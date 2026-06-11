@@ -6,7 +6,8 @@ slices `hidden_states` and `labels` to the same CP-local attention-load-balanced
 sequence order before the model loss path. The CE path should therefore run on
 CP-local tokens and reduce only across TP.
 
-Two implementations exist behind `LINEAR_CE_IMPL`:
+Three implementations exist behind `LINEAR_CE_IMPL` when
+`LINEAR_CE_CHUNK_SIZE>0`:
 
 - `torch`: the original Python-autograd chunked CE. It materializes a
   per-chunk FP32 logits/exp/grad-logits working set.
@@ -15,6 +16,10 @@ Two implementations exist behind `LINEAR_CE_IMPL`:
   kernels compute loss statistics and overwrite that buffer with grad-logits
   in-place. Full sequence logits are not materialized. This is not a fully
   tile-resident zero-logits CUTLASS/TE kernel.
+- `streaming`: an experimental sequence-parallel aware path. It avoids the
+  Megatron output-layer sequence-parallel full hidden all-gather by broadcasting
+  each TP owner's supervised-token hidden chunk through the TP group. It still
+  materializes per-chunk TP-local logits, so it is not a zero-logits kernel.
 
 ## Local Check
 
@@ -24,7 +29,7 @@ Run from `.deps/mcore-bridge`:
 NPROC_PER_NODE=4 TP_SIZE=2 tests/run_chunked_linear_ce_smokes.sh
 ```
 
-The check compares both `LINEAR_CE_IMPL=torch` and `LINEAR_CE_IMPL=triton`
+The check compares `LINEAR_CE_IMPL=triton` and the streaming SP-sharded path
 against full CE with TP=2 and CP=2. It covers:
 
 - CP-local hidden states and labels using the Megatron attention-load-balanced
@@ -32,6 +37,7 @@ against full CE with TP=2 and CP=2. It covers:
 - TP vocab shards and TP softmax reductions.
 - Backward with internal TP input-gradient all-reduce.
 - Backward with external sequence-parallel input-gradient all-reduce.
+- Streaming hidden states sharded across the TP sequence-parallel dimension.
 - Weight-gradient reduction across CP ranks for reference comparison.
 
 Validated on 2026-06-11:
@@ -44,8 +50,13 @@ Validated on 2026-06-11:
 | triton | loss | 2.4e-7 | 8e-8 |
 | triton | hidden grad | 0 | 3.25e-6 |
 | triton | weight grad | 1e-8 | 9.625e-5 |
+| streaming | loss | 2.4e-7 | 8e-8 |
+| streaming | hidden grad | 0 | 3.25e-6 |
+| streaming | weight grad | 1e-8 | 1.0588e-4 |
 
-Both input-gradient paths passed.
+Both input-gradient paths passed. The current smoke script exercises the
+Triton and streaming paths; the `torch` numbers above are retained as the
+historical baseline from the same validation round.
 
 ## 27B CP2 Smoke Results
 
@@ -58,11 +69,21 @@ attention recompute, and the same 27B SFT smoke script.
 | 8192 | none | 0 | 0.25196117, 0.29439181 | 3.91375995, 4.23591614 | 43.43 | 111.261, 18.799 |
 | 8192 | torch | 2048 | 0.25196114, 0.29439172 | 3.90876889, 4.22761917 | 47.71 | 86.932, 18.875 |
 | 8192 | triton | 2048 | 0.25196111, 0.29439172 | 3.91360569, 4.22973156 | 44.31 | 114.982, 25.760 |
+| 8192 | streaming | 2048 | 0.25196111, 0.29439172 | 3.90982723, 4.23182869 | 44.48 | 93.780, 19.653 |
 | 16384 | none | 0 | 0.20072812, 0.22631969 | 1.80706847, 2.15706253 | 59.93 | 116.518, 26.091 |
 | 16384 | torch | 2048 | 0.20072806, 0.22631963 | 1.80472362, 2.15484047 | 63.90 | 104.408, 28.295 |
 | 16384 | torch | 512 | 0.20072731, 0.22631963 | 1.80431390, 2.15794945 | 61.98 | 108.309, 28.862 |
 | 16384 | triton | 2048 | 0.20072804, 0.22631963 | 1.80468631, 2.15631199 | 60.36 | 106.952, 27.859 |
 | 16384 | triton | 512 | 0.20072731, 0.22631963 | 1.80364609, 2.15686083 | 60.24 | 106.008, 27.077 |
+| 16384 | streaming | 2048 | 0.20072804, 0.22631963 | 1.80453157, 2.15973759 | 60.42 | 100.045, 27.257 |
+
+The sample-level supervised-token ratios in these runs were high enough that
+supervised-token-only lm_head work has limited room to help:
+
+| max length | supervised tokens | total tokens | ratio |
+| --- | ---: | ---: | ---: |
+| 8192 | 4641 | 8192 | 56.7% |
+| 16384 | 12542 | 16384 | 76.5% |
 
 Log roots:
 
@@ -74,6 +95,18 @@ Log roots:
 - `logs/qwen36-27b-paper2arm-distill-megatron/qwen36-27b-sft-cp-fusedlinearce-8192-20260611-192316-cp2-tp4`
 - `logs/qwen36-27b-paper2arm-distill-megatron/qwen36-27b-sft-cp-fusedlinearce-16384-20260611-193041-cp2-tp4`
 - `logs/qwen36-27b-paper2arm-distill-megatron/qwen36-27b-sft-cp-fusedlinearce512-16384-20260611-193820-cp2-tp4`
+- `logs/qwen36-27b-paper2arm-distill-megatron/qwen36-27b-sft-cp-streamingce-8192-20260611-201426-cp2-tp4`
+- `logs/qwen36-27b-paper2arm-distill-megatron/qwen36-27b-sft-cp-streamingce-16384-20260611-202400-cp2-tp4`
+
+## FLA Reference Check
+
+`../flash-linear-attention/fla/modules/fused_linear_cross_entropy.py` is adapted
+from Liger Kernel. Its forward loop computes `F.linear(c_x, weight, bias)` per
+chunk, then uses Triton CE kernels to compute loss and overwrite chunk logits
+with dlogits before computing `dx` and `dw`. This avoids full-sequence logits,
+but it still materializes per-chunk logits and is not Megatron vocab-TP safe as
+is. It does not provide the fully tile-resident lm_head-to-loss kernel needed to
+remove logits entirely.
 
 ## Production Guidance
 
@@ -82,8 +115,9 @@ Log roots:
   gradient check.
 - Performance: do not enable either chunked implementation by default for 27B
   CP2 SFT. The Triton fused-linear chunk path fixes most of the old torch
-  chunk memory regression, but it still stayed above the native fused CE peak
-  memory in the measured 8K/16K runs and slowed the warm 16K iteration.
+  chunk memory regression, and streaming avoids the SP hidden all-gather, but
+  both stayed above the native fused CE peak memory in the measured 8K/16K
+  runs.
 - Keep production default `LINEAR_CE_CHUNK_SIZE=0` unless a different model or
   sequence mix shows a clear memory win.
 - A real production optimization should be a fused lm_head plus CE path that

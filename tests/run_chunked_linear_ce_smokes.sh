@@ -20,6 +20,7 @@ export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-1}"
 export TP_SIZE
 
 "${PYTHON_BIN}" -m py_compile \
+  "${ROOT_DIR}/src/mcore_bridge/model/fused_linear_ce.py" \
   "${ROOT_DIR}/src/mcore_bridge/model/gpt_model.py" \
   "${ROOT_DIR}/tests/check_chunked_linear_ce_cp.py"
 

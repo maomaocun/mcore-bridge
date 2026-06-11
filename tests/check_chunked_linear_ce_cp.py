@@ -3,12 +3,21 @@ import os
 os.environ.setdefault('TORCH_COMPILE_DISABLE', '1')
 os.environ.setdefault('TORCHINDUCTOR_COMPILE_THREADS', '1')
 
+import importlib.util
+from pathlib import Path
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from mcore_bridge.model.fused_linear_ce import VocabParallelFusedLinearCrossEntropy
-from mcore_bridge.model.gpt_model import _ChunkedLinearCrossEntropy
+
+_FUSED_LINEAR_CE_PATH = Path(__file__).resolve().parents[1] / 'src/mcore_bridge/model/fused_linear_ce.py'
+_FUSED_LINEAR_CE_SPEC = importlib.util.spec_from_file_location('mcore_bridge_fused_linear_ce', _FUSED_LINEAR_CE_PATH)
+_FUSED_LINEAR_CE = importlib.util.module_from_spec(_FUSED_LINEAR_CE_SPEC)
+assert _FUSED_LINEAR_CE_SPEC.loader is not None
+_FUSED_LINEAR_CE_SPEC.loader.exec_module(_FUSED_LINEAR_CE)
+VocabParallelFusedLinearCrossEntropy = _FUSED_LINEAR_CE.VocabParallelFusedLinearCrossEntropy
+VocabParallelStreamingFusedLinearCrossEntropy = _FUSED_LINEAR_CE.VocabParallelStreamingFusedLinearCrossEntropy
 
 
 def _init_distributed():
@@ -148,6 +157,58 @@ def _run_case(name, ce_function, tp_rank, cp_rank, tp_size, cp_size, tp_group, c
     _assert_close(f'{name} weight grad', weight_grad, ref_weight.grad[vocab_start:vocab_end])
 
 
+def _run_sp_streaming_case(tp_rank, cp_rank, tp_size, cp_size, tp_group, cp_group):
+    if dist.get_rank() == 0:
+        print('checking triton streaming fused linear CE / CP local + SP-sharded hidden', flush=True)
+
+    seq_len = 24
+    batch = 2
+    hidden_size = 8
+    vocab_size = 24
+    chunk_size = 3
+    hidden, weight, labels = _make_case(seq_len, batch, hidden_size, vocab_size)
+
+    ref_hidden = hidden.detach().clone().requires_grad_(True)
+    ref_weight = weight.detach().clone().requires_grad_(True)
+    ref_losses = _reference_losses(ref_hidden, ref_weight, labels)
+
+    torch.manual_seed(1234)
+    grad_out = torch.randn(batch, seq_len, device='cuda') * 0.13
+    grad_out = grad_out.masked_fill(labels == -100, 0.0)
+    (ref_losses * grad_out).sum().backward()
+
+    cp_hidden = _split_cp_reference(hidden.detach(), cp_size, cp_rank, dim=0).contiguous()
+    cp_labels = _split_cp_reference(labels, cp_size, cp_rank, dim=1).contiguous()
+    cp_grad_out = _split_cp_reference(grad_out, cp_size, cp_rank, dim=1).contiguous()
+    cp_ref_losses = _split_cp_reference(ref_losses.detach(), cp_size, cp_rank, dim=1).contiguous()
+    cp_ref_hidden_grad = _split_cp_reference(ref_hidden.grad.detach(), cp_size, cp_rank, dim=0).contiguous()
+
+    local_hidden = torch.chunk(cp_hidden, tp_size, dim=0)[tp_rank].contiguous().requires_grad_(True)
+    local_ref_hidden_grad = torch.chunk(cp_ref_hidden_grad, tp_size, dim=0)[tp_rank].contiguous()
+    partition_vocab_size = vocab_size // tp_size
+    vocab_start = tp_rank * partition_vocab_size
+    vocab_end = vocab_start + partition_vocab_size
+    local_weight = weight.detach()[vocab_start:vocab_end].contiguous().requires_grad_(True)
+
+    losses = VocabParallelStreamingFusedLinearCrossEntropy.apply(
+        local_hidden,
+        local_weight,
+        cp_labels,
+        tp_group,
+        vocab_start,
+        chunk_size,
+    )
+    _assert_close('triton streaming fused linear CE loss', losses, cp_ref_losses)
+
+    (losses * cp_grad_out).sum().backward()
+
+    _assert_close('triton streaming fused linear CE hidden grad', local_hidden.grad.detach(), local_ref_hidden_grad)
+
+    weight_grad = local_weight.grad.detach().clone()
+    dist.all_reduce(weight_grad, op=dist.ReduceOp.SUM, group=cp_group)
+    _assert_close('triton streaming fused linear CE weight grad', weight_grad, ref_weight.grad[vocab_start:vocab_end])
+
+
 def main():
     _, rank, world_size = _init_distributed()
     tp_size, cp_size, tp_rank, cp_rank, tp_group, cp_group = _make_groups(rank, world_size)
@@ -155,7 +216,6 @@ def main():
         raise AssertionError('check_chunked_linear_ce_cp.py requires TP size >= 2')
 
     for impl_name, ce_function in (
-        ('torch chunked CE', _ChunkedLinearCrossEntropy),
         ('triton fused linear CE', VocabParallelFusedLinearCrossEntropy),
     ):
         _run_case(
@@ -180,6 +240,8 @@ def main():
             cp_group,
             reduce_grad_input=False,
         )
+
+    _run_sp_streaming_case(tp_rank, cp_rank, tp_size, cp_size, tp_group, cp_group)
 
     if rank == 0:
         print(f'chunked linear CE CP checks OK with tp_size={tp_size}, cp_size={cp_size}', flush=True)

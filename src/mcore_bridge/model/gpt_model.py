@@ -27,7 +27,10 @@ from typing import Optional, Tuple
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import get_logger, roll_tensor, split_cp_inputs
 
-from .fused_linear_ce import VocabParallelFusedLinearCrossEntropy
+from .fused_linear_ce import (
+    VocabParallelFusedLinearCrossEntropy,
+    VocabParallelStreamingFusedLinearCrossEntropy,
+)
 from .rope import dynamic_rope_update, get_rope_inv_freq
 
 logger = get_logger()
@@ -68,9 +71,13 @@ def _parse_linear_ce_impl() -> str:
         'triton': 'triton',
         'fused': 'triton',
         'fused_linear': 'triton',
+        'stream': 'streaming',
+        'streaming': 'streaming',
+        'sp_stream': 'streaming',
+        'sp_streaming': 'streaming',
     }
     if raw_value not in aliases:
-        raise ValueError(f'LINEAR_CE_IMPL must be one of torch,triton. Got: {raw_value!r}')
+        raise ValueError(f'LINEAR_CE_IMPL must be one of torch,triton,streaming. Got: {raw_value!r}')
     return aliases[raw_value]
 
 
@@ -196,16 +203,24 @@ def _chunked_linear_cross_entropy_loss(model, hidden_states, output_weight, labe
     if output_weight is None:
         raise ValueError('Unable to locate output layer weight for LINEAR_CE_CHUNK_SIZE.')
 
+    linear_ce_impl = _parse_linear_ce_impl()
     if getattr(model.output_layer, 'sequence_parallel', False):
+        if linear_ce_impl == 'streaming':
+            if _tp_group_size(model.pg_collection.tp) <= 1:
+                raise ValueError('LINEAR_CE_IMPL=streaming requires tensor parallel size > 1.')
+            vocab_start_index = torch.distributed.get_rank(model.pg_collection.tp) * output_weight.shape[0]
+            return VocabParallelStreamingFusedLinearCrossEntropy.apply(
+                hidden_states, output_weight, labels, model.pg_collection.tp, vocab_start_index, chunk_size)
         hidden_states = gather_from_sequence_parallel_region(
             hidden_states, tensor_parallel_output_grad=True, group=model.pg_collection.tp)
         reduce_grad_input = False
     else:
+        if linear_ce_impl == 'streaming':
+            raise ValueError('LINEAR_CE_IMPL=streaming is only valid when sequence_parallel is enabled.')
         reduce_grad_input = _tp_group_size(model.pg_collection.tp) > 1
 
     vocab_start_index = torch.distributed.get_rank(model.pg_collection.tp) * output_weight.shape[0] \
         if _tp_group_size(model.pg_collection.tp) > 1 else 0
-    linear_ce_impl = _parse_linear_ce_impl()
     if linear_ce_impl == 'triton':
         return VocabParallelFusedLinearCrossEntropy.apply(
             hidden_states, output_weight, labels, model.pg_collection.tp, vocab_start_index, chunk_size,

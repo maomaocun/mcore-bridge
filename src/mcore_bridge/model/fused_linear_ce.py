@@ -277,3 +277,187 @@ class VocabParallelFusedLinearCrossEntropy(torch.autograd.Function):
 
         grad_hidden = grad_hidden_flat.view(seq_len, batch_size, hidden_size) if grad_hidden_flat is not None else None
         return grad_hidden, grad_weight, None, None, None, None, None
+
+
+def _group_rank(tp_group) -> int:
+    if tp_group is None or not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return 0
+    return torch.distributed.get_rank(tp_group)
+
+
+def _group_world_size(tp_group) -> int:
+    if tp_group is None or not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return 1
+    return torch.distributed.get_world_size(tp_group)
+
+
+def _group_global_rank(tp_group, group_rank: int) -> int:
+    if tp_group is None:
+        return group_rank
+    if hasattr(torch.distributed, 'get_global_rank'):
+        return torch.distributed.get_global_rank(tp_group, group_rank)
+    return torch.distributed.distributed_c10d._get_process_group_ranks(tp_group)[group_rank]
+
+
+def _broadcast_from_group_rank(tensor: torch.Tensor, tp_group, group_rank: int) -> torch.Tensor:
+    if _group_world_size(tp_group) > 1:
+        torch.distributed.broadcast(tensor, src=_group_global_rank(tp_group, group_rank), group=tp_group)
+    return tensor
+
+
+class VocabParallelStreamingFusedLinearCrossEntropy(torch.autograd.Function):
+    """SP-aware chunked lm_head + TP CE without full hidden all-gather.
+
+    Megatron's sequence-parallel output layer gathers the whole sequence before
+    the vocab-parallel lm_head so every vocab rank can see every token. This
+    variant streams one sequence-parallel owner's supervised-token chunk at a
+    time through a broadcast, computes TP CE, then keeps only the owner shard's
+    hidden gradient. It preserves vocab-parallel softmax semantics while avoiding
+    a persistent full-sequence hidden buffer in the loss path.
+    """
+
+    @staticmethod
+    def forward(ctx, hidden_states, output_weight, labels, tp_group, vocab_start_index, chunk_size):
+        if labels.dim() != 2:
+            raise ValueError(f'labels must be [batch, sequence], got shape: {tuple(labels.shape)}')
+        if hidden_states.dim() != 3:
+            raise ValueError(f'hidden_states must be [local_sequence, batch, hidden], got: {tuple(hidden_states.shape)}')
+        local_seq_len, batch_size, hidden_size = hidden_states.shape
+        tp_size = _group_world_size(tp_group)
+        tp_rank = _group_rank(tp_group)
+        full_seq_len = labels.shape[1]
+        if labels.shape[0] != batch_size:
+            raise ValueError(
+                f'labels batch must match hidden states. Got labels={tuple(labels.shape)}, '
+                f'hidden_states={tuple(hidden_states.shape)}')
+        if full_seq_len != local_seq_len * tp_size:
+            raise ValueError(
+                f'streaming linear CE expects labels sequence length to equal local_sequence * TP size. '
+                f'Got labels={tuple(labels.shape)}, hidden_states={tuple(hidden_states.shape)}, tp_size={tp_size}.')
+        if chunk_size <= 0:
+            raise ValueError(f'chunk_size must be > 0. Got: {chunk_size}')
+
+        labels_t = labels.transpose(0, 1).contiguous()
+        target_flat = labels_t.view(-1)
+        hidden_flat = hidden_states.contiguous().view(local_seq_len * batch_size, hidden_size)
+        losses_flat = torch.zeros((full_seq_len * batch_size,), dtype=torch.float32, device=hidden_states.device)
+
+        for owner_rank in range(tp_size):
+            owner_offset = owner_rank * local_seq_len * batch_size
+            owner_target = target_flat[owner_offset:owner_offset + local_seq_len * batch_size]
+            owner_supervised = torch.nonzero(owner_target != -100, as_tuple=False).flatten()
+            for chunk_start in range(0, owner_supervised.numel(), chunk_size):
+                chunk_end = min(owner_supervised.numel(), chunk_start + chunk_size)
+                owner_local_indices = owner_supervised[chunk_start:chunk_end]
+                n_tokens = owner_local_indices.numel()
+                if owner_rank == tp_rank:
+                    hidden_chunk = hidden_flat.index_select(0, owner_local_indices)
+                else:
+                    hidden_chunk = torch.empty((n_tokens, hidden_size), dtype=hidden_states.dtype,
+                                               device=hidden_states.device)
+                _broadcast_from_group_rank(hidden_chunk, tp_group, owner_rank)
+
+                target = owner_target.index_select(0, owner_local_indices).contiguous()
+                logits = torch.matmul(hidden_chunk, output_weight.t()).contiguous()
+                local_max = logits.float().amax(dim=-1)
+                global_max = local_max
+                if tp_size > 1:
+                    torch.distributed.all_reduce(global_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
+
+                local_sum, local_target_logit = fused_ce_stats(
+                    logits,
+                    target,
+                    global_max,
+                    vocab_start_index=vocab_start_index,
+                )
+                global_sum = local_sum
+                target_logit = local_target_logit
+                if tp_size > 1:
+                    torch.distributed.all_reduce(global_sum, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+                    torch.distributed.all_reduce(target_logit, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+
+                chunk_loss = torch.log(global_sum) + global_max - target_logit
+                losses_flat.index_copy_(0, owner_offset + owner_local_indices, chunk_loss)
+
+        ctx.save_for_backward(hidden_states, output_weight, target_flat)
+        ctx.tp_group = tp_group
+        ctx.vocab_start_index = vocab_start_index
+        ctx.chunk_size = chunk_size
+        ctx.local_seq_len = local_seq_len
+        ctx.batch_size = batch_size
+        return losses_flat.view(full_seq_len, batch_size).transpose(0, 1).contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        hidden_states, output_weight, target_flat = ctx.saved_tensors
+        tp_group = ctx.tp_group
+        vocab_start_index = ctx.vocab_start_index
+        chunk_size = ctx.chunk_size
+        local_seq_len = ctx.local_seq_len
+        batch_size = ctx.batch_size
+        tp_size = _group_world_size(tp_group)
+        tp_rank = _group_rank(tp_group)
+        _, _, hidden_size = hidden_states.shape
+
+        hidden_flat = hidden_states.contiguous().view(local_seq_len * batch_size, hidden_size)
+        grad_output_flat = grad_output.transpose(0, 1).contiguous().view(-1).float()
+        grad_hidden_flat = torch.zeros_like(hidden_flat) if ctx.needs_input_grad[0] else None
+        grad_weight = torch.zeros_like(output_weight) if ctx.needs_input_grad[1] else None
+
+        for owner_rank in range(tp_size):
+            owner_offset = owner_rank * local_seq_len * batch_size
+            owner_target = target_flat[owner_offset:owner_offset + local_seq_len * batch_size]
+            owner_supervised = torch.nonzero(owner_target != -100, as_tuple=False).flatten()
+            for chunk_start in range(0, owner_supervised.numel(), chunk_size):
+                chunk_end = min(owner_supervised.numel(), chunk_start + chunk_size)
+                owner_local_indices = owner_supervised[chunk_start:chunk_end]
+                n_tokens = owner_local_indices.numel()
+                if owner_rank == tp_rank:
+                    hidden_chunk = hidden_flat.index_select(0, owner_local_indices)
+                else:
+                    hidden_chunk = torch.empty((n_tokens, hidden_size), dtype=hidden_states.dtype,
+                                               device=hidden_states.device)
+                _broadcast_from_group_rank(hidden_chunk, tp_group, owner_rank)
+
+                target = owner_target.index_select(0, owner_local_indices).contiguous()
+                logits = torch.matmul(hidden_chunk, output_weight.t()).contiguous()
+                local_max = logits.float().amax(dim=-1)
+                global_max = local_max
+                if tp_size > 1:
+                    torch.distributed.all_reduce(global_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
+                local_sum, _ = fused_ce_stats(
+                    logits,
+                    target,
+                    global_max,
+                    vocab_start_index=vocab_start_index,
+                )
+                global_sum = local_sum
+                if tp_size > 1:
+                    torch.distributed.all_reduce(global_sum, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+
+                grad_output_chunk = grad_output_flat.index_select(0, owner_offset + owner_local_indices).contiguous()
+                grad_logits = fused_ce_grad_logits_(
+                    logits,
+                    target,
+                    grad_output_chunk,
+                    global_max,
+                    global_sum,
+                    vocab_start_index=vocab_start_index,
+                )
+
+                if grad_hidden_flat is not None:
+                    grad_hidden_chunk = torch.matmul(grad_logits, output_weight)
+                    if tp_size > 1:
+                        torch.distributed.all_reduce(grad_hidden_chunk, op=torch.distributed.ReduceOp.SUM,
+                                                     group=tp_group)
+                    if owner_rank == tp_rank:
+                        grad_hidden_flat.index_copy_(0, owner_local_indices,
+                                                     grad_hidden_chunk.to(dtype=hidden_states.dtype))
+
+                if grad_weight is not None:
+                    grad_weight_chunk = torch.matmul(grad_logits.t(), hidden_chunk)
+                    grad_weight.add_(grad_weight_chunk.to(dtype=grad_weight.dtype))
+
+        grad_hidden = grad_hidden_flat.view(local_seq_len, batch_size, hidden_size) \
+            if grad_hidden_flat is not None else None
+        return grad_hidden, grad_weight, None, None, None, None
