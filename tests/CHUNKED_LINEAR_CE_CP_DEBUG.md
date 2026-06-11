@@ -15,11 +15,15 @@ Three implementations exist behind `LINEAR_CE_IMPL` when
   per-chunk TP-local logits buffer for the lm_head matmul, but the Triton CE
   kernels compute loss statistics and overwrite that buffer with grad-logits
   in-place. Full sequence logits are not materialized. This is not a fully
-  tile-resident zero-logits CUTLASS/TE kernel.
+  tile-resident zero-logits CUTLASS/TE kernel. The optimized path computes
+  per-row max with Triton, avoiding a per-chunk FP32 logits copy, and accumulates
+  lm_head weight grad with in-place `addmm_`, avoiding a full-shard temporary
+  wgrad tensor per chunk.
 - `streaming`: an experimental sequence-parallel aware path. It avoids the
   Megatron output-layer sequence-parallel full hidden all-gather by broadcasting
   each TP owner's supervised-token hidden chunk through the TP group. It still
-  materializes per-chunk TP-local logits, so it is not a zero-logits kernel.
+  materializes per-chunk TP-local logits, so it is not a zero-logits kernel. It
+  uses the same row-max and in-place wgrad reductions as `triton`.
 
 ## Local Check
 
@@ -52,7 +56,7 @@ Validated on 2026-06-11:
 | triton | weight grad | 1e-8 | 9.625e-5 |
 | streaming | loss | 2.4e-7 | 8e-8 |
 | streaming | hidden grad | 0 | 3.25e-6 |
-| streaming | weight grad | 1e-8 | 1.0588e-4 |
+| streaming | weight grad | 1e-8 | 9.625e-5 |
 
 Both input-gradient paths passed. The current smoke script exercises the
 Triton and streaming paths; the `torch` numbers above are retained as the
@@ -76,6 +80,7 @@ attention recompute, and the same 27B SFT smoke script.
 | 16384 | triton | 2048 | 0.20072804, 0.22631963 | 1.80468631, 2.15631199 | 60.36 | 106.952, 27.859 |
 | 16384 | triton | 512 | 0.20072731, 0.22631963 | 1.80364609, 2.15686083 | 60.24 | 106.008, 27.077 |
 | 16384 | streaming | 2048 | 0.20072804, 0.22631963 | 1.80453157, 2.15973759 | 60.42 | 100.045, 27.257 |
+| 16384 | streaming optimized | 2048 | 0.20072804, 0.22631963 | 1.80409408, 2.15695667 | 59.33 | 110.650, 28.331 |
 
 The sample-level supervised-token ratios in these runs were high enough that
 supervised-token-only lm_head work has limited room to help:
@@ -97,6 +102,7 @@ Log roots:
 - `logs/qwen36-27b-paper2arm-distill-megatron/qwen36-27b-sft-cp-fusedlinearce512-16384-20260611-193820-cp2-tp4`
 - `logs/qwen36-27b-paper2arm-distill-megatron/qwen36-27b-sft-cp-streamingce-8192-20260611-201426-cp2-tp4`
 - `logs/qwen36-27b-paper2arm-distill-megatron/qwen36-27b-sft-cp-streamingce-16384-20260611-202400-cp2-tp4`
+- `logs/qwen36-27b-paper2arm-distill-megatron/qwen36-27b-sft-cp-streamingce-opt-16384-20260611-2129-cp2-tp4`
 
 ## FLA Reference Check
 
@@ -141,27 +147,34 @@ Validated on 2026-06-11 with TP=4, hidden size 5120, vocab 248320, BF16:
 | seq len | case | max allocated GiB | max reserved GiB |
 | ---: | --- | ---: | ---: |
 | 8192 | native_mcore | 4.4869 | 4.5137 |
-| 8192 | streaming | 2.8176 | 3.5371 |
+| 8192 | streaming optimized | 1.7519 | 1.9941 |
 | 16384 | native_mcore | 8.3739 | 8.4004 |
-| 16384 | streaming | 2.8568 | 3.5371 |
+| 16384 | streaming optimized | 1.7911 | 1.8574 |
 
-This confirms that streaming does reduce the isolated lm_head+CE live memory.
-The full 27B run still peaked slightly above native fused CE, so the measured
-training peak is dominated elsewhere in the iteration or by reserved allocator
-behavior. It is not explained by a CE-loss recompute setting.
+Before the row-max and in-place wgrad optimization, streaming measured 2.8176 /
+3.5371 GiB at 8K and 2.8568 / 3.5371 GiB at 16K. The optimized path removes the
+per-chunk FP32 logits copy from `logits.float().amax()` and the full-shard
+`grad_weight_chunk` temporary in backward.
+
+This confirms that streaming reduces isolated lm_head+CE live memory. The
+optimized full 27B 16K CP2 smoke also reduced end-to-end training
+`max_memory_reserved` from the native fused CE baseline 59.93 GiB to 59.33 GiB.
+It is therefore no longer only a local loss-path win, but the margin is still
+small relative to the total model step peak.
 
 ## Production Guidance
 
 - Correctness: CP=2 chunked linear CE aligns with the non-chunked fused CE loss
   to about 1e-6 in the 27B smoke and both implementations pass the TP2/CP2
   gradient check.
-- Performance: do not enable either chunked implementation by default for 27B
-  CP2 SFT. The Triton fused-linear chunk path fixes most of the old torch
-  chunk memory regression, and streaming avoids the SP hidden all-gather, but
-  both stayed above the native fused CE peak memory in the measured 8K/16K
-  runs.
-- Keep production default `LINEAR_CE_CHUNK_SIZE=0` unless a different model or
-  sequence mix shows a clear memory win.
+- Performance: `LINEAR_CE_IMPL=streaming LINEAR_CE_CHUNK_SIZE=2048` is now a
+  production-candidate opt-in for 27B CP2 16K SFT when loss-path memory matters.
+  It reduced the measured 16K full-step peak by 0.60 GiB versus native fused CE
+  in the local 8-GPU smoke, with matching loss and grad norm. It is still slower
+  than native fused CE and needs a 32-GPU staging canary before becoming a
+  production default.
+- Keep production default `LINEAR_CE_CHUNK_SIZE=0` until the same memory win is
+  reproduced on the 32-GPU production topology and representative sequence mix.
 - A real production optimization should be a fused lm_head plus CE path that
   avoids materializing even per-chunk logits and avoids the current
   sequence-parallel gather/cublas workspace overhead. That likely belongs in a

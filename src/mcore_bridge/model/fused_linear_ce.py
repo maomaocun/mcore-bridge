@@ -32,6 +32,25 @@ def _row_block_size(n_cols: int) -> int:
 
 
 @triton.jit
+def _row_max_kernel(
+    logits_ptr,
+    max_ptr,
+    n_cols: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    row_logits_ptr = logits_ptr + row * n_cols
+    max_val = -float('inf')
+
+    for start in range(0, n_cols, BLOCK_SIZE):
+        offsets = start + tl.arange(0, BLOCK_SIZE)
+        logits = tl.load(row_logits_ptr + offsets, mask=offsets < n_cols, other=-float('inf')).to(tl.float32)
+        max_val = tl.maximum(max_val, tl.max(logits, axis=0))
+
+    tl.store(max_ptr + row, max_val)
+
+
+@triton.jit
 def _vp_ce_stats_kernel(
     logits_ptr,
     target_ptr,
@@ -135,6 +154,29 @@ def fused_ce_stats(
     return local_sum, local_target_logit
 
 
+def fused_row_max(logits: torch.Tensor) -> torch.Tensor:
+    """Return per-row FP32 max without materializing a FP32 logits copy."""
+
+    _require_triton()
+    if logits.dim() != 2:
+        raise ValueError(f'logits must be [tokens, vocab_partition], got {tuple(logits.shape)}')
+    if not logits.is_contiguous():
+        logits = logits.contiguous()
+    n_rows, n_cols = logits.shape
+    max_values = torch.empty((n_rows,), dtype=torch.float32, device=logits.device)
+    if n_rows == 0:
+        return max_values
+
+    _row_max_kernel[(n_rows,)](
+        logits,
+        max_values,
+        n_cols=n_cols,
+        BLOCK_SIZE=_row_block_size(n_cols),
+        num_warps=32,
+    )
+    return max_values
+
+
 def fused_ce_grad_logits_(
     logits: torch.Tensor,
     target: torch.Tensor,
@@ -204,7 +246,7 @@ class VocabParallelFusedLinearCrossEntropy(torch.autograd.Function):
             target = target_flat.index_select(0, token_indices).contiguous()
             logits = torch.matmul(hidden_chunk, output_weight.t()).contiguous()
 
-            local_max = logits.float().amax(dim=-1)
+            local_max = fused_row_max(logits)
             global_max = local_max
             if tp_group is not None and torch.distributed.get_world_size(tp_group) > 1:
                 torch.distributed.all_reduce(global_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
@@ -272,8 +314,7 @@ class VocabParallelFusedLinearCrossEntropy(torch.autograd.Function):
                 grad_hidden_flat.index_copy_(0, token_indices, grad_hidden_chunk.to(dtype=hidden_states.dtype))
 
             if grad_weight is not None:
-                grad_weight_chunk = torch.matmul(grad_logits.t(), hidden_chunk)
-                grad_weight.add_(grad_weight_chunk.to(dtype=grad_weight.dtype))
+                grad_weight.addmm_(grad_logits.t(), hidden_chunk)
 
         grad_hidden = grad_hidden_flat.view(seq_len, batch_size, hidden_size) if grad_hidden_flat is not None else None
         return grad_hidden, grad_weight, None, None, None, None, None
@@ -359,7 +400,7 @@ class VocabParallelStreamingFusedLinearCrossEntropy(torch.autograd.Function):
 
                 target = owner_target.index_select(0, owner_local_indices).contiguous()
                 logits = torch.matmul(hidden_chunk, output_weight.t()).contiguous()
-                local_max = logits.float().amax(dim=-1)
+                local_max = fused_row_max(logits)
                 global_max = local_max
                 if tp_size > 1:
                     torch.distributed.all_reduce(global_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
@@ -421,7 +462,7 @@ class VocabParallelStreamingFusedLinearCrossEntropy(torch.autograd.Function):
 
                 target = owner_target.index_select(0, owner_local_indices).contiguous()
                 logits = torch.matmul(hidden_chunk, output_weight.t()).contiguous()
-                local_max = logits.float().amax(dim=-1)
+                local_max = fused_row_max(logits)
                 global_max = local_max
                 if tp_size > 1:
                     torch.distributed.all_reduce(global_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
@@ -455,8 +496,7 @@ class VocabParallelStreamingFusedLinearCrossEntropy(torch.autograd.Function):
                                                      grad_hidden_chunk.to(dtype=hidden_states.dtype))
 
                 if grad_weight is not None:
-                    grad_weight_chunk = torch.matmul(grad_logits.t(), hidden_chunk)
-                    grad_weight.add_(grad_weight_chunk.to(dtype=grad_weight.dtype))
+                    grad_weight.addmm_(grad_logits.t(), hidden_chunk)
 
         grad_hidden = grad_hidden_flat.view(local_seq_len, batch_size, hidden_size) \
             if grad_hidden_flat is not None else None
