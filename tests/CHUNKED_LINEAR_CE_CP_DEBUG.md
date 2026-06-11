@@ -171,36 +171,43 @@ small relative to the total model step peak.
   production-candidate opt-in for 27B CP2 16K SFT when loss-path memory matters.
   It reduced the measured 16K full-step peak by 0.60 GiB versus native fused CE
   in the local 8-GPU smoke, with matching loss and grad norm. It is still slower
-  than native fused CE and needs a 32-GPU staging canary before becoming a
-  production default.
-- Keep production default `LINEAR_CE_CHUNK_SIZE=0` until the same memory win is
-  reproduced on the 32-GPU production topology and representative sequence mix.
+  than native fused CE, so keep it opt-in unless the local gate below passes for
+  the intended sequence mix.
+- Keep production default `LINEAR_CE_CHUNK_SIZE=0` unless the local comparison
+  on the target run shape shows a clear memory win and acceptable speed
+  regression.
 - A real production optimization should be a fused lm_head plus CE path that
   avoids materializing even per-chunk logits and avoids the current
   sequence-parallel gather/cublas workspace overhead. That likely belongs in a
   TE/CUTLASS-level kernel, not in this Python-autograd wrapper.
 
-## 32-GPU Canary
+## Local Production Gate
 
-Use the ms-swift repo root. The submit script defaults to `DRY_RUN=1`; set
-`DRY_RUN=0` only when intentionally launching both DLC jobs.
+Use the ms-swift repo root. Run paired local 27B SFT smokes with identical data,
+model, topology, and max length:
 
 ```bash
-DRY_RUN=0 MAX_LENGTH=32768 TRAIN_ITERS=2 \
-  dlc/submit_qwen36_27b_linear_ce_canary_32g.sh
+SMOKE=1 RUN_NAME=<native-run> MAX_LENGTH=16384 TRAIN_ITERS=2 \
+  TENSOR_MODEL_PARALLEL_SIZE=4 CONTEXT_PARALLEL_SIZE=2 \
+  NPROC_PER_NODE=8 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  ALLOW_EXPERIMENTAL_CP=true LINEAR_CE_IMPL=torch LINEAR_CE_CHUNK_SIZE=0 \
+  SKIP_FINAL_SAVE=true SKIP_REASONING_DUP_CHECK=1 \
+  ./train_qwen36_27b_paper2arm_distill_megatron.sh
+
+SMOKE=1 RUN_NAME=<streaming-run> MAX_LENGTH=16384 TRAIN_ITERS=2 \
+  TENSOR_MODEL_PARALLEL_SIZE=4 CONTEXT_PARALLEL_SIZE=2 \
+  NPROC_PER_NODE=8 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  ALLOW_EXPERIMENTAL_CP=true LINEAR_CE_IMPL=streaming LINEAR_CE_CHUNK_SIZE=2048 \
+  SKIP_FINAL_SAVE=true SKIP_REASONING_DUP_CHECK=1 \
+  ./train_qwen36_27b_paper2arm_distill_megatron.sh
 ```
 
-This submits two 4-node x 8-GPU runs using the production DLC wrapper:
-
-- native baseline: `LINEAR_CE_IMPL=torch LINEAR_CE_CHUNK_SIZE=0`
-- candidate: `LINEAR_CE_IMPL=streaming LINEAR_CE_CHUNK_SIZE=2048`
-
-After both runs finish, compare their step logs:
+Compare their step logs:
 
 ```bash
 python scripts/compare_linear_ce_canary.py \
-  dlc/logs/linear_ce_native_32g_<stamp> \
-  dlc/logs/linear_ce_streaming_32g_<stamp>
+  logs/qwen36-27b-paper2arm-distill-megatron/<native-run> \
+  logs/qwen36-27b-paper2arm-distill-megatron/<streaming-run>
 ```
 
 Default pass gates:
@@ -212,5 +219,13 @@ Default pass gates:
 - steady-state step time regression <= 35%, excluding the first step because it
   includes Triton JIT and other one-time warmup
 
-Only promote streaming CE to a production default if this 32-GPU canary passes
-on the intended dataset and max-length mix.
+Validated local gate on 2026-06-11:
+
+```bash
+python scripts/compare_linear_ce_canary.py \
+  logs/qwen36-27b-paper2arm-distill-megatron/qwen36-27b-sft-cp-capacity-16384-20260611-174250-cp2-tp4 \
+  logs/qwen36-27b-paper2arm-distill-megatron/qwen36-27b-sft-cp-streamingce-opt-16384-20260611-2129-cp2-tp4
+```
+
+The comparison passed with max loss delta 8e-8, max grad-norm delta 0.00298,
+peak memory saving 0.60 GiB, and steady-state speed regression 7.7%.
