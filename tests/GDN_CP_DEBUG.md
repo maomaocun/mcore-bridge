@@ -33,7 +33,9 @@ setup, so the default smoke avoids it.
 ## 27B Smoke Commands
 
 Use the ms-swift repo root for these commands. Keep `LINEAR_CE_CHUNK_SIZE=0`
-while validating CP; chunked linear CE intentionally raises for `CP > 1`.
+for the GDN CP isolation smokes unless the run is specifically validating
+chunked linear CE. See `tests/CHUNKED_LINEAR_CE_CP_DEBUG.md` for the separate
+CP-safe chunked CE checks and 27B measurements.
 
 ```bash
 source ./megatron_env.sh
@@ -147,8 +149,11 @@ Log roots:
   and fails with CP=1.
 - For 4K/8K when memory fits and throughput is the priority, CP=1 with more DP
   is faster on the same 8 GPUs. CP=2 trades throughput for activation memory.
-- Keep `LINEAR_CE_CHUNK_SIZE=0` with `context_parallel_size > 1`. Chunked
-  linear CE still raises for CP and should be validated separately before use.
+- `LINEAR_CE_CHUNK_SIZE>0` is numerically CP-safe in the local TP2/CP2 check
+  and in the 27B CP2 loss smoke, but the current implementation is not a 27B
+  production default because it used more memory and was slower than fused CE
+  in the 8K/16K measurements. Keep it opt-in and see
+  `tests/CHUNKED_LINEAR_CE_CP_DEBUG.md`.
 - Keep `ALLOW_EXPERIMENTAL_CP=true` and `USE_MCORE_GDN=true` explicit in launch
   scripts until this path has longer multi-node burn-in.
 - Do not treat CP>2 as production-ready from these checks; the current

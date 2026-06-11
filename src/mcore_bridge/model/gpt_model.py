@@ -174,8 +174,6 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
 
 
 def _chunked_linear_cross_entropy_loss(model, hidden_states, output_weight, labels, chunk_size):
-    if getattr(model.config, 'context_parallel_size', 1) != 1:
-        raise ValueError('LINEAR_CE_CHUNK_SIZE does not support context_parallel_size > 1.')
     if output_weight is None:
         output_weight = model.output_layer.weight
     if output_weight is None:
