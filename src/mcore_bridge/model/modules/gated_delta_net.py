@@ -4,8 +4,10 @@ import torch
 import torch.nn.functional as F
 import transformer_engine
 from contextlib import nullcontext
+from functools import lru_cache
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.mappings import all_to_all_hp2sp, all_to_all_sp2hp
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint, sharded_state_dict_default
@@ -28,6 +30,13 @@ try:
     from megatron.core.ssm.gated_delta_net import GatedDeltaNetSubmodules, torch_chunk_gated_delta_rule
 except ImportError:
     _GatedDeltaNet = object
+
+try:
+    from megatron.core.ssm.gated_delta_net import tensor_a2a_cp2hp as _mcore_tensor_a2a_cp2hp
+    from megatron.core.ssm.gated_delta_net import tensor_a2a_hp2cp as _mcore_tensor_a2a_hp2cp
+except ImportError:
+    _mcore_tensor_a2a_cp2hp = None
+    _mcore_tensor_a2a_hp2cp = None
 
 
 # Code borrowed from NVIDIA/Megatron-LM
@@ -89,6 +98,163 @@ def get_parameter_local_cp(
     return param
 
 
+def _all_to_all_cp2hp(input_: torch.Tensor, cp_group: torch.distributed.ProcessGroup) -> torch.Tensor:
+    assert input_.dim() == 3, 'all_to_all_cp2hp assumes 3-d input shape.'
+    s_in, b_in, h_in = input_.shape
+    s_out, h_out = s_in * cp_group.size(), h_in // cp_group.size()
+    output = all_to_all_sp2hp(input_, group=cp_group)
+    return output.reshape(s_out, b_in, h_out)
+
+
+def _all_to_all_hp2cp(input_: torch.Tensor, cp_group: torch.distributed.ProcessGroup) -> torch.Tensor:
+    assert input_.dim() == 3, 'all_to_all_hp2cp assumes 3-d input shape.'
+    s_in, b_in, h_in = input_.shape
+    s_out, h_out = s_in // cp_group.size(), h_in * cp_group.size()
+    output = all_to_all_hp2sp(input_, group=cp_group)
+    return output.reshape(s_out, b_in, h_out)
+
+
+def _undo_attention_load_balancing(input_: torch.Tensor, cp_size: int) -> torch.Tensor:
+    num_chunks = 2 * cp_size
+    chunks = torch.chunk(input_, chunks=num_chunks, dim=0)
+    order = [2 * i for i in range(cp_size)] + [num_chunks - 2 * i - 1 for i in range(cp_size)]
+    return torch.cat([chunks[i] for i in order], dim=0)
+
+
+def _redo_attention_load_balancing(input_: torch.Tensor, cp_size: int) -> torch.Tensor:
+    num_chunks = 2 * cp_size
+    chunks = torch.chunk(input_, chunks=num_chunks, dim=0)
+    order = [None] * num_chunks
+    order[::2] = range(cp_size)
+    order[1::2] = reversed(range(cp_size, num_chunks))
+    return torch.cat([chunks[i] for i in order], dim=0)
+
+
+def tensor_a2a_cp2hp(
+    tensor: torch.Tensor,
+    seq_dim: int,
+    head_dim: int,
+    cp_group: torch.distributed.ProcessGroup,
+    split_sections: Optional[List[int]] = None,
+    undo_attention_load_balancing: bool = True,
+):
+    if _mcore_tensor_a2a_cp2hp is not None:
+        return _mcore_tensor_a2a_cp2hp(
+            tensor,
+            seq_dim=seq_dim,
+            head_dim=head_dim,
+            cp_group=cp_group,
+            split_sections=split_sections,
+            undo_attention_load_balancing=undo_attention_load_balancing,
+        )
+
+    cp_size = cp_group.size()
+    if cp_size == 1:
+        return tensor
+    assert seq_dim == 0, f'tensor_a2a_cp2hp only supports seq_dim == 0 for now, but got {seq_dim=}'
+    assert head_dim == -1 or head_dim == 2, f'tensor_a2a_cp2hp only supports head_dim == -1 or 2, got {head_dim=}'
+    assert tensor.dim() == 3, f'tensor_a2a_cp2hp only supports 3-d input tensor, got {tensor.dim()=}'
+
+    if split_sections is not None:
+        outputs = [
+            tensor_a2a_cp2hp(
+                x,
+                seq_dim=seq_dim,
+                head_dim=head_dim,
+                cp_group=cp_group,
+                undo_attention_load_balancing=False,
+            ) for x in torch.split(tensor, split_sections, dim=head_dim)
+        ]
+        tensor = torch.cat(outputs, dim=head_dim)
+    else:
+        tensor = _all_to_all_cp2hp(tensor, cp_group)
+    if undo_attention_load_balancing:
+        tensor = _undo_attention_load_balancing(tensor, cp_size)
+    return tensor
+
+
+def tensor_a2a_hp2cp(
+    tensor: torch.Tensor,
+    seq_dim: int,
+    head_dim: int,
+    cp_group: torch.distributed.ProcessGroup,
+    split_sections: Optional[List[int]] = None,
+    redo_attention_load_balancing: bool = True,
+):
+    if _mcore_tensor_a2a_hp2cp is not None:
+        return _mcore_tensor_a2a_hp2cp(
+            tensor,
+            seq_dim=seq_dim,
+            head_dim=head_dim,
+            cp_group=cp_group,
+            split_sections=split_sections,
+            redo_attention_load_balancing=redo_attention_load_balancing,
+        )
+
+    cp_size = cp_group.size()
+    if cp_size == 1:
+        return tensor
+    assert seq_dim == 0, f'tensor_a2a_hp2cp only supports seq_dim == 0 for now, but got {seq_dim=}'
+    assert head_dim == -1 or head_dim == 2, f'tensor_a2a_hp2cp only supports head_dim == -1 or 2, got {head_dim=}'
+    assert tensor.dim() == 3, f'tensor_a2a_hp2cp only supports 3-d input tensor, got {tensor.dim()=}'
+
+    if redo_attention_load_balancing:
+        tensor = _redo_attention_load_balancing(tensor, cp_size)
+    if split_sections is not None:
+        outputs = [
+            tensor_a2a_hp2cp(
+                x,
+                seq_dim=seq_dim,
+                head_dim=head_dim,
+                cp_group=cp_group,
+                redo_attention_load_balancing=False,
+            ) for x in torch.split(tensor, split_sections, dim=head_dim)
+        ]
+        tensor = torch.cat(outputs, dim=head_dim)
+    else:
+        tensor = _all_to_all_hp2cp(tensor, cp_group)
+    return tensor
+
+
+def _build_thd_cp_a2a_perm(cu_seqlens: torch.Tensor, cp_size: int, t_global: int):
+    cu = cu_seqlens.to(dtype=torch.long)
+    seq_lens = torch.diff(cu)
+    if (seq_lens % (2 * cp_size) != 0).any():
+        raise ValueError(
+            f'GDN CP with THD format requires each packed sequence length to be divisible by '
+            f'2*cp_size={2 * cp_size}, but got lengths: {seq_lens.tolist()}')
+    t_local = t_global // cp_size
+    positions = torch.arange(t_global, device=cu.device)
+    seq_idx = torch.bucketize(positions, cu[1:], right=True)
+    halves = seq_lens // (2 * cp_size)
+    local_starts = cu[:-1] // cp_size
+    global_starts = cu[:-1]
+    half_i = halves[seq_idx]
+    pos_in_seq = positions - global_starts[seq_idx]
+    natural_chunk = pos_in_seq // half_i
+    offset = pos_in_seq - natural_chunk * half_i
+    lb_chunk = torch.where(natural_chunk < cp_size, 2 * natural_chunk, 4 * cp_size - 2 * natural_chunk - 1)
+    rank = lb_chunk // 2
+    half_within_rank = lb_chunk - 2 * rank
+    k = half_within_rank * half_i + offset
+    idx = rank * t_local + local_starts[seq_idx] + k
+    inv = torch.empty_like(idx)
+    inv[idx] = positions
+    return idx, inv
+
+
+@lru_cache(maxsize=8)
+def _build_head_perm_for_split_sections(split_sections, cp_size: int, device: torch.device) -> torch.Tensor:
+    assert all(s % cp_size == 0 for s in split_sections), (
+        f'split_sections {split_sections} must be divisible by cp_size {cp_size} for GDN')
+    offset = 0
+    parts = []
+    for size in split_sections:
+        parts.append(torch.arange(offset, offset + size, device=device, dtype=torch.long).view(cp_size, -1))
+        offset += size
+    return torch.cat(parts, dim=-1).view(-1)
+
+
 class GatedDeltaNet(_GatedDeltaNet):
 
     def __init__(self, config: ModelConfig, submodules: 'GatedDeltaNetSubmodules', *args, **kwargs):
@@ -102,6 +268,10 @@ class GatedDeltaNet(_GatedDeltaNet):
         finally:
             if config.linear_decoupled_in_proj:
                 submodules.in_proj = in_proj
+        self.cp_size = self.pg_collection.cp.size()
+        self.qk_dim_local_tp = self.qk_dim // self.tp_size
+        self.v_dim_local_tp = self.v_dim // self.tp_size
+        self.conv_dim_local_tp = self.conv_dim // self.tp_size
         if not config.linear_decoupled_in_proj:
             return
         self.in_proj_qkvz_dim = self.qk_dim * 2 + self.v_dim * 2
@@ -183,6 +353,9 @@ class GatedDeltaNet(_GatedDeltaNet):
             assert not self.config.sequence_parallel
             # TODO: support inference
             raise NotImplementedError('GDN does not support inference for now.')
+
+        if not self.config.linear_decoupled_in_proj:
+            return self._forward_merged_in_proj(hidden_states, packed_seq_params)
 
         cu_seqlens = None if packed_seq_params is None else packed_seq_params.cu_seqlens_q
         # Input projection
@@ -371,6 +544,201 @@ class GatedDeltaNet(_GatedDeltaNet):
                 norm_out = tensor_a2a_hp2cp(norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp)
 
         # Output projection
+        nvtx_range_push(suffix='out_proj')
+        out, out_bias = self.out_proj(norm_out)
+        nvtx_range_pop(suffix='out_proj')
+
+        return out, out_bias
+
+    def _forward_merged_in_proj(
+        self,
+        hidden_states: torch.Tensor,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
+        seq_len, batch, _ = hidden_states.shape
+        cp_size = self.cp_size
+        seq_len = seq_len * self.sp_size * cp_size
+        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        thd_cp_a2a_inv = None
+
+        if packed_seq:
+            assert batch == 1, 'Packed sequence expects batch dimension to be 1.'
+            if self.config.deterministic_mode:
+                raise NotImplementedError('GDN CP with packed sequence does not support deterministic mode.')
+            cu_seqlens_q = (packed_seq_params.cu_seqlens_q_padded
+                            if packed_seq_params.cu_seqlens_q_padded is not None else packed_seq_params.cu_seqlens_q)
+            cu_seqlens_kv = (packed_seq_params.cu_seqlens_kv_padded if packed_seq_params.cu_seqlens_kv_padded
+                             is not None else packed_seq_params.cu_seqlens_kv)
+            if cu_seqlens_q[-1].item() != seq_len:
+                raise ValueError(
+                    f'GDN packed cu_seqlens_q[-1]={cu_seqlens_q[-1].item()} does not match total seq_len={seq_len}.')
+            if not torch.equal(cu_seqlens_q, cu_seqlens_kv):
+                raise ValueError('GDN currently requires cu_seqlens_q and cu_seqlens_kv to match.')
+        else:
+            cu_seqlens_q = None
+
+        nvtx_range_push(suffix='in_proj')
+        qkvzba, _ = self.in_proj(hidden_states)
+        nvtx_range_pop(suffix='in_proj')
+
+        if cp_size > 1:
+            head_perm = _build_head_perm_for_split_sections(
+                (
+                    self.qk_dim_local_tp,
+                    self.qk_dim_local_tp,
+                    self.v_dim_local_tp,
+                    self.v_dim_local_tp,
+                    self.num_value_heads // self.tp_size,
+                    self.num_value_heads // self.tp_size,
+                ),
+                cp_size,
+                qkvzba.device,
+            )
+            qkvzba = qkvzba.index_select(-1, head_perm)
+
+        if packed_seq:
+            qkvzba = tensor_a2a_cp2hp(
+                qkvzba,
+                seq_dim=0,
+                head_dim=-1,
+                cp_group=self.pg_collection.cp,
+                undo_attention_load_balancing=False,
+            )
+            if cp_size > 1:
+                thd_cp_a2a_idx, thd_cp_a2a_inv = _build_thd_cp_a2a_perm(cu_seqlens_q, cp_size, seq_len)
+                qkvzba = qkvzba.index_select(0, thd_cp_a2a_idx)
+        else:
+            qkvzba = tensor_a2a_cp2hp(qkvzba, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp)
+
+        qkvzba = qkvzba.transpose(0, 1)
+        qkv, gate, beta, alpha = torch.split(
+            qkvzba,
+            [
+                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // cp_size,
+                self.v_dim_local_tp // cp_size,
+                self.num_value_heads // self.tp_size // cp_size,
+                self.num_value_heads // self.tp_size // cp_size,
+            ],
+            dim=-1,
+        )
+        gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
+        beta = beta.reshape(batch, seq_len, -1)
+        alpha = alpha.reshape(batch, seq_len, -1)
+
+        nvtx_range_push(suffix='conv1d')
+        qkv_channels_split_sections = [self.qk_dim_local_tp, self.qk_dim_local_tp, self.v_dim_local_tp]
+        conv1d_weight = get_parameter_local_cp(
+            self.conv1d.weight,
+            dim=0,
+            cp_group=self.pg_collection.cp,
+            split_sections=qkv_channels_split_sections,
+        )
+        conv1d_bias = (
+            get_parameter_local_cp(
+                self.conv1d.bias,
+                dim=0,
+                cp_group=self.pg_collection.cp,
+                split_sections=qkv_channels_split_sections,
+            ) if self.conv_bias else None)
+        if (causal_conv1d is None) or self.config.deterministic_mode:
+            assert cu_seqlens_q is None, 'Packed sequences are not supported when fla is not available.'
+            qkv = qkv.transpose(1, 2).contiguous()
+            conv_out = F.conv1d(
+                input=qkv,
+                weight=conv1d_weight,
+                bias=conv1d_bias,
+                stride=self.conv1d.stride,
+                padding=self.conv1d.padding,
+                dilation=self.conv1d.dilation,
+                groups=self.conv_dim_local_tp // cp_size,
+            )
+            qkv = self.act_fn(conv_out[..., :seq_len])
+            qkv = qkv.transpose(1, 2)
+        else:
+            assert self.activation in ['silu', 'swish']
+            qkv = causal_conv1d(
+                x=qkv,
+                weight=conv1d_weight.squeeze(1),
+                bias=conv1d_bias,
+                activation=self.activation,
+                cu_seqlens=cu_seqlens_q,
+            )[0]
+        nvtx_range_pop(suffix='conv1d')
+
+        query_key, value = torch.split(
+            qkv,
+            [2 * self.qk_dim_local_tp // cp_size, self.v_dim_local_tp // cp_size],
+            dim=-1,
+        )
+        query_key = query_key.reshape(batch, seq_len, -1, self.key_head_dim)
+        value = value.reshape(batch, seq_len, -1, self.value_head_dim)
+        if self.use_qk_l2norm:
+            query_key = l2norm(query_key.contiguous())
+        num_query_key_heads_per_device = self.qk_dim_local_tp // self.key_head_dim // cp_size
+        query, key = torch.split(query_key, [num_query_key_heads_per_device, num_query_key_heads_per_device], dim=2)
+        if self.num_value_heads // self.num_key_heads > 1:
+            repeat_factor = self.num_value_heads // self.num_key_heads
+            query = query.repeat_interleave(repeat_factor, dim=2)
+            key = key.repeat_interleave(repeat_factor, dim=2)
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+        gate = gate.contiguous()
+        beta = beta.contiguous()
+        alpha = alpha.contiguous()
+
+        nvtx_range_push(suffix='g_and_beta')
+        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
+        dt_bias_local_cp = get_parameter_local_cp(self.dt_bias, dim=0, cp_group=self.pg_collection.cp)
+        g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)
+        beta = beta.sigmoid()
+        nvtx_range_pop(suffix='g_and_beta')
+
+        nvtx_range_push(suffix='gated_delta_rule')
+        if self.config.deterministic_mode:
+            core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=False,
+            )
+        else:
+            core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=False,
+                cu_seqlens=cu_seqlens_q,
+            )
+        nvtx_range_pop(suffix='gated_delta_rule')
+
+        nvtx_range_push(suffix='gated_norm')
+        norm_out = self._apply_gated_norm(core_attn_out, gate)
+        nvtx_range_pop(suffix='gated_norm')
+
+        norm_out = norm_out.reshape(batch, seq_len, -1)
+        norm_out = norm_out.transpose(0, 1).contiguous()
+        if packed_seq:
+            if cp_size > 1:
+                norm_out = norm_out.index_select(0, thd_cp_a2a_inv)
+            norm_out = tensor_a2a_hp2cp(
+                norm_out,
+                seq_dim=0,
+                head_dim=-1,
+                cp_group=self.pg_collection.cp,
+                redo_attention_load_balancing=False,
+            )
+        else:
+            norm_out = tensor_a2a_hp2cp(norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp)
+
         nvtx_range_push(suffix='out_proj')
         out, out_bias = self.out_proj(norm_out)
         nvtx_range_pop(suffix='out_proj')

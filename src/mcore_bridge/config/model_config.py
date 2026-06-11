@@ -11,7 +11,7 @@ from transformers.utils import is_torch_npu_available
 from transformers.utils.versions import require_version
 from typing import List, Literal, Optional, Union
 
-from mcore_bridge.utils import get_logger, json_parse_to_dict
+from mcore_bridge.utils import get_env_args, get_logger, json_parse_to_dict
 
 logger = get_logger()
 
@@ -314,7 +314,21 @@ class ModelConfig(TransformerConfig):
             self.mtp_num_layers = 1
         else:
             self.mtp_unroll_steps = self.mtp_num_layers
-        super().__post_init__()
+        if self.experimental_attention_variant == 'gated_delta_net' and self.context_parallel_size > 1:
+            allow_gdn_cp = get_env_args('ALLOW_MCORE_GDN_CP', bool, False)
+            if not allow_gdn_cp:
+                raise AssertionError(
+                    'gated_delta_net CP is experimental in mcore_bridge. '
+                    'Set ALLOW_MCORE_GDN_CP=true to bypass Megatron Core 0.17 config guard.')
+            self._check_gated_delta_net_context_parallel()
+            experimental_attention_variant = self.experimental_attention_variant
+            self.experimental_attention_variant = None
+            try:
+                super().__post_init__()
+            finally:
+                self.experimental_attention_variant = experimental_attention_variant
+        else:
+            super().__post_init__()
 
         self._check_npu()
         if self.mcore_model_type is None:
@@ -345,6 +359,25 @@ class ModelConfig(TransformerConfig):
                 self.linear_attention_freq = [
                     0 if ((i + 1) % self.linear_attention_freq == 0) else 1 for i in range(self.num_layers)
                 ]
+
+    def _check_gated_delta_net_context_parallel(self):
+        assert self.linear_attention_freq is not None, 'linear_attention_freq must be set for linear gated_delta_net.'
+        assert self.linear_conv_kernel_dim is not None, 'linear_conv_kernel_dim must be set for gated delta net.'
+        assert self.linear_key_head_dim is not None, 'linear_key_head_dim must be set for gated delta net.'
+        assert self.linear_value_head_dim is not None, 'linear_value_head_dim must be set for gated delta net.'
+        assert self.linear_num_key_heads is not None, 'linear_num_key_heads must be set for gated delta net.'
+        assert self.linear_num_value_heads is not None, 'linear_num_value_heads must be set for gated delta net.'
+        assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
+            f'linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of '
+            f'linear_num_key_heads ({self.linear_num_key_heads}).')
+        assert self.linear_num_key_heads % self.tensor_model_parallel_size == 0, (
+            'linear_num_key_heads must be a multiple of tensor_model_parallel_size.')
+        assert self.linear_num_value_heads % self.tensor_model_parallel_size == 0, (
+            'linear_num_value_heads must be a multiple of tensor_model_parallel_size.')
+        assert self.linear_num_key_heads % (self.tensor_model_parallel_size * self.context_parallel_size) == 0, (
+            f'linear_num_key_heads ({self.linear_num_key_heads}) must be a multiple of '
+            f'tensor_model_parallel_size*context_parallel_size '
+            f'({self.tensor_model_parallel_size * self.context_parallel_size}).')
 
     def _check_npu(self):
         MAX_NPU_EXPERTS_PER_EP = 128
