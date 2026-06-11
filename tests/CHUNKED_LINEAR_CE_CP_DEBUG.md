@@ -104,6 +104,53 @@ Log roots:
 - `logs/qwen36-27b-paper2arm-distill-megatron/qwen36-27b-sft-cp-streamingce-16384-20260611-202400-cp2-tp4`
 - `logs/qwen36-27b-paper2arm-distill-megatron/qwen36-27b-sft-cp-streamingce-opt-16384-20260611-2129-cp2-tp4`
 
+## 27B 32K Local Findings
+
+All runs used the same local 8xA100 host, BF16, `GLOBAL_BATCH_SIZE=8`,
+`MICRO_BATCH_SIZE=1`, padding-free THD, `SKIP_FINAL_SAVE=true`, and two train
+iterations.
+
+Selective attention recompute is not sufficient for 32K on this 8-GPU host:
+
+| max length | TP | CP | recompute | impl | result |
+| ---: | ---: | ---: | --- | --- | --- |
+| 32768 | 4 | 2 | selective attention | native | OOM before CE in FLA `chunk_gated_delta_rule_fwd`, allocating `u = torch.empty_like(v)` with about 79.2 GiB in use |
+| 32768 | 2 | 4 | selective attention | native | OOM before CE in GDN `query.repeat_interleave`, because lower TP doubled the model shard and left too little headroom |
+
+This means the 32K local bottleneck is GatedDeltaNet forward scratch plus saved
+non-attention activations, not lm_head/CE. Streaming CE cannot fix those
+selective-recompute OOMs because the run fails before the loss path.
+
+Full recompute makes 32K fit locally with TP=4, CP=2:
+
+| max length | impl | recompute | losses | grad norms | peak GiB/GPU | logged s/it |
+| ---: | --- | --- | --- | --- | ---: | --- |
+| 32768 | native | full, uniform, every layer | 0.20043571, 0.23982921 | 1.29552317, 1.28497398 | 38.46 | 156.02, 113.53 |
+| 32768 | streaming | full, uniform, every layer | 0.20043567, 0.23982918 | 1.29451263, 1.28170609 | 38.46 | 130.69, 97.39 |
+
+The local compare gate for the two full-recompute 32K runs passed when the
+memory-saving requirement was set to zero:
+
+```bash
+python scripts/compare_linear_ce_canary.py \
+  logs/qwen36-27b-paper2arm-distill-megatron/qwen36-27b-sft-cp-native-32768-fullrecompute-local-20260611-222742-cp2-tp4 \
+  logs/qwen36-27b-paper2arm-distill-megatron/qwen36-27b-sft-cp-streamingce-32768-fullrecompute-local-20260611-223548-cp2-tp4 \
+  --min-memory-saving-gib 0.0 --max-speed-regression 0.35
+```
+
+Result: max loss delta `4e-8`, max grad-norm delta `0.00327`, same peak memory
+`38.46 GiB`, and steady-state speed regression `-9.9%` by the compare script's
+coarse elapsed-time estimate. With the normal `0.3 GiB` memory-saving gate it
+correctly fails the memory check, because full recompute moves the full-step
+peak away from the CE path.
+
+Log roots:
+
+- `logs/qwen36-27b-paper2arm-distill-megatron/qwen36-27b-sft-cp-native-32768-local-20260611-221716-cp2-tp4`
+- `logs/qwen36-27b-paper2arm-distill-megatron/qwen36-27b-sft-cp-native-32768-local-20260611-222227-cp4-tp2`
+- `logs/qwen36-27b-paper2arm-distill-megatron/qwen36-27b-sft-cp-native-32768-fullrecompute-local-20260611-222742-cp2-tp4`
+- `logs/qwen36-27b-paper2arm-distill-megatron/qwen36-27b-sft-cp-streamingce-32768-fullrecompute-local-20260611-223548-cp2-tp4`
+
 ## FLA Reference Check
 
 `../flash-linear-attention/fla/modules/fused_linear_cross_entropy.py` is adapted
