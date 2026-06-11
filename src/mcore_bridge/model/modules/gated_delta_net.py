@@ -377,7 +377,6 @@ class GatedDeltaNet(_GatedDeltaNet):
         nvtx_range_pop(suffix='in_proj')
 
         if cp_size > 1:
-            from megatron.core.ssm.gated_delta_net import tensor_a2a_cp2hp, tensor_a2a_hp2cp
             if cu_seqlens is not None:
                 unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens // self.cp_size, dim=0)
                 outputs = []
