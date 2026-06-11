@@ -179,3 +179,38 @@ small relative to the total model step peak.
   avoids materializing even per-chunk logits and avoids the current
   sequence-parallel gather/cublas workspace overhead. That likely belongs in a
   TE/CUTLASS-level kernel, not in this Python-autograd wrapper.
+
+## 32-GPU Canary
+
+Use the ms-swift repo root. The submit script defaults to `DRY_RUN=1`; set
+`DRY_RUN=0` only when intentionally launching both DLC jobs.
+
+```bash
+DRY_RUN=0 MAX_LENGTH=32768 TRAIN_ITERS=2 \
+  dlc/submit_qwen36_27b_linear_ce_canary_32g.sh
+```
+
+This submits two 4-node x 8-GPU runs using the production DLC wrapper:
+
+- native baseline: `LINEAR_CE_IMPL=torch LINEAR_CE_CHUNK_SIZE=0`
+- candidate: `LINEAR_CE_IMPL=streaming LINEAR_CE_CHUNK_SIZE=2048`
+
+After both runs finish, compare their step logs:
+
+```bash
+python scripts/compare_linear_ce_canary.py \
+  dlc/logs/linear_ce_native_32g_<stamp> \
+  dlc/logs/linear_ce_streaming_32g_<stamp>
+```
+
+Default pass gates:
+
+- at least 2 common train steps
+- max loss absolute delta <= 2e-6
+- max grad-norm absolute delta <= 0.01
+- streaming peak `memory(GiB)` saves at least 0.3 GiB versus native
+- steady-state step time regression <= 35%, excluding the first step because it
+  includes Triton JIT and other one-time warmup
+
+Only promote streaming CE to a production default if this 32-GPU canary passes
+on the intended dataset and max-length mix.
