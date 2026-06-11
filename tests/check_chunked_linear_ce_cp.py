@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from mcore_bridge.model.fused_linear_ce import VocabParallelFusedLinearCrossEntropy
 from mcore_bridge.model.gpt_model import _ChunkedLinearCrossEntropy
 
 
@@ -93,7 +94,7 @@ def _reference_losses(hidden, weight, labels):
     return losses.view(seq_len, batch).transpose(0, 1).contiguous()
 
 
-def _run_case(name, tp_rank, cp_rank, tp_size, cp_size, tp_group, cp_group, reduce_grad_input):
+def _run_case(name, ce_function, tp_rank, cp_rank, tp_size, cp_size, tp_group, cp_group, reduce_grad_input):
     if dist.get_rank() == 0:
         print(f'checking {name}', flush=True)
 
@@ -124,7 +125,7 @@ def _run_case(name, tp_rank, cp_rank, tp_size, cp_size, tp_group, cp_group, redu
     vocab_end = vocab_start + partition_vocab_size
     local_weight = weight.detach()[vocab_start:vocab_end].contiguous().requires_grad_(True)
 
-    losses = _ChunkedLinearCrossEntropy.apply(
+    losses = ce_function.apply(
         local_hidden,
         local_weight,
         local_labels,
@@ -153,26 +154,32 @@ def main():
     if tp_size < 2:
         raise AssertionError('check_chunked_linear_ce_cp.py requires TP size >= 2')
 
-    _run_case(
-        'CP local CE with internal TP grad reduce',
-        tp_rank,
-        cp_rank,
-        tp_size,
-        cp_size,
-        tp_group,
-        cp_group,
-        reduce_grad_input=True,
-    )
-    _run_case(
-        'CP local CE with external sequence-parallel grad reduce',
-        tp_rank,
-        cp_rank,
-        tp_size,
-        cp_size,
-        tp_group,
-        cp_group,
-        reduce_grad_input=False,
-    )
+    for impl_name, ce_function in (
+        ('torch chunked CE', _ChunkedLinearCrossEntropy),
+        ('triton fused linear CE', VocabParallelFusedLinearCrossEntropy),
+    ):
+        _run_case(
+            f'{impl_name} / CP local CE with internal TP grad reduce',
+            ce_function,
+            tp_rank,
+            cp_rank,
+            tp_size,
+            cp_size,
+            tp_group,
+            cp_group,
+            reduce_grad_input=True,
+        )
+        _run_case(
+            f'{impl_name} / CP local CE with external sequence-parallel grad reduce',
+            ce_function,
+            tp_rank,
+            cp_rank,
+            tp_size,
+            cp_size,
+            tp_group,
+            cp_group,
+            reduce_grad_input=False,
+        )
 
     if rank == 0:
         print(f'chunked linear CE CP checks OK with tp_size={tp_size}, cp_size={cp_size}', flush=True)

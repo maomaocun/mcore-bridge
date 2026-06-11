@@ -27,6 +27,7 @@ from typing import Optional, Tuple
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import get_logger, roll_tensor, split_cp_inputs
 
+from .fused_linear_ce import VocabParallelFusedLinearCrossEntropy
 from .rope import dynamic_rope_update, get_rope_inv_freq
 
 logger = get_logger()
@@ -55,6 +56,22 @@ def _parse_linear_ce_chunk_size() -> int:
     if chunk_size < 0:
         raise ValueError(f'LINEAR_CE_CHUNK_SIZE must be >= 0. Got: {chunk_size}')
     return chunk_size
+
+
+def _parse_linear_ce_impl() -> str:
+    raw_value = os.environ.get('LINEAR_CE_IMPL', 'torch').strip().lower()
+    aliases = {
+        '': 'torch',
+        'chunked': 'torch',
+        'python': 'torch',
+        'torch': 'torch',
+        'triton': 'triton',
+        'fused': 'triton',
+        'fused_linear': 'triton',
+    }
+    if raw_value not in aliases:
+        raise ValueError(f'LINEAR_CE_IMPL must be one of torch,triton. Got: {raw_value!r}')
+    return aliases[raw_value]
 
 
 def _tp_group_size(tp_group) -> int:
@@ -188,6 +205,11 @@ def _chunked_linear_cross_entropy_loss(model, hidden_states, output_weight, labe
 
     vocab_start_index = torch.distributed.get_rank(model.pg_collection.tp) * output_weight.shape[0] \
         if _tp_group_size(model.pg_collection.tp) > 1 else 0
+    linear_ce_impl = _parse_linear_ce_impl()
+    if linear_ce_impl == 'triton':
+        return VocabParallelFusedLinearCrossEntropy.apply(
+            hidden_states, output_weight, labels, model.pg_collection.tp, vocab_start_index, chunk_size,
+            reduce_grad_input)
     return _ChunkedLinearCrossEntropy.apply(
         hidden_states, output_weight, labels, model.pg_collection.tp, vocab_start_index, chunk_size, reduce_grad_input)
 
@@ -657,7 +679,9 @@ class GPTModel(McoreGPTModel):
                 raise ValueError('LINEAR_CE_CHUNK_SIZE currently does not support MuP output scaling.')
             if (os.environ.get('LINEAR_CE_DEBUG', '').lower() in {'1', 'true', 'yes', 'on'}
                     and not getattr(self, '_linear_ce_chunk_size_logged', False)):
-                logger.info(f'Using supervised-token chunked linear CE loss; chunk_size={linear_ce_chunk_size}.')
+                logger.info(
+                    f'Using supervised-token chunked linear CE loss; '
+                    f'impl={_parse_linear_ce_impl()}, chunk_size={linear_ce_chunk_size}.')
                 self._linear_ce_chunk_size_logged = True
             return _chunked_linear_cross_entropy_loss(self, hidden_states, output_weight, labels, linear_ce_chunk_size)
 
