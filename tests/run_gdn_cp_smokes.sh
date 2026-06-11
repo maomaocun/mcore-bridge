@@ -40,17 +40,19 @@ run_check() {
 "${PYTHON_BIN}" -m py_compile \
   "${ROOT_DIR}/src/mcore_bridge/model/modules/gated_delta_net.py" \
   "${ROOT_DIR}/tests/check_gdn_cp_a2a.py" \
+  "${ROOT_DIR}/tests/check_gdn_cp_backward.py" \
   "${ROOT_DIR}/tests/check_gdn_cp_equivalence.py" \
   "${ROOT_DIR}/tests/check_gdn_cp_fla_equivalence.py"
 
 run_check 0 check_gdn_cp_equivalence.py
+run_check 1 check_gdn_cp_backward.py
 if [[ "${RUN_FLA:-0}" == "1" ]]; then
-  run_check 1 check_gdn_cp_fla_equivalence.py
+  run_check 2 check_gdn_cp_fla_equivalence.py
 else
   echo "[gdn-cp-smoke] skip FLA real-operator check; set RUN_FLA=1 to enable"
 fi
 if [[ "${RUN_SLOW_A2A:-0}" == "1" ]]; then
-  run_check 2 check_gdn_cp_a2a.py
+  run_check 3 check_gdn_cp_a2a.py
 else
   echo "[gdn-cp-smoke] skip slow helper-import A2A check; set RUN_SLOW_A2A=1 to enable"
 fi

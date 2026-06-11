@@ -1,4 +1,6 @@
 import os
+import importlib.util
+from pathlib import Path
 
 os.environ.setdefault('TORCH_COMPILE_DISABLE', '1')
 os.environ.setdefault('TORCHINDUCTOR_COMPILE_THREADS', '1')
@@ -17,6 +19,20 @@ def _init_distributed():
     torch.cuda.set_device(local_rank)
     dist.init_process_group('nccl')
     return local_rank, dist.get_rank(), dist.get_world_size()
+
+
+def _load_gdn_helpers():
+    module_path = Path(__file__).resolve().parents[1] / 'src/mcore_bridge/model/modules/gated_delta_net.py'
+    spec = importlib.util.spec_from_file_location('mcore_bridge_gdn_for_fla_check', module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return (
+        module._build_head_perm_for_split_sections,
+        module._build_thd_cp_a2a_perm,
+        module.get_parameter_local_cp,
+        module.tensor_a2a_cp2hp,
+        module.tensor_a2a_hp2cp,
+    )
 
 
 def _split_cp_inputs_reference(inputs: torch.Tensor, cp_size: int, cp_rank: int, dim: int) -> torch.Tensor:
@@ -143,6 +159,14 @@ def _make_realish_qwen_case(seq_len: int, batch: int):
     return qkvzba, conv_weight, conv_bias, A_log, dt_bias, out_norm_weight, dims
 
 
+def _clone_case_with_grads(case):
+    cloned = []
+    for item in case[:-1]:
+        cloned.append(item.detach().clone().requires_grad_(True))
+    cloned.append(case[-1])
+    return tuple(cloned)
+
+
 def _slice_dims(dims, cp_size):
     return {
         'qk_dim': dims['qk_dim'] // cp_size,
@@ -233,6 +257,27 @@ def _head_perm(dims, cp_size):
     )
 
 
+def _head_perm_from_helper(build_head_perm, dims, cp_size):
+    return build_head_perm(
+        (
+            dims['qk_dim'],
+            dims['qk_dim'],
+            dims['v_dim'],
+            dims['v_dim'],
+            dims['num_value_heads'],
+            dims['num_value_heads'],
+        ),
+        cp_size,
+        torch.device('cuda'),
+    )
+
+
+def _gather_param_grad(local_grad, cp_group):
+    grad = torch.zeros_like(local_grad) if local_grad is None else local_grad.detach().clone()
+    dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=cp_group)
+    return grad
+
+
 def _check_packed_fla(cp_group, rank, cp_size):
     if rank == 0:
         print('checking packed real-operator GDN CP equivalence', flush=True)
@@ -268,12 +313,115 @@ def _check_packed_fla(cp_group, rank, cp_size):
     _assert_close('packed FLA roundtrip output', cp_out, expected)
 
 
+def _check_packed_fla_backward(cp_group, rank, cp_size, helpers):
+    build_head_perm, build_thd_perm, get_parameter_local_cp, tensor_a2a_cp2hp, tensor_a2a_hp2cp = helpers
+    if rank == 0:
+        print('checking packed real-operator GDN CP backward equivalence', flush=True)
+    lengths = torch.tensor([256], device='cuda', dtype=torch.long)
+    cu_seqlens = torch.cat([torch.zeros(1, device='cuda', dtype=torch.long), lengths.cumsum(dim=0)])
+    seq_len = int(cu_seqlens[-1].item())
+    base_case = _make_realish_qwen_case(seq_len=seq_len, batch=1)
+    ref_case = _clone_case_with_grads(base_case)
+    cp_case = _clone_case_with_grads(base_case)
+    ref_qkvzba, ref_conv_weight, ref_conv_bias, ref_A_log, ref_dt_bias, ref_out_norm_weight, dims = ref_case
+    cp_qkvzba, cp_conv_weight, cp_conv_bias, cp_A_log, cp_dt_bias, cp_out_norm_weight, _ = cp_case
+
+    torch.manual_seed(2468)
+    grad_out = torch.randn(seq_len, 1, dims['v_dim'], device='cuda', dtype=torch.float32) * 0.05
+
+    ref = _gdn_fla_core(
+        ref_qkvzba,
+        ref_conv_weight,
+        ref_conv_bias,
+        ref_A_log,
+        ref_dt_bias,
+        ref_out_norm_weight,
+        dims,
+        cu_seqlens=cu_seqlens,
+    )
+    (ref.float() * grad_out).sum().backward()
+
+    head_perm = _head_perm_from_helper(build_head_perm, dims, cp_size)
+    local = _split_cp_inputs_reference(cp_qkvzba.detach(), cp_size, rank, dim=0)
+    local = local.contiguous().index_select(-1, head_perm).requires_grad_(True)
+    hp = tensor_a2a_cp2hp(
+        local,
+        seq_dim=0,
+        head_dim=-1,
+        cp_group=cp_group,
+        undo_attention_load_balancing=False,
+    )
+    thd_idx, thd_inv = build_thd_perm(cu_seqlens, cp_size, seq_len)
+    hp = hp.index_select(0, thd_idx)
+
+    conv_sections = [dims['qk_dim'], dims['qk_dim'], dims['v_dim']]
+    cp_out_hp = _gdn_fla_core(
+        hp,
+        get_parameter_local_cp(cp_conv_weight, dim=0, cp_group=cp_group, split_sections=conv_sections),
+        get_parameter_local_cp(cp_conv_bias, dim=0, cp_group=cp_group, split_sections=conv_sections),
+        get_parameter_local_cp(cp_A_log, dim=0, cp_group=cp_group),
+        get_parameter_local_cp(cp_dt_bias, dim=0, cp_group=cp_group),
+        cp_out_norm_weight,
+        _slice_dims(dims, cp_size),
+        cu_seqlens=cu_seqlens,
+    )
+    cp_out = tensor_a2a_hp2cp(
+        cp_out_hp.index_select(0, thd_inv),
+        seq_dim=0,
+        head_dim=-1,
+        cp_group=cp_group,
+        redo_attention_load_balancing=False,
+    )
+    local_grad_out = _split_cp_inputs_reference(grad_out, cp_size, rank, dim=0).contiguous()
+    (cp_out.float() * local_grad_out).sum().backward()
+
+    expected_qkv_grad = _split_cp_inputs_reference(ref_qkvzba.grad, cp_size, rank, dim=0)
+    expected_qkv_grad = expected_qkv_grad.contiguous().index_select(-1, head_perm)
+    _assert_close('packed FLA qkvzba grad', local.grad, expected_qkv_grad, atol=2e-2, rtol=8e-2)
+    _assert_close(
+        'packed FLA conv_weight grad',
+        _gather_param_grad(cp_conv_weight.grad, cp_group),
+        ref_conv_weight.grad,
+        atol=2e-2,
+        rtol=8e-2,
+    )
+    _assert_close(
+        'packed FLA conv_bias grad',
+        _gather_param_grad(cp_conv_bias.grad, cp_group),
+        ref_conv_bias.grad,
+        atol=2e-2,
+        rtol=8e-2,
+    )
+    _assert_close(
+        'packed FLA A_log grad',
+        _gather_param_grad(cp_A_log.grad, cp_group),
+        ref_A_log.grad,
+        atol=2e-2,
+        rtol=8e-2,
+    )
+    _assert_close(
+        'packed FLA dt_bias grad',
+        _gather_param_grad(cp_dt_bias.grad, cp_group),
+        ref_dt_bias.grad,
+        atol=2e-2,
+        rtol=8e-2,
+    )
+    _assert_close(
+        'packed FLA out_norm_weight grad',
+        _gather_param_grad(cp_out_norm_weight.grad, cp_group),
+        ref_out_norm_weight.grad,
+        atol=2e-2,
+        rtol=8e-2,
+    )
+
+
 def main():
     _, rank, cp_size = _init_distributed()
     if cp_size < 2:
         raise AssertionError('check_gdn_cp_fla_equivalence.py requires at least 2 ranks.')
     cp_group = dist.group.WORLD
     _check_packed_fla(cp_group, rank, cp_size)
+    _check_packed_fla_backward(cp_group, rank, cp_size, _load_gdn_helpers())
     if rank == 0:
         print(f'GDN FLA CP equivalence checks OK with cp_size={cp_size}', flush=True)
     dist.destroy_process_group()
