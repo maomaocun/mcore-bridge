@@ -108,6 +108,48 @@ but it still materializes per-chunk logits and is not Megatron vocab-TP safe as
 is. It does not provide the fully tile-resident lm_head-to-loss kernel needed to
 remove logits entirely.
 
+## Loss-Path Memory Probe
+
+`tests/profile_linear_ce_memory.py` isolates the lm_head plus CE path from the
+full 27B model. It initializes a TP-only distributed run and compares:
+
+- `native_mcore`: Megatron sequence-parallel output linear, including its global
+  all-gather buffer, followed by native fused vocab-parallel CE.
+- `streaming`: `VocabParallelStreamingFusedLinearCrossEntropy`.
+
+The probe reports both `torch.cuda.max_memory_allocated()` and
+`torch.cuda.max_memory_reserved()`. Full training logs use
+`max_memory_reserved`, so small differences in the table above can include CUDA
+caching allocator reservation and fragmentation rather than live tensor usage.
+
+Run examples from `.deps/mcore-bridge`:
+
+```bash
+source ../../megatron_env.sh
+CUDA_VISIBLE_DEVICES=0,1,2,3 CUDA_DEVICE_MAX_CONNECTIONS=1 \
+  LINEAR_CE_PROFILE_CASE=native_mcore PROFILE_SEQ_LEN=16384 PROFILE_IGNORE_TOKENS=3842 \
+  torchrun --nproc_per_node 4 --master_port 29785 tests/profile_linear_ce_memory.py
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 CUDA_DEVICE_MAX_CONNECTIONS=1 \
+  LINEAR_CE_PROFILE_CASE=streaming PROFILE_SEQ_LEN=16384 PROFILE_IGNORE_TOKENS=3842 \
+  PROFILE_CHUNK_SIZE=2048 \
+  torchrun --nproc_per_node 4 --master_port 29786 tests/profile_linear_ce_memory.py
+```
+
+Validated on 2026-06-11 with TP=4, hidden size 5120, vocab 248320, BF16:
+
+| seq len | case | max allocated GiB | max reserved GiB |
+| ---: | --- | ---: | ---: |
+| 8192 | native_mcore | 4.4869 | 4.5137 |
+| 8192 | streaming | 2.8176 | 3.5371 |
+| 16384 | native_mcore | 8.3739 | 8.4004 |
+| 16384 | streaming | 2.8568 | 3.5371 |
+
+This confirms that streaming does reduce the isolated lm_head+CE live memory.
+The full 27B run still peaked slightly above native fused CE, so the measured
+training peak is dominated elsewhere in the iteration or by reserved allocator
+behavior. It is not explained by a CE-loss recompute setting.
+
 ## Production Guidance
 
 - Correctness: CP=2 chunked linear CE aligns with the non-chunked fused CE loss
