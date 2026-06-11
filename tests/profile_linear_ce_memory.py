@@ -29,7 +29,9 @@ def _init_distributed():
 
 
 def _make_labels(seq_len, batch_size, vocab_size, ignore_tokens):
-    labels = torch.randint(0, vocab_size, (batch_size, seq_len), device='cuda')
+    generator = torch.Generator(device='cuda')
+    generator.manual_seed(20260611)
+    labels = torch.randint(0, vocab_size, (batch_size, seq_len), device='cuda', generator=generator)
     if ignore_tokens > 0:
         labels[:, :ignore_tokens] = -100
     return labels
@@ -80,7 +82,8 @@ def main():
     weight = (torch.randn(vocab_partition, hidden_size, device='cuda', dtype=dtype) * 0.01)
     weight.requires_grad_(True)
     labels = _make_labels(seq_len, batch_size, vocab_size, ignore_tokens)
-    supervised = (labels != -100).sum().float()
+    loss_mask = (labels != -100).float()
+    supervised = loss_mask.sum().float()
 
     # Keep setup allocations out of the measured peak.
     torch.cuda.empty_cache()
@@ -100,13 +103,14 @@ def main():
         )
         losses = fused_vocab_parallel_cross_entropy(
             logits, labels.transpose(0, 1).contiguous(), dist.group.WORLD)
+        losses = losses.transpose(0, 1).contiguous()
     elif case == 'streaming':
         losses = VocabParallelStreamingFusedLinearCrossEntropy.apply(
             hidden, weight, labels, dist.group.WORLD, vocab_start, chunk_size)
     else:
         raise ValueError(f'Unknown LINEAR_CE_PROFILE_CASE={case!r}')
 
-    loss = losses.sum() / supervised.clamp_min(1.0)
+    loss = (losses.float() * loss_mask).sum() / supervised.clamp_min(1.0)
     loss.backward()
     _print_peak(case, loss)
     dist.destroy_process_group()

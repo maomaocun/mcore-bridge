@@ -127,6 +127,14 @@ The probe reports both `torch.cuda.max_memory_allocated()` and
 `torch.cuda.max_memory_reserved()`. Full training logs use
 `max_memory_reserved`, so small differences in the table above can include CUDA
 caching allocator reservation and fragmentation rather than live tensor usage.
+The probe applies the same outer SFT loss mask used by training: native
+Megatron fused vocab CE does not implement `ignore_index=-100` internally, and
+returns `[sequence, batch]` losses, so the probe transposes native losses to
+`[batch, sequence]` before masking. Without that mask, random ignored tokens
+inflate the reported native loss by roughly `total_tokens / supervised_tokens`.
+The printed probe loss is random-logit CE around `log(vocab)` and is only a
+sanity check that native and streaming see the same targets; it is not an SFT
+training-loss expectation.
 
 Run examples from `.deps/mcore-bridge`:
 
@@ -142,14 +150,15 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 CUDA_DEVICE_MAX_CONNECTIONS=1 \
   torchrun --nproc_per_node 4 --master_port 29786 tests/profile_linear_ce_memory.py
 ```
 
-Validated on 2026-06-11 with TP=4, hidden size 5120, vocab 248320, BF16:
+Validated on 2026-06-11 with TP=4, hidden size 5120, vocab 248320, BF16,
+fixed labels across TP ranks, and SFT-style loss masking:
 
 | seq len | case | max allocated GiB | max reserved GiB |
 | ---: | --- | ---: | ---: |
 | 8192 | native_mcore | 4.4869 | 4.5137 |
 | 8192 | streaming optimized | 1.7519 | 1.9941 |
-| 16384 | native_mcore | 8.3739 | 8.4004 |
-| 16384 | streaming optimized | 1.7911 | 1.8574 |
+| 16384 | native_mcore | 8.3740 | 8.4004 |
+| 16384 | streaming optimized | 1.7912 | 1.8574 |
 
 Before the row-max and in-place wgrad optimization, streaming measured 2.8176 /
 3.5371 GiB at 8K and 2.8568 / 3.5371 GiB at 16K. The optimized path removes the
