@@ -1406,6 +1406,29 @@ class GPTBridge:
                                                                                            config.hidden_size).clone()
         return hf_state_dict
 
+    def _pad_mcore_local_out_weight(self, mg_module, weight: torch.Tensor) -> torch.Tensor:
+        logical = None if mg_module is None else getattr(mg_module, '_mcore_gdn_logical_out_features', None)
+        padded = None if mg_module is None else getattr(mg_module, '_mcore_gdn_padded_out_features', None)
+        if logical is None or padded is None or logical == padded:
+            return weight
+        chunks = weight.chunk(self.tp_size, dim=0)
+        padded_chunks = []
+        for chunk in chunks:
+            if chunk.shape[0] != logical:
+                return weight
+            padded_chunks.append(F.pad(chunk, (0, 0, 0, padded - logical)))
+        return torch.cat(padded_chunks, dim=0)
+
+    def _unpad_mcore_local_out_weight(self, mg_module, weight: torch.Tensor) -> torch.Tensor:
+        logical = None if mg_module is None else getattr(mg_module, '_mcore_gdn_logical_out_features', None)
+        padded = None if mg_module is None else getattr(mg_module, '_mcore_gdn_padded_out_features', None)
+        if logical is None or padded is None or logical == padded:
+            return weight
+        chunks = weight.chunk(self.tp_size, dim=0)
+        if any(chunk.shape[0] != padded for chunk in chunks):
+            return weight
+        return torch.cat([chunk[:logical] for chunk in chunks], dim=0)
+
     def _set_linear_in_proj(self, mg_attn, hf_state_dict, to_mcore: bool):
         config = self.config
         num_key_heads = config.linear_num_key_heads
@@ -1439,6 +1462,7 @@ class GPTBridge:
                       for key in ['in_proj_z', 'in_proj_b', 'in_proj_a']),
                 ],
                                            dim=1).reshape((-1, config.hidden_size))
+                in_proj_weight = self._pad_mcore_local_out_weight(mg_attn.in_proj, in_proj_weight)
                 self._set_weight(mg_attn.in_proj.weight, in_proj_weight, 'in_proj.weight')
         else:
             qkv_dim = key_dim * 2 + value_dim
@@ -1474,6 +1498,8 @@ class GPTBridge:
                 in_proj_weight, _ = self._get_weight(None if mg_attn is None else mg_attn.in_proj.weight.data,
                                                      'in_proj.weight')
                 if in_proj_weight is not None:
+                    in_proj_weight = self._unpad_mcore_local_out_weight(
+                        None if mg_attn is None else mg_attn.in_proj, in_proj_weight)
                     in_proj_weight = in_proj_weight.reshape(num_key_heads, -1, config.hidden_size)
                     q = in_proj_weight[:, :key_dim].reshape(-1, config.hidden_size)
                     k = in_proj_weight[:, key_dim:2 * key_dim].reshape(-1, config.hidden_size)

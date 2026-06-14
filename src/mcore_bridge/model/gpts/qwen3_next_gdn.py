@@ -43,6 +43,33 @@ class Qwen3NextGDNBridgeMixin(GPTBridge):
 
 class Qwen3NextGDNBridge(Qwen3NextGDNBridgeMixin):
 
+    def _pad_linear_in_proj_weight_for_fp8(self, mg_attn, in_proj_weight: torch.Tensor) -> torch.Tensor:
+        if mg_attn is None or not hasattr(mg_attn, 'in_proj'):
+            return in_proj_weight
+        logical = getattr(mg_attn.in_proj, '_mcore_gdn_logical_out_features', None)
+        padded = getattr(mg_attn.in_proj, '_mcore_gdn_padded_out_features', None)
+        if logical is None or padded is None or logical == padded:
+            return in_proj_weight
+        chunks = in_proj_weight.chunk(self.tp_size, dim=0)
+        padded_chunks = []
+        for chunk in chunks:
+            if chunk.shape[0] != logical:
+                return in_proj_weight
+            padded_chunks.append(torch.nn.functional.pad(chunk, (0, 0, 0, padded - logical)))
+        return torch.cat(padded_chunks, dim=0)
+
+    def _unpad_linear_in_proj_weight_for_fp8(self, mg_attn, in_proj_weight: torch.Tensor) -> torch.Tensor:
+        if mg_attn is None or not hasattr(mg_attn, 'in_proj'):
+            return in_proj_weight
+        logical = getattr(mg_attn.in_proj, '_mcore_gdn_logical_out_features', None)
+        padded = getattr(mg_attn.in_proj, '_mcore_gdn_padded_out_features', None)
+        if logical is None or padded is None or logical == padded:
+            return in_proj_weight
+        chunks = in_proj_weight.chunk(self.tp_size, dim=0)
+        if any(chunk.shape[0] != padded for chunk in chunks):
+            return in_proj_weight
+        return torch.cat([chunk[:logical] for chunk in chunks], dim=0)
+
     def _set_linear_in_proj(self, mg_attn, hf_state_dict, to_mcore: bool):
         config = self.config
         num_key_heads = config.linear_num_key_heads
@@ -68,6 +95,7 @@ class Qwen3NextGDNBridge(Qwen3NextGDNBridgeMixin):
                     *(x.reshape(num_key_heads, -1, config.hidden_size) for x in [qkvz, ba]),
                 ],
                                            dim=1).reshape((-1, config.hidden_size))
+                in_proj_weight = self._pad_linear_in_proj_weight_for_fp8(mg_attn, in_proj_weight)
                 self._set_weight(mg_attn.in_proj.weight, in_proj_weight, 'in_proj.weight')
         else:
             qkvz_dim = key_dim * 2 + value_dim * 2
@@ -96,6 +124,7 @@ class Qwen3NextGDNBridge(Qwen3NextGDNBridgeMixin):
                 in_proj_weight, _ = self._get_weight(None if mg_attn is None else mg_attn.in_proj.weight.data,
                                                      'in_proj.weight')
                 if in_proj_weight is not None:
+                    in_proj_weight = self._unpad_linear_in_proj_weight_for_fp8(mg_attn, in_proj_weight)
                     in_proj_weight = in_proj_weight.reshape(num_key_heads, -1, config.hidden_size)
                     hf_state_dict['in_proj_qkvz.weight'] = in_proj_weight[:, :qkvz_dim].reshape(
                         -1, config.hidden_size).clone()

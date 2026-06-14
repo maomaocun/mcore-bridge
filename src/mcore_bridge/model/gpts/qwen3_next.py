@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import os
 import torch
 from copy import deepcopy
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, _get_extra_te_kwargs
@@ -482,6 +483,21 @@ class Qwen3NextGatedDeltaNet(_HuggingFaceModule, _Qwen3NextGatedDeltaNet):
         else:
             hidden_states = hidden_states.transpose(0, 1)
             attention_mask = resolve_gdn_attention_mask(kwargs)
+            pad_gdn_for_fp8 = os.environ.get('MCORE_GDN_PAD_TO_FP8_MULTIPLE', '').lower() in {
+                '1', 'true', 'yes', 'y', 'on'
+            }
+            if attention_mask is not None and pad_gdn_for_fp8:
+                # TE FP8 linear kernels require the flattened token dimension to be
+                # divisible by 8. Qwen3Next GDN removes padding before its HF
+                # implementation, so re-enable trailing pad slots for compute only.
+                # The training labels/loss_scale for these slots remain ignored.
+                token_count = int(attention_mask.sum().item())
+                pad_count = (-token_count) % 8
+                if pad_count:
+                    flat_mask = attention_mask.reshape(-1)
+                    pad_idx = torch.nonzero(~flat_mask, as_tuple=False).flatten()
+                    if pad_idx.numel() >= pad_count:
+                        flat_mask[pad_idx[:pad_count]] = True
         with get_cuda_rng_tracker().fork('data-parallel-rng'):
             res = super().forward(hidden_states=hidden_states, attention_mask=attention_mask)
         if thd_format:

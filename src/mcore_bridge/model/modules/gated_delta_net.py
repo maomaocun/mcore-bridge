@@ -1,5 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
+import math
+import os
 import torch
 import torch.nn.functional as F
 import transformer_engine
@@ -37,6 +39,158 @@ try:
 except ImportError:
     _mcore_tensor_a2a_cp2hp = None
     _mcore_tensor_a2a_hp2cp = None
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, '').lower() in {'1', 'true', 'yes', 'y', 'on'}
+
+
+def _gdn_projection_context():
+    if _env_flag('MCORE_GDN_DISABLE_FP8_PROJ'):
+        return transformer_engine.pytorch.fp8_autocast(enabled=False)
+    return nullcontext()
+
+
+def _pad_projection_input_for_fp8(hidden_states: torch.Tensor, label: str, enabled: bool = True):
+    if (not enabled or not _env_flag('MCORE_GDN_PAD_TO_FP8_MULTIPLE')
+            or _env_flag('MCORE_GDN_DISABLE_FP8_PROJ')):
+        return hidden_states, 0
+    if hidden_states.dim() < 2:
+        return hidden_states, 0
+
+    token_count = math.prod(hidden_states.shape[:-1])
+    if token_count % 8 == 0:
+        return hidden_states, 0
+
+    rest = math.prod(hidden_states.shape[1:-1]) or 1
+    pad_len = 0
+    for candidate in range(1, 9):
+        if ((hidden_states.shape[0] + candidate) * rest) % 8 == 0:
+            pad_len = candidate
+            break
+    if pad_len == 0:
+        return hidden_states, 0
+
+    pad_shape = list(hidden_states.shape)
+    pad_shape[0] = pad_len
+    padded = torch.cat((hidden_states, hidden_states.new_zeros(pad_shape)), dim=0)
+    if _env_flag('MCORE_GDN_PAD_DEBUG') and os.environ.get('LOCAL_RANK', '0') == '0':
+        print(
+            f'[MCORE_GDN_FP8_PROJ_PAD] label={label} original_shape={tuple(hidden_states.shape)} '
+            f'padded_shape={tuple(padded.shape)} pad_len={pad_len} token_count={token_count}',
+            flush=True,
+        )
+    return padded, pad_len
+
+
+def _pad_column_parallel_weight_for_fp8(module, label: str):
+    if (not _env_flag('MCORE_GDN_PAD_TO_FP8_MULTIPLE') or _env_flag('MCORE_GDN_DISABLE_FP8_PROJ')
+            or getattr(module, 'parallel_mode', None) != 'column' or not hasattr(module, 'weight')):
+        return
+    weight = module.weight
+    if weight.dim() != 2 or weight.shape[0] % 8 == 0:
+        return
+
+    logical_out_features = weight.shape[0]
+    pad_len = (-logical_out_features) % 8
+    padded_out_features = logical_out_features + pad_len
+    padded_weight = weight.detach().new_zeros((padded_out_features, weight.shape[1]))
+    padded_weight[:logical_out_features].copy_(weight.detach())
+    new_weight = torch.nn.Parameter(padded_weight, requires_grad=weight.requires_grad)
+    for attr in ('tensor_model_parallel', 'partition_dim', 'partition_stride', 'allreduce'):
+        if hasattr(weight, attr):
+            setattr(new_weight, attr, getattr(weight, attr))
+    module.weight = new_weight
+    module.out_features = padded_out_features
+    if hasattr(module, 'parameter_split_sizes') and len(module.parameter_split_sizes) == 1:
+        module.parameter_split_sizes[0] = padded_out_features
+
+    bias = getattr(module, 'bias', None)
+    if isinstance(bias, torch.nn.Parameter) and bias.numel() == logical_out_features:
+        padded_bias = bias.detach().new_zeros((padded_out_features,))
+        padded_bias[:logical_out_features].copy_(bias.detach())
+        new_bias = torch.nn.Parameter(padded_bias, requires_grad=bias.requires_grad)
+        for attr in ('tensor_model_parallel', 'partition_dim', 'partition_stride', 'allreduce'):
+            if hasattr(bias, attr):
+                setattr(new_bias, attr, getattr(bias, attr))
+        module.bias = new_bias
+
+    module._mcore_gdn_logical_out_features = logical_out_features
+    module._mcore_gdn_padded_out_features = padded_out_features
+    if _env_flag('MCORE_GDN_PAD_DEBUG') and os.environ.get('LOCAL_RANK', '0') == '0':
+        print(
+            f'[MCORE_GDN_FP8_WEIGHT_PAD] label={label} logical_out={logical_out_features} '
+            f'padded_out={padded_out_features} pad_len={pad_len}',
+            flush=True,
+        )
+
+
+def _gdn_projection(module, hidden_states: torch.Tensor, label: str, disable_fp8: bool = False):
+    context = transformer_engine.pytorch.fp8_autocast(enabled=False) if disable_fp8 else _gdn_projection_context()
+    if _env_flag('MCORE_GDN_PAD_DEBUG') and os.environ.get('LOCAL_RANK', '0') == '0':
+        print(
+            f'[MCORE_GDN_FP8_PROJ_IN] label={label} shape={tuple(hidden_states.shape)} '
+            f'disable_fp8={disable_fp8} module_sequence_parallel={getattr(module, "sequence_parallel", None)} '
+            f'module_parallel_mode={getattr(module, "parallel_mode", None)}',
+            flush=True,
+        )
+    hidden_states, pad_len = _pad_projection_input_for_fp8(hidden_states, label, enabled=not disable_fp8)
+    with context:
+        out, bias = module(hidden_states)
+    logical_out_features = getattr(module, '_mcore_gdn_logical_out_features', None)
+    if logical_out_features is not None and out.shape[-1] != logical_out_features:
+        out = out[..., :logical_out_features]
+        if bias is not None:
+            bias = bias[:logical_out_features]
+    if pad_len:
+        out = out[:-pad_len]
+    return out, bias
+
+
+def _pad_hidden_states_for_fp8(hidden_states: torch.Tensor, cp_size: int, packed_seq: bool = False):
+    original_shape = tuple(hidden_states.shape)
+    enabled = _env_flag('MCORE_GDN_PAD_WHOLE_LAYER_TO_FP8_MULTIPLE')
+    debug = _env_flag('MCORE_GDN_PAD_DEBUG') and os.environ.get('LOCAL_RANK', '0') == '0'
+    if not enabled or packed_seq or cp_size != 1:
+        if debug:
+            print(
+                f'[MCORE_GDN_PAD_DEBUG] skip original_shape={original_shape} enabled={enabled} '
+                f'cp_size={cp_size} packed_seq={packed_seq}',
+                flush=True,
+            )
+        return hidden_states, 0
+    if hidden_states.dim() != 3:
+        if debug:
+            print(f'[MCORE_GDN_PAD_DEBUG] skip original_shape={original_shape} dim={hidden_states.dim()}', flush=True)
+        return hidden_states, 0
+
+    seq_len, batch, _ = hidden_states.shape
+    token_count = seq_len * batch
+    if token_count % 8 == 0:
+        if debug:
+            print(
+                f'[MCORE_GDN_PAD_DEBUG] already_aligned original_shape={original_shape} token_count={token_count}',
+                flush=True,
+            )
+        return hidden_states, 0
+
+    pad_len = 0
+    for candidate in range(1, 9):
+        if ((seq_len + candidate) * batch) % 8 == 0:
+            pad_len = candidate
+            break
+    if pad_len == 0:
+        return hidden_states, 0
+
+    pad = hidden_states.new_zeros((pad_len, batch, hidden_states.shape[-1]))
+    padded = torch.cat((hidden_states, pad), dim=0)
+    if debug:
+        print(
+            f'[MCORE_GDN_PAD_DEBUG] original_shape={original_shape} padded_shape={tuple(padded.shape)} '
+            f'pad_len={pad_len} cp_size={cp_size} packed_seq={packed_seq}',
+            flush=True,
+        )
+    return padded, pad_len
 
 
 # Code borrowed from NVIDIA/Megatron-LM
@@ -273,6 +427,8 @@ class GatedDeltaNet(_GatedDeltaNet):
         self.v_dim_local_tp = self.v_dim // self.tp_size
         self.conv_dim_local_tp = self.conv_dim // self.tp_size
         if not config.linear_decoupled_in_proj:
+            _pad_column_parallel_weight_for_fp8(self.in_proj, 'in_proj')
+        if not config.linear_decoupled_in_proj:
             return
         self.in_proj_qkvz_dim = self.qk_dim * 2 + self.v_dim * 2
         self.in_proj_ba_dim = self.num_value_heads * 2
@@ -343,8 +499,14 @@ class GatedDeltaNet(_GatedDeltaNet):
         # TODO: Deal with attention_mask (There is an issue when left padding is used.)
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        seq_len, batch, _ = hidden_states.shape
         cp_size = self.config.context_parallel_size
+        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        hidden_states, fp8_pad_len = _pad_hidden_states_for_fp8(
+            hidden_states,
+            cp_size=cp_size,
+            packed_seq=packed_seq,
+        )
+        seq_len, batch, _ = hidden_states.shape
         seq_len = seq_len * self.sp_size * cp_size
 
         if inference_context is not None:
@@ -359,18 +521,18 @@ class GatedDeltaNet(_GatedDeltaNet):
         num_key_heads_per_device = self.num_key_heads // self.tp_size // cp_size
         nvtx_range_push(suffix='in_proj')
         if self.config.linear_decoupled_in_proj:
-            qkvz, _ = self.in_proj_qkvz(hidden_states)
-            if self.config.fp8_param:
-                fp8_context = transformer_engine.pytorch.fp8_autocast(enabled=False)
-            else:
-                fp8_context = nullcontext()
-            with fp8_context:
-                ba, _ = self.in_proj_ba(hidden_states)
+            qkvz, _ = _gdn_projection(self.in_proj_qkvz, hidden_states, 'in_proj_qkvz')
+            ba, _ = _gdn_projection(
+                self.in_proj_ba,
+                hidden_states,
+                'in_proj_ba',
+                disable_fp8=self.config.fp8_param,
+            )
             qkvz = qkvz.view(qkvz.shape[:-1] + (num_key_heads_per_device, qkvz.shape[-1] // num_key_heads_per_device))
             ba = ba.view(ba.shape[:-1] + (num_key_heads_per_device, ba.shape[-1] // num_key_heads_per_device))
             qkvzba = torch.concat([qkvz, ba], dim=-1).view(*qkvz.shape[:2], -1)
         else:
-            qkvzba, _ = self.in_proj(hidden_states)
+            qkvzba, _ = _gdn_projection(self.in_proj, hidden_states, 'in_proj')
         nvtx_range_pop(suffix='in_proj')
 
         if cp_size > 1:
@@ -541,8 +703,10 @@ class GatedDeltaNet(_GatedDeltaNet):
 
         # Output projection
         nvtx_range_push(suffix='out_proj')
-        out, out_bias = self.out_proj(norm_out)
+        out, out_bias = _gdn_projection(self.out_proj, norm_out, 'out_proj')
         nvtx_range_pop(suffix='out_proj')
+        if fp8_pad_len:
+            out = out[:-fp8_pad_len]
 
         return out, out_bias
 
@@ -551,10 +715,11 @@ class GatedDeltaNet(_GatedDeltaNet):
         hidden_states: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
-        seq_len, batch, _ = hidden_states.shape
         cp_size = self.cp_size
-        seq_len = seq_len * self.sp_size * cp_size
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        hidden_states, fp8_pad_len = _pad_hidden_states_for_fp8(hidden_states, cp_size=cp_size, packed_seq=packed_seq)
+        seq_len, batch, _ = hidden_states.shape
+        seq_len = seq_len * self.sp_size * cp_size
         thd_cp_a2a_inv = None
 
         if packed_seq:
@@ -574,7 +739,7 @@ class GatedDeltaNet(_GatedDeltaNet):
             cu_seqlens_q = None
 
         nvtx_range_push(suffix='in_proj')
-        qkvzba, _ = self.in_proj(hidden_states)
+        qkvzba, _ = _gdn_projection(self.in_proj, hidden_states, 'in_proj')
         nvtx_range_pop(suffix='in_proj')
 
         if cp_size > 1:
@@ -736,8 +901,10 @@ class GatedDeltaNet(_GatedDeltaNet):
             norm_out = tensor_a2a_hp2cp(norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp)
 
         nvtx_range_push(suffix='out_proj')
-        out, out_bias = self.out_proj(norm_out)
+        out, out_bias = _gdn_projection(self.out_proj, norm_out, 'out_proj')
         nvtx_range_pop(suffix='out_proj')
+        if fp8_pad_len:
+            out = out[:-fp8_pad_len]
 
         return out, out_bias
 
