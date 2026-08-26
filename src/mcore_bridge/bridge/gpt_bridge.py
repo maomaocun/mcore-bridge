@@ -116,7 +116,7 @@ class GPTBridge:
         if mg_key is None:
             return
         if '.' not in mg_key:
-            if mg_key in {'dt_bias', 'A_log'}:
+            if mg_key in {'dt_bias', 'A_log', 'linear_o_group_proj'}:
                 return 0
             else:
                 return
@@ -132,6 +132,8 @@ class GPTBridge:
             'linear_q_proj',
             'linear_q_up_proj',
             'linear_kv_up_proj',
+            # DSv4 hybrid attention's manually-created grouped output matrix
+            'linear_o_group_proj',
             # mtp
             'eh_proj',
         } | self.additional_dim0_keys
@@ -143,7 +145,7 @@ class GPTBridge:
             key, suffix = mg_key.rsplit('.', 2)[-2:]
             if suffix == 'layer_norm_weight':
                 return
-            elif mg_key == 'core_attention.softmax_offset':
+            elif mg_key in {'core_attention.softmax_offset', 'core_attention.attn_sink'}:
                 return 0
             elif key in dim0_keys:
                 return 0

@@ -73,8 +73,13 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         if config.fp8_param:
             group_proj_in_size = self.query_projection_size // config.o_groups
             del self.linear_o_group_proj
+            if config.o_groups % self.tp_size != 0:
+                raise ValueError(
+                    "o_groups must be divisible by tensor model parallel size for FP8 grouped output: "
+                    f"{config.o_groups} % {self.tp_size} != 0"
+                )
             self.linear_o_group_proj = te.GroupedLinear(
-                num_gemms=config.o_groups,
+                num_gemms=self.o_local_groups,
                 in_features=group_proj_in_size,
                 out_features=config.o_lora_rank,
                 bias=False,
@@ -497,6 +502,7 @@ class DeepseekV4Bridge(GPTBridge):
         GroupedLinear stores per-gemm weight{i} each of shape [R, D].
         """
         o_groups = self.config.o_groups
+        local_groups = o_groups // self.tp_size
         if to_mcore:
             hf_weight = hf_state_dict['wo_a.weight'].load()
             hf_scale_inv = None
@@ -504,14 +510,16 @@ class DeepseekV4Bridge(GPTBridge):
                 hf_scale_inv = hf_state_dict['wo_a.weight_scale_inv'].load()
             weights = hf_weight.chunk(o_groups, dim=0)
             scale_invs = hf_scale_inv.chunk(o_groups, dim=0) if hf_scale_inv is not None else [None] * o_groups
-            for i, (w, s) in enumerate(zip(weights, scale_invs)):
+            start = self.tp_rank * local_groups
+            for i, (w, s) in enumerate(zip(weights[start:start + local_groups],
+                                             scale_invs[start:start + local_groups])):
                 param = getattr(mg_attn.linear_o_group_proj, f'weight{i}')
                 self._set_param(param, w, s)
         else:
             if mg_attn is None:
                 mg_weight = None
             else:
-                mg_weight = [getattr(mg_attn.linear_o_group_proj, f'weight{i}') for i in range(o_groups)]
+                mg_weight = [getattr(mg_attn.linear_o_group_proj, f'weight{i}') for i in range(local_groups)]
             weight, scale_inv = self._get_weight(mg_weight, 'linear_o_group_proj.weight0')
             if weight is not None:
                 hf_state_dict['wo_a.weight'] = weight
