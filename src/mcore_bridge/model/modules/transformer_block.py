@@ -84,6 +84,10 @@ class TransformerBlock(McoreTransformerBlock):
         """
         if input_ids is None or not torch.is_tensor(input_ids) or input_ids.ndim != 2:
             return input_ids
+        if hidden_states is None:
+            # Pipeline stages receive their activation through input_tensor;
+            # keep auxiliary ids untouched until that tensor is installed.
+            return input_ids
         tp_group = getattr(self.pg_collection, 'tp', None)
         if not self.config.sequence_parallel or tp_group is None or tp_group.size() <= 1:
             return input_ids
