@@ -363,14 +363,14 @@ class TransformerBlock(McoreTransformerBlock):
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
 
-        if 'input_ids' in kwargs:
-            kwargs['input_ids'] = self._slice_sequence_parallel_input_ids(
-                kwargs['input_ids'], hidden_states
-            )
-
         if not self.pre_process:
             # See set_input_tensor()
             hidden_states = self.input_tensor
+
+        if 'input_ids' in kwargs and hidden_states is not None:
+            kwargs['input_ids'] = self._slice_sequence_parallel_input_ids(
+                kwargs['input_ids'], hidden_states
+            )
 
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch
