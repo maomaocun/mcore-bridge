@@ -1999,6 +1999,7 @@ class GPTBridge:
         adapter_name: str = 'default',
         converter: Optional[Callable] = None,
         max_shard_size: str = '5GB',
+        save_missing_weights: Union[bool, str] = False,
     ) -> None:
         """Save Megatron model checkpoint in safetensors (HuggingFace) format.
 
@@ -2015,6 +2016,9 @@ class GPTBridge:
             adapter_name: Name of the adapter for PEFT models. Defaults to 'default'.
             converter: Used to perform key-value conversion on the newly exported state_dict.
             max_shard_size: Maximum size of a single storage file, default is '5GB'.
+            save_missing_weights: Compatibility flag consumed by the ms-swift
+                wrapper. The bridge exporter already streams all converted
+                weights and does not need a second missing-weight pass.
         """
         gc_collect()
         saver = StreamingSafetensorSaver(save_dir=output_dir, max_shard_size=max_shard_size, peft_format=peft_format)

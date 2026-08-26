@@ -72,6 +72,32 @@ def _checkpoint_unflatten(schema, tensors):
 # Code borrowed from NVIDIA/Megatron-LM
 class TransformerBlock(McoreTransformerBlock):
 
+    def _slice_sequence_parallel_input_ids(self, input_ids, hidden_states):
+        """Align hash-routing token ids with TP-local hidden-state rows.
+
+        The V4 hash router consumes ``input_ids`` in the MoE layer.  The
+        embedding/attention stream is sequence-parallel, so its hidden states
+        contain only one TP slice while the training batch still carries the
+        full ``[batch, sequence]`` token tensor.  Slice only when the shape
+        proves that the ids are global; already-local ids and non-sequence
+        auxiliary tensors are left untouched.
+        """
+        if input_ids is None or not torch.is_tensor(input_ids) or input_ids.ndim != 2:
+            return input_ids
+        tp_group = getattr(self.pg_collection, 'tp', None)
+        if not self.config.sequence_parallel or tp_group is None or tp_group.size() <= 1:
+            return input_ids
+
+        local_seq = hidden_states.shape[0]
+        global_seq = local_seq * tp_group.size()
+        tp_start = tp_group.rank() * local_seq
+        tp_end = tp_start + local_seq
+        if input_ids.shape[1] == global_seq:
+            return input_ids[:, tp_start:tp_end].contiguous()
+        if input_ids.shape[0] == global_seq:
+            return input_ids[tp_start:tp_end, :].contiguous()
+        return input_ids
+
     def _checkpointed_forward(
         self,
         hidden_states: torch.Tensor,
@@ -336,6 +362,11 @@ class TransformerBlock(McoreTransformerBlock):
         # Delete the obsolete reference to the initial input tensor if necessary
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
+
+        if 'input_ids' in kwargs:
+            kwargs['input_ids'] = self._slice_sequence_parallel_input_ids(
+                kwargs['input_ids'], hidden_states
+            )
 
         if not self.pre_process:
             # See set_input_tensor()

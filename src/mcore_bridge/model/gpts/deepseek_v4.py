@@ -167,6 +167,28 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
             q = _q_rms_norm(q, self.config.layernorm_epsilon)
 
+            # The Bridge path owns its RoPE application instead of calling the
+            # MCore DSv4 implementation.  With sequence parallelism, q-up and
+            # kv projection expose the TP-local sequence length only after the
+            # projections; slice the global position table at that point.
+            local_rotary_pos_emb = rotary_pos_emb
+            local_kv_rotary_pos_emb = None
+            if self.tp_size > 1 and self.config.sequence_parallel and packed_seq_params is None:
+                tp_rank = torch.distributed.get_rank(group=self.pg_collection.tp)
+
+                def _slice_tp_rope(tensor, local_seq_len):
+                    if tensor is None or tensor.size(0) == local_seq_len:
+                        return tensor
+                    start = tp_rank * local_seq_len
+                    if start + local_seq_len > tensor.size(0):
+                        raise RuntimeError(
+                            "DSv4 Bridge TP RoPE table is shorter than the local sequence slice: "
+                            f"table={tensor.size(0)}, start={start}, local={local_seq_len}"
+                        )
+                    return tensor.narrow(0, start, local_seq_len)
+
+                local_rotary_pos_emb = _slice_tp_rope(local_rotary_pos_emb, q.size(0))
+
             boundary_rows = 0
             if boundary_kv_compressed is not None:
                 boundary_rows = boundary_kv_compressed.shape[0]
@@ -178,6 +200,24 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
 
             kv, _ = self.linear_kv_proj(kv_projection_input)
             kv = self.kv_layernorm(kv)
+            if self.tp_size > 1 and self.config.sequence_parallel:
+                # q-up is a standard SP column-parallel projection and
+                # therefore sees the complete CP-local sequence. The V4 KV
+                # projection is duplicated, so gather its local output to the
+                # same sequence space before CSA/attention.
+                if boundary_rows:
+                    boundary_kv_part = kv[:boundary_rows]
+                    local_kv_part = tensor_parallel.gather_from_sequence_parallel_region(
+                        kv[boundary_rows:], group=self.pg_collection.tp
+                    )
+                    kv = torch.cat([boundary_kv_part, local_kv_part], dim=0)
+                else:
+                    kv = tensor_parallel.gather_from_sequence_parallel_region(
+                        kv, group=self.pg_collection.tp
+                    )
+            local_kv_rotary_pos_emb = kv_rotary_pos_emb
+            if self.tp_size > 1 and self.config.sequence_parallel and packed_seq_params is None:
+                local_kv_rotary_pos_emb = _slice_tp_rope(local_kv_rotary_pos_emb, kv.size(0))
             boundary_kv = None
 
             # q_no_pe: [num_tokens, n, qk_head_dim]
@@ -189,7 +229,7 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
             q_pos_emb = apply_rotary_pos_emb(
                 q_pos_emb,
-                rotary_pos_emb,
+                local_rotary_pos_emb,
                 config=self.config,
                 cu_seqlens=cu_seqlens_q,
                 cp_group=self.pg_collection.cp,
@@ -204,7 +244,7 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
             k_pos_emb = apply_rotary_pos_emb(
                 k_pos_emb,
-                kv_rotary_pos_emb,
+                local_kv_rotary_pos_emb,
                 config=self.config,
                 cu_seqlens=cu_seqlens_kv,
                 cp_group=self.pg_collection.cp,
@@ -292,12 +332,21 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         if use_thd_cp and packed_seq_params.cp_partition_mode != 'contiguous':
             raise ValueError('DSv4 THD CP requires a contiguous CP partition.')
 
+        sequence_parallel_local_length = hidden_states.size(0)
+        core_hidden_states = hidden_states
+        if self.tp_size > 1 and self.config.sequence_parallel:
+            # q-up uses TE's standard SP all-gather. The duplicated KV path
+            # and CSA compressor need the same CP-local sequence explicitly.
+            core_hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
+                hidden_states, group=self.pg_collection.tp
+            )
+
         boundary_hidden = None
         boundary_rotary_pos_emb = None
         if use_thd_cp:
             from megatron.core.transformer.experimental_attention_variant import csa_cp_utils as cp_utils
             boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
-                hidden_states,
+                core_hidden_states,
                 self._dsv4_compress_ratio,
                 self.config.csa_window_size,
                 self.pg_collection.cp,
@@ -329,6 +378,16 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             query, key, value, q_compressed, kv_compressed = qkv
             boundary_kv = None
 
+        core_q_compressed = q_compressed
+        if self.tp_size > 1 and self.config.sequence_parallel:
+            # q-down is duplicated and remains TP-local, while CSA's learned
+            # indexer consumes the same complete CP-local sequence as the
+            # gathered hidden states. Keep the local q-compressed tensor for
+            # q-up, and provide a gathered copy to the core-attention path.
+            core_q_compressed = tensor_parallel.gather_from_sequence_parallel_region(
+                q_compressed, group=self.pg_collection.tp
+            )
+
         # TODO: Currently, TE can only accept contiguous tensors for MLA
         query = query.contiguous()
         key = key.contiguous()
@@ -350,8 +409,8 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
                 value,
                 attention_mask,
                 packed_seq_params=packed_seq_params,
-                x=hidden_states,
-                qr=q_compressed,
+                x=core_hidden_states,
+                qr=core_q_compressed,
                 **core_attn_kwargs,
             )
         forced_released_tensors = [query, key, value]
@@ -432,6 +491,21 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         with attn_proj_manager as core_attn_out:
             output, bias = self.linear_proj(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
+
+        # Some TE versions reduce the row-parallel output across TP but leave
+        # the sequence dimension gathered. Restore the standard
+        # sequence-parallel module contract (local sequence on return) when
+        # that backend behavior is observed; do not double-scatter versions
+        # that already return the local shape.
+        if (
+            self.tp_size > 1
+            and self.config.sequence_parallel
+            and output.size(0) != sequence_parallel_local_length
+            and output.size(0) % self.tp_size == 0
+        ):
+            output = tensor_parallel.scatter_to_sequence_parallel_region(
+                output, group=self.pg_collection.tp
+            )
 
         return output, bias
 
