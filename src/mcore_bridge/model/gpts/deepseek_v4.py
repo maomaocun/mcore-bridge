@@ -1,10 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
+import os
 import torch
 import transformer_engine.pytorch as te
 from contextlib import contextmanager
 from megatron.core import tensor_parallel
-from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
+from megatron.core.models.common.embeddings.rope_utils import (
+    _apply_rotary_pos_emb_bshd,
+    apply_rotary_pos_emb,
+)
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from typing import Optional
 
@@ -16,6 +20,38 @@ from ..gpt_model import GPTModel
 from ..modules.compressor import Compressor, CSAIndexer
 from ..register import ModelLoader, ModelMeta, register_model
 from ..rope import get_rope_inv_freq
+
+
+def _dsv4_log_bridge_kv(phase, layer_number, tensor):
+    """Log KV projection finiteness for an explicitly selected debug rank."""
+    if os.environ.get('DSV4_LOG_BRIDGE_KV', '0') != '1':
+        return
+    try:
+        if int(layer_number) != int(os.environ.get('DSV4_LOG_BRIDGE_KV_LAYER', '1')):
+            return
+    except ValueError:
+        return
+    rank = os.environ.get('RANK', 'unknown')
+    selected = {
+        item.strip()
+        for item in os.environ.get('DSV4_LOG_BRIDGE_KV_RANKS', '3,7').split(',')
+        if item.strip()
+    }
+    if rank not in selected or tensor is None:
+        return
+    value = tensor.detach()
+    if value.numel() == 0:
+        print(f'[DSV4 Bridge KV] phase={phase} rank={rank} shape={tuple(value.shape)} empty', flush=True)
+        return
+    finite = torch.isfinite(value)
+    print(
+        f'[DSV4 Bridge KV] phase={phase} rank={rank} shape={tuple(value.shape)} '
+        f'dtype={value.dtype} finite={bool(finite.all().item())} '
+        f'nan={int(torch.isnan(value).sum().item())} '
+        f'inf={int(torch.isinf(value).sum().item())} '
+        f'max_abs={float(value.float().abs().amax().item())}',
+        flush=True,
+    )
 
 try:
     from megatron.core.pipeline_parallel.fine_grained_activation_offload import \
@@ -29,6 +65,42 @@ except ImportError:
     _q_rms_norm = None
     apply_module = None
     off_interface = None
+
+try:
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import \
+        copy_attention_chunk
+except ImportError:
+    copy_attention_chunk = None
+
+
+class _MergeRotaryOutput(torch.autograd.Function):
+    """Merge inverse-RoPE output into the original attention buffer.
+
+    This is used only with ``DSV4_CSA_RECOMPUTE_OUT=1``. The sparse-attention
+    backward then recomputes its original output, while this node routes the
+    content gradient directly and the rotary gradient through the independent
+    rotary slice without allocating another full hidden-state tensor.
+    """
+
+    @staticmethod
+    def forward(ctx, core_output, rotated_output, content_dim):
+        ctx.content_dim = int(content_dim)
+        ctx.rotary_dim = int(rotated_output.shape[-1])
+        core_output.data.narrow(-1, ctx.content_dim, ctx.rotary_dim).copy_(rotated_output.data)
+        return core_output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        rotary_grad = grad_output.narrow(-1, ctx.content_dim, ctx.rotary_dim).contiguous()
+        # The raw-storage update avoids a second full-size gradient buffer;
+        # this node owns the incoming gradient and returns it only once.
+        grad_output.data.narrow(-1, ctx.content_dim, ctx.rotary_dim).zero_()
+        return grad_output, rotary_grad, None
+
+
+def merge_rotary_output(core_output, rotated_output, content_dim):
+    """Apply the memory-bounded inverse-RoPE merge autograd node."""
+    return _MergeRotaryOutput.apply(core_output, rotated_output, content_dim)
 
 
 @contextmanager
@@ -148,6 +220,70 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         # QKV up projection and RoPE apply
         # =========================================
 
+        try:
+            qkv_up_proj_chunk_size = int(
+                os.environ.get('DSV4_QKV_UP_PROJ_CHUNK_SIZE', '0') or 0
+            )
+        except ValueError:
+            qkv_up_proj_chunk_size = 0
+
+        def run_chunked_projection(projection, projection_input):
+            """Run a token-wise TE projection in bounded row chunks.
+
+            Q/KV up projections retain their full logical output for the CSA
+            interface, but a single 256K TE GEMM can request a multi-GiB
+            temporary during activation recompute.  The copy node keeps each
+            chunk's autograd edge without introducing a second full output.
+            """
+            if (
+                qkv_up_proj_chunk_size <= 0
+                or projection_input.size(0) <= qkv_up_proj_chunk_size
+                or copy_attention_chunk is None
+            ):
+                return projection(projection_input)
+
+            output = None
+            bias = None
+            total_rows = projection_input.size(0)
+            for start in range(0, total_rows, qkv_up_proj_chunk_size):
+                end = min(start + qkv_up_proj_chunk_size, total_rows)
+                output_chunk, bias_chunk = projection(projection_input[start:end])
+                input_chunk_rows = end - start
+                direct_rows = input_chunk_rows
+                gathered_rows = input_chunk_rows * self.tp_size
+                if output_chunk.size(0) not in (direct_rows, gathered_rows):
+                    raise RuntimeError(
+                        'DSV4 QKV up projection chunking received an unsupported '
+                        'sequence layout: '
+                        f'input_rows={input_chunk_rows}, output_rows={output_chunk.size(0)}, '
+                        f'tp={self.tp_size}'
+                    )
+                if output is None:
+                    output_rows = total_rows if output_chunk.size(0) == direct_rows else total_rows * self.tp_size
+                    output = torch.empty(
+                        (output_rows, *output_chunk.shape[1:]),
+                        dtype=output_chunk.dtype,
+                        device=output_chunk.device,
+                    )
+                    bias = bias_chunk
+                if output_chunk.size(0) == direct_rows:
+                    output = copy_attention_chunk(output, output_chunk, start)
+                else:
+                    # TE sequence-parallel column projections return the
+                    # gathered rows in rank-major order.  The local input
+                    # chunk at offset ``start`` therefore contributes to
+                    # global positions ``rank * total_rows + start``.
+                    for rank in range(self.tp_size):
+                        rank_chunk = output_chunk.narrow(
+                            0, rank * input_chunk_rows, input_chunk_rows
+                        )
+                        output = copy_attention_chunk(
+                            output,
+                            rank_chunk,
+                            rank * total_rows + start,
+                        )
+            return output, bias
+
         def qkv_up_proj_and_rope_apply(q_compressed,
                                        kv_compressed,
                                        rotary_pos_emb,
@@ -161,11 +297,159 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             """
             # q_compressed: [num_tokens, q_lora_rank]
             # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-            q, _ = self.linear_q_up_proj(q_compressed)
+            query_chunk_provider = None
+            indexer_qr_chunk_provider = None
+            stream_query = (
+                os.environ.get('DSV4_STREAM_QKV_QUERY', '0').strip() == '1'
+                and os.environ.get('DSV4_STREAM_CORE_OUTPUT', '0').strip() == '1'
+                and packed_seq_params is not None
+                and packed_seq_params.qkv_format == 'thd'
+                and self.tp_size > 1
+                and self.config.sequence_parallel
+                and boundary_kv_compressed is None
+                and not self.recompute_up_proj
+            )
 
-            # q: [num_tokens, n, q_head_dim]
-            q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
-            q = _q_rms_norm(q, self.config.layernorm_epsilon)
+            if stream_query:
+                local_q_rows = q_compressed.size(0)
+                global_q_rows = local_q_rows * self.tp_size
+                q_cu_seqlens = packed_seq_params.cu_seqlens_q
+
+                def compressed_query_chunk_provider(start, end):
+                    if start < 0 or end > global_q_rows or end <= start:
+                        raise RuntimeError(
+                            f'Invalid DSV4 streamed compressed-query chunk: '
+                            f'start={start}, end={end}, local_rows={local_q_rows}, '
+                            f'global_rows={global_q_rows}'
+                        )
+                    pieces = []
+                    piece_start = start
+                    while piece_start < end:
+                        owner = piece_start // local_q_rows
+                        piece_end = min(end, (owner + 1) * local_q_rows)
+                        piece_rows = piece_end - piece_start
+                        local_start = piece_start - owner * local_q_rows
+                        qr_local = q_compressed.narrow(0, local_start, piece_rows)
+                        qr_global = tensor_parallel.gather_from_sequence_parallel_region(
+                            qr_local, group=self.pg_collection.tp
+                        )
+                        expected_rows = piece_rows * self.tp_size
+                        if qr_global.size(0) != expected_rows:
+                            raise RuntimeError(
+                                'DSV4 streamed compressed-query gather returned '
+                                f'an unexpected row count: got={qr_global.size(0)}, '
+                                f'expected={expected_rows}'
+                            )
+                        pieces.append(
+                            qr_global.narrow(0, owner * piece_rows, piece_rows)
+                        )
+                        piece_start = piece_end
+                    return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
+
+                def query_chunk_provider(start, end):
+                    if (
+                        start < 0
+                        or end > global_q_rows
+                        or end <= start
+                    ):
+                        raise RuntimeError(
+                            f'Invalid DSV4 streamed Q chunk: start={start}, end={end}, '
+                            f'local_rows={local_q_rows}, global_rows={global_q_rows}'
+                        )
+                    pieces = []
+                    piece_start = start
+                    while piece_start < end:
+                        owner = piece_start // local_q_rows
+                        piece_end = min(end, (owner + 1) * local_q_rows)
+                        local_start = piece_start - owner * local_q_rows
+                        local_end = piece_end - owner * local_q_rows
+                        projection_chunk_size = (
+                            qkv_up_proj_chunk_size
+                            if qkv_up_proj_chunk_size > 0
+                            else local_end - local_start
+                        )
+                        for projection_start in range(
+                            local_start, local_end, projection_chunk_size
+                        ):
+                            projection_end = min(
+                                projection_start + projection_chunk_size, local_end
+                            )
+                            projection_rows = projection_end - projection_start
+                            q_local, _ = self.linear_q_up_proj(
+                                q_compressed.narrow(0, projection_start, projection_rows)
+                            )
+                            if q_local.size(0) == projection_rows:
+                                q_local = tensor_parallel.gather_from_sequence_parallel_region(
+                                    q_local, group=self.pg_collection.tp
+                                )
+                            expected_rows = projection_rows * self.tp_size
+                            if q_local.size(0) != expected_rows:
+                                raise RuntimeError(
+                                    'DSV4 streamed Q projection returned an unexpected '
+                                    f'row count: got={q_local.size(0)}, expected={expected_rows}'
+                                )
+                            q_chunk = q_local.narrow(
+                                0, owner * projection_rows, projection_rows
+                            )
+                            q_chunk = q_chunk.view(
+                                projection_rows,
+                                self.num_attention_heads_per_partition,
+                                self.q_head_dim,
+                            )
+                            q_chunk = _q_rms_norm(q_chunk, self.config.layernorm_epsilon)
+                            pos_dim = self.config.qk_pos_emb_head_dim
+                            q_no_pe, q_pos_emb = torch.split(
+                                q_chunk, [q_chunk.size(-1) - pos_dim, pos_dim], dim=-1
+                            )
+                            global_start = owner * local_q_rows + projection_start
+                            global_end = global_start + projection_rows
+                            global_rows = torch.arange(
+                                global_start,
+                                global_end,
+                                device=q_chunk.device,
+                                dtype=q_cu_seqlens.dtype,
+                            )
+                            seq_ids = torch.bucketize(
+                                global_rows,
+                                q_cu_seqlens[1:],
+                                out_int32=True,
+                                right=True,
+                            ).clamp_max(q_cu_seqlens.numel() - 2)
+                            positions = global_rows - q_cu_seqlens[seq_ids]
+                            positions = positions.clamp_min(0).clamp_max(rotary_pos_emb.size(0) - 1)
+                            freqs_chunk = rotary_pos_emb.index_select(0, positions.long())
+                            q_pos_emb = _apply_rotary_pos_emb_bshd(
+                                q_pos_emb.contiguous(),
+                                freqs_chunk,
+                                rotary_interleaved=self.config.rotary_interleaved,
+                                mla_rotary_interleaved=True,
+                                mla_output_remove_interleaving=True,
+                            )
+                            pieces.append(torch.cat([q_no_pe, q_pos_emb], dim=-1).contiguous())
+                        piece_start = piece_end
+                    return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
+
+                query_chunk_provider.total_q = global_q_rows
+                query_chunk_provider.num_heads = self.num_attention_heads_per_partition
+                query_chunk_provider.head_dim = self.q_head_dim
+                query_chunk_provider.device = q_compressed.device
+                query_chunk_provider.dtype = q_compressed.dtype
+                indexer_qr_chunk_provider = compressed_query_chunk_provider
+                q = None
+            else:
+                q, _ = run_chunked_projection(self.linear_q_up_proj, q_compressed)
+                if (
+                    self.tp_size > 1
+                    and self.config.sequence_parallel
+                    and q.size(0) == q_compressed.size(0)
+                ):
+                    q = tensor_parallel.gather_from_sequence_parallel_region(
+                        q, group=self.pg_collection.tp
+                    )
+
+                # q: [num_tokens, n, q_head_dim]
+                q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
+                q = _q_rms_norm(q, self.config.layernorm_epsilon)
 
             # The Bridge path owns its RoPE application instead of calling the
             # MCore DSv4 implementation.  With sequence parallelism, q-up and
@@ -187,7 +471,8 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
                         )
                     return tensor.narrow(0, start, local_seq_len)
 
-                local_rotary_pos_emb = _slice_tp_rope(local_rotary_pos_emb, q.size(0))
+                if q is not None:
+                    local_rotary_pos_emb = _slice_tp_rope(local_rotary_pos_emb, q.size(0))
 
             boundary_rows = 0
             if boundary_kv_compressed is not None:
@@ -197,9 +482,24 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             else:
                 kv_projection_input = kv_compressed
                 kv_rotary_pos_emb = rotary_pos_emb
+            _dsv4_log_bridge_kv('projection_input', self.layer_number, kv_projection_input)
 
-            kv, _ = self.linear_kv_proj(kv_projection_input)
+            if boundary_kv_compressed is not None:
+                # Boundary rows are a CP-only prefix.  Keep this uncommon
+                # path on its original whole-tensor implementation until a
+                # prefix-aware sequence-parallel gather is added.
+                kv, _ = self.linear_kv_proj(kv_projection_input)
+                kv_up_projection_is_gathered = False
+            else:
+                kv, _ = run_chunked_projection(self.linear_kv_proj, kv_projection_input)
+                kv_up_projection_is_gathered = (
+                    self.tp_size > 1
+                    and self.config.sequence_parallel
+                    and kv.size(0) == kv_compressed.size(0) * self.tp_size
+                )
+            _dsv4_log_bridge_kv('after_linear_kv_proj', self.layer_number, kv)
             kv = self.kv_layernorm(kv)
+            _dsv4_log_bridge_kv('after_kv_layernorm', self.layer_number, kv)
             if self.tp_size > 1 and self.config.sequence_parallel:
                 # q-up is a standard SP column-parallel projection and
                 # therefore sees the complete CP-local sequence. The V4 KV
@@ -211,33 +511,37 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
                         kv[boundary_rows:], group=self.pg_collection.tp
                     )
                     kv = torch.cat([boundary_kv_part, local_kv_part], dim=0)
-                else:
+                elif not kv_up_projection_is_gathered:
                     kv = tensor_parallel.gather_from_sequence_parallel_region(
                         kv, group=self.pg_collection.tp
                     )
+            _dsv4_log_bridge_kv('after_tp_kv_gather', self.layer_number, kv)
             local_kv_rotary_pos_emb = kv_rotary_pos_emb
             if self.tp_size > 1 and self.config.sequence_parallel and packed_seq_params is None:
                 local_kv_rotary_pos_emb = _slice_tp_rope(local_kv_rotary_pos_emb, kv.size(0))
             boundary_kv = None
-
-            # q_no_pe: [num_tokens, n, qk_head_dim]
-            # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
             pos_dim = self.config.qk_pos_emb_head_dim
-            q_no_pe, q_pos_emb = torch.split(q, [q.shape[-1] - pos_dim, pos_dim], dim=-1)
 
-            # RoPE and query (shared for wkv and latent)
-            # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
-            q_pos_emb = apply_rotary_pos_emb(
-                q_pos_emb,
-                local_rotary_pos_emb,
-                config=self.config,
-                cu_seqlens=cu_seqlens_q,
-                cp_group=self.pg_collection.cp,
-                mla_rotary_interleaved=True,
-                mla_output_remove_interleaving=True,
-            )
-            # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
-            query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
+            if q is not None:
+                # q_no_pe: [num_tokens, n, qk_head_dim]
+                # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
+                q_no_pe, q_pos_emb = torch.split(q, [q.shape[-1] - pos_dim, pos_dim], dim=-1)
+
+                # RoPE and query (shared for wkv and latent)
+                # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
+                q_pos_emb = apply_rotary_pos_emb(
+                    q_pos_emb,
+                    local_rotary_pos_emb,
+                    config=self.config,
+                    cu_seqlens=cu_seqlens_q,
+                    cp_group=self.pg_collection.cp,
+                    mla_rotary_interleaved=True,
+                    mla_output_remove_interleaving=True,
+                )
+                # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
+                query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
+            else:
+                query = None
 
             kv_no_pe, k_pos_emb = torch.split(kv, [kv.size(-1) - pos_dim, pos_dim], dim=-1)
 
@@ -254,21 +558,31 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
 
             # Single head: key = value = [num_tokens, 1, v_head_dim]
             kv = torch.cat([kv_no_pe, k_pos_emb], dim=-1).unsqueeze(-2)
+            _dsv4_log_bridge_kv('after_kv_rope', self.layer_number, kv)
             if boundary_kv_compressed is not None:
                 boundary_kv = kv[:boundary_rows]
                 kv = kv[boundary_rows:]
             key = kv
             value = kv
 
-            query = query.contiguous()
+            if query is not None:
+                query = query.contiguous()
             key = key.contiguous()
             value = value.contiguous()
             if boundary_kv is not None:
                 boundary_kv = boundary_kv.contiguous()
             if boundary_kv is None:
-                return query, key, value
-            return query, key, value, boundary_kv
+                result = (query, key, value)
+            else:
+                result = (query, key, value, boundary_kv)
+            if query_chunk_provider is not None:
+                result = result + (query_chunk_provider, )
+            if indexer_qr_chunk_provider is not None:
+                result = result + (indexer_qr_chunk_provider, )
+            return result
 
+        query_chunk_provider = None
+        indexer_qr_chunk_provider = None
         if self.recompute_up_proj:
             quantization = self.config.fp8 or self.config.fp4
             self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
@@ -283,7 +597,14 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
                                                                                    boundary_rotary_pos_emb)
         else:
             if boundary_hidden is None:
-                query, key, value = qkv_up_proj_and_rope_apply(q_compressed, kv_compressed, rotary_pos_emb)
+                qkv_result = qkv_up_proj_and_rope_apply(
+                    q_compressed, kv_compressed, rotary_pos_emb
+                )
+                query, key, value = qkv_result[:3]
+                if len(qkv_result) > 3:
+                    query_chunk_provider = qkv_result[3]
+                if len(qkv_result) > 4:
+                    indexer_qr_chunk_provider = qkv_result[4]
                 boundary_kv = None
             else:
                 query, key, value, boundary_kv = qkv_up_proj_and_rope_apply(q_compressed, kv_compressed, rotary_pos_emb,
@@ -291,7 +612,11 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
 
         result = (query, key, value, q_compressed, kv_compressed)
         if boundary_kv is not None:
-            return result + (boundary_kv, )
+            result = result + (boundary_kv, )
+        if query_chunk_provider is not None:
+            result = result + (query_chunk_provider, )
+        if indexer_qr_chunk_provider is not None:
+            result = result + (indexer_qr_chunk_provider, )
         return result
 
     def forward(
@@ -344,7 +669,13 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         boundary_hidden = None
         boundary_rotary_pos_emb = None
         if use_thd_cp:
-            from megatron.core.transformer.experimental_attention_variant import csa_cp_utils as cp_utils
+            # Keep Bridge on the same CP utility implementation as the V4 CSA
+            # core.  The old top-level ``csa_cp_utils`` module imports the
+            # removed dsa_kernels.indexer_topk symbol on the current MCore
+            # backend; the maintained utility lives under csa_utils.cp_utils.
+            from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+                cp_utils,
+            )
             boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
                 core_hidden_states,
                 self._dsv4_compress_ratio,
@@ -372,10 +703,18 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             boundary_hidden=boundary_hidden,
             boundary_rotary_pos_emb=boundary_rotary_pos_emb,
         )
+        # The streamed providers are returned only by the non-CP TP path.  A
+        # TP×CP layout still needs these locals initialized before the common
+        # sequence-parallel gather below; otherwise entering CP through the
+        # `use_thd_cp` branch raises UnboundLocalError before attention.
+        query_chunk_provider = None
+        indexer_qr_chunk_provider = None
         if use_thd_cp:
             query, key, value, q_compressed, kv_compressed, boundary_kv = qkv
         else:
-            query, key, value, q_compressed, kv_compressed = qkv
+            query, key, value, q_compressed, kv_compressed = qkv[:5]
+            query_chunk_provider = qkv[5] if len(qkv) > 5 else None
+            indexer_qr_chunk_provider = qkv[6] if len(qkv) > 6 else None
             boundary_kv = None
 
         core_q_compressed = q_compressed
@@ -384,12 +723,14 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             # indexer consumes the same complete CP-local sequence as the
             # gathered hidden states. Keep the local q-compressed tensor for
             # q-up, and provide a gathered copy to the core-attention path.
-            core_q_compressed = tensor_parallel.gather_from_sequence_parallel_region(
-                q_compressed, group=self.pg_collection.tp
-            )
+            if indexer_qr_chunk_provider is None:
+                core_q_compressed = tensor_parallel.gather_from_sequence_parallel_region(
+                    q_compressed, group=self.pg_collection.tp
+                )
 
         # TODO: Currently, TE can only accept contiguous tensors for MLA
-        query = query.contiguous()
+        if query is not None:
+            query = query.contiguous()
         key = key.contiguous()
         value = value.contiguous()
 
@@ -397,12 +738,147 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         # core attention computation
         # ==================================
         # Need corresponding TE change
+        stream_core_output = (
+            os.environ.get('DSV4_STREAM_CORE_OUTPUT', '0').strip() == '1'
+            and self.tp_size > 1
+            and self.config.sequence_parallel
+            and packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+            and not use_thd_cp
+            and core_hidden_states.size(0) == sequence_parallel_local_length * self.tp_size
+            and not self.offload_core_attention
+            and not self.offload_attn_proj
+            and not self.recompute_up_proj
+            and not self._o_group_proj_is_grouped_linear
+            and copy_attention_chunk is not None
+        )
+        stream_output = None
+        stream_bias = None
+
+        if stream_core_output:
+            # The CSA path normally returns one global [T, heads*D] buffer.
+            # At 256K that buffer is itself a multi-GiB allocation even after
+            # query/top-k chunking.  Consume each chunk through the exact
+            # downstream projection chain while it is still small, retaining
+            # only this rank's sequence-parallel output rows.
+            stream_cu_seqlens = (
+                packed_seq_params.cu_seqlens_kv_padded
+                if packed_seq_params.cu_seqlens_kv_padded is not None
+                else packed_seq_params.cu_seqlens_kv
+            )
+            stream_wo_a_weight = self.linear_o_group_proj.view(
+                self.o_local_groups, self.config.o_lora_rank, -1
+            )
+
+            def consume_core_output(start, end, core_chunk):
+                nonlocal stream_output, stream_bias
+                chunk_rows = end - start
+                if core_chunk.ndim == 2:
+                    core_chunk = core_chunk.unsqueeze(1)
+                if core_chunk.ndim != 3:
+                    raise RuntimeError(
+                        'DSV4 streamed CSA output must be [T, 1, H] or [T, H], '
+                        f'got {tuple(core_chunk.shape)}'
+                    )
+
+                n_heads = self.num_attention_heads_per_partition
+                pos_dim = self.config.qk_pos_emb_head_dim
+                chunk_view = core_chunk.view(chunk_rows, core_chunk.size(1), n_heads, -1)
+                content_chunk, rot_chunk = torch.split(
+                    chunk_view,
+                    [chunk_view.size(-1) - pos_dim, pos_dim],
+                    dim=-1,
+                )
+
+                # Build document-relative positions for this global chunk.  A
+                # packed batch can contain multiple documents; slicing the
+                # frequency table by [start:end] would be wrong after a reset.
+                global_rows = torch.arange(
+                    start,
+                    end,
+                    device=rot_chunk.device,
+                    dtype=stream_cu_seqlens.dtype,
+                )
+                seq_ids = torch.bucketize(
+                    global_rows,
+                    stream_cu_seqlens[1:],
+                    out_int32=True,
+                    right=True,
+                ).clamp_max(stream_cu_seqlens.numel() - 2)
+                positions = global_rows - stream_cu_seqlens[seq_ids]
+                positions = positions.clamp_min(0).clamp_max(rotary_pos_emb.size(0) - 1)
+                freqs_chunk = rotary_pos_emb.index_select(0, positions.long())
+
+                rot_chunk = _apply_rotary_pos_emb_bshd(
+                    rot_chunk.squeeze(1).contiguous(),
+                    freqs_chunk,
+                    rotary_interleaved=self.config.rotary_interleaved,
+                    mla_rotary_interleaved=True,
+                    inverse=True,
+                    mla_output_remove_interleaving=True,
+                ).unsqueeze(1)
+                projected_input = torch.cat(
+                    [content_chunk, rot_chunk], dim=-1
+                ).reshape(chunk_rows, core_chunk.size(1), -1)
+                projected_input = projected_input.view(
+                    chunk_rows, core_chunk.size(1), self.o_local_groups, -1
+                )
+                projected_input = torch.einsum(
+                    '...gd,grd->...gr', projected_input, stream_wo_a_weight
+                ).reshape(chunk_rows, core_chunk.size(1), -1)
+                # Every TP rank sees the same global chunk.  Disable SP just
+                # for this short row-parallel call so TE returns the full
+                # chunk after the TP reduction; slicing an SP reduce-scatter
+                # result by ``start // tp`` would be wrong for chunks before
+                # this rank's global sequence interval.
+                sequence_parallel_attrs = []
+                for module in self.linear_proj.modules():
+                    if hasattr(module, 'sequence_parallel'):
+                        sequence_parallel_attrs.append((module, module.sequence_parallel))
+                        module.sequence_parallel = False
+                try:
+                    chunk_output, chunk_bias = self.linear_proj(projected_input)
+                finally:
+                    for module, value in sequence_parallel_attrs:
+                        module.sequence_parallel = value
+
+                if chunk_output.size(0) != chunk_rows:
+                    raise RuntimeError(
+                        'Streamed TP projection must return the full global chunk '
+                        'when sequence_parallel is disabled: '
+                        f'got={chunk_output.size(0)}, expected={chunk_rows}'
+                    )
+                local_global_start = self.pg_collection.tp.rank() * sequence_parallel_local_length
+                local_global_end = local_global_start + sequence_parallel_local_length
+                copy_start = max(start, local_global_start)
+                copy_end = min(end, local_global_end)
+                if copy_start >= copy_end:
+                    return
+                chunk_output = chunk_output.narrow(0, copy_start - start, copy_end - copy_start)
+                destination_start = copy_start - local_global_start
+                if stream_output is None:
+                    stream_output = torch.empty(
+                        (sequence_parallel_local_length, *chunk_output.shape[1:]),
+                        dtype=chunk_output.dtype,
+                        device=chunk_output.device,
+                    )
+                    stream_bias = chunk_bias
+                stream_output = copy_attention_chunk(
+                    stream_output, chunk_output, destination_start
+                )
+
         core_attn_manager = off_interface(self.offload_core_attention and self.training, query, 'core_attn')
         with core_attn_manager as query:
             core_attn_kwargs = {}
             if boundary_hidden is not None:
                 core_attn_kwargs['boundary_hidden'] = boundary_hidden
                 core_attn_kwargs['boundary_kv'] = boundary_kv
+            if stream_core_output:
+                core_attn_kwargs['stream_output_consumer'] = consume_core_output
+            if query_chunk_provider is not None:
+                core_attn_kwargs['query_chunk_provider'] = query_chunk_provider
+            if indexer_qr_chunk_provider is not None:
+                core_attn_kwargs['indexer_qr_chunk_provider'] = indexer_qr_chunk_provider
             core_attn_out = self.core_attention(
                 query,
                 key,
@@ -416,7 +892,22 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         forced_released_tensors = [query, key, value]
         if boundary_kv is not None:
             forced_released_tensors.append(boundary_kv)
-        core_attn_out = core_attn_manager.group_offload(core_attn_out, forced_released_tensors=forced_released_tensors)
+        if core_attn_out is not None:
+            core_attn_out = core_attn_manager.group_offload(
+                core_attn_out, forced_released_tensors=forced_released_tensors
+            )
+        else:
+            # The streaming consumer has already run the inverse-RoPE and
+            # output-projection chain for every chunk.  Still release the QKV
+            # group through the manager before returning.
+            core_attn_manager.group_offload(
+                None, forced_released_tensors=forced_released_tensors
+            )
+
+        if stream_core_output:
+            if stream_output is None:
+                raise RuntimeError('DSV4 CSA output streaming produced no output chunks.')
+            return stream_output, stream_bias
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
@@ -444,10 +935,17 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             cu_seqlens_kv = None
 
         content_part, rot_part = torch.split(core_attn_out, [core_attn_out.size(-1) - pos_dim, pos_dim], dim=-1)
+        use_recompute_rope_merge = (
+            os.environ.get('DSV4_CSA_RECOMPUTE_OUT', '0').strip() == '1'
+        )
         if packed_seq:
             rot_part_in = rot_part.squeeze(1)
         else:
             rot_part_in = rot_part
+        if use_recompute_rope_merge:
+            # The fused RoPE backward must retain the pre-rotation values
+            # after the original attention buffer is overwritten.
+            rot_part_in = rot_part_in.contiguous()
         rot_part_out = apply_rotary_pos_emb(
             rot_part_in,
             rotary_pos_emb,
@@ -462,7 +960,12 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             rot_part = rot_part_out.unsqueeze(1)
         else:
             rot_part = rot_part_out
-        core_attn_out = torch.cat([content_part, rot_part], dim=-1)
+        if use_recompute_rope_merge:
+            core_attn_out = merge_rotary_output(
+                core_attn_out, rot_part, content_part.size(-1)
+            )
+        else:
+            core_attn_out = torch.cat([content_part, rot_part], dim=-1)
         core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), -1)
 
         # Grouped output
@@ -481,15 +984,171 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         else:
             core_attn_out = core_attn_out.view(core_attn_out.size(0), core_attn_out.size(1), self.o_local_groups, -1)
             wo_a_weight = self.linear_o_group_proj.view(self.o_local_groups, self.config.o_lora_rank, -1)
-            core_attn_out = torch.einsum('...gd,grd->...gr', core_attn_out, wo_a_weight)
-            core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+            try:
+                output_chunk_size = int(os.environ.get('DSV4_TP_O_PROJ_CHUNK_SIZE', '0') or 0)
+            except ValueError:
+                output_chunk_size = 0
+            try:
+                linear_proj_chunk_hint = int(
+                    os.environ.get('DSV4_TP_LINEAR_PROJ_CHUNK_SIZE', '0') or 0
+                )
+            except ValueError:
+                linear_proj_chunk_hint = 0
+            defer_wo_a_projection = (
+                output_chunk_size > 0
+                and linear_proj_chunk_hint > 0
+                and core_attn_out.size(0) > output_chunk_size
+                and self.tp_size > 1
+                and self.config.sequence_parallel
+            )
+            if output_chunk_size > 0 and core_attn_out.size(0) > output_chunk_size:
+                if copy_attention_chunk is None:
+                    raise RuntimeError(
+                        'DSV4_TP_O_PROJ_CHUNK_SIZE requires the MCore copy_attention_chunk helper.'
+                    )
+                if not defer_wo_a_projection:
+                    projected = None
+                    for start in range(0, core_attn_out.size(0), output_chunk_size):
+                        end = min(start + output_chunk_size, core_attn_out.size(0))
+                        projected_chunk = torch.einsum(
+                            '...gd,grd->...gr', core_attn_out[start:end], wo_a_weight
+                        )
+                        if projected is None:
+                            projected = torch.empty(
+                                (core_attn_out.size(0), projected_chunk.size(1), projected_chunk.size(2),
+                                 projected_chunk.size(3)),
+                                dtype=projected_chunk.dtype,
+                                device=projected_chunk.device,
+                            )
+                        projected = copy_attention_chunk(projected, projected_chunk, start)
+                    core_attn_out = projected
+            else:
+                core_attn_out = torch.einsum('...gd,grd->...gr', core_attn_out, wo_a_weight)
+            if not defer_wo_a_projection:
+                core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
         # =================
         # Output. [sq, b, h]
         # =================
         attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, 'attn_proj')
         with attn_proj_manager as core_attn_out:
-            output, bias = self.linear_proj(core_attn_out)
+            try:
+                linear_proj_chunk_size = int(
+                    os.environ.get('DSV4_TP_LINEAR_PROJ_CHUNK_SIZE', '0') or 0
+                )
+            except ValueError:
+                linear_proj_chunk_size = 0
+
+            # TE's row-parallel projection performs the TP reduce-scatter in one
+            # call.  At very long sequence lengths its temporary collective
+            # buffer can be larger than the remaining headroom even when the
+            # preceding MLA workspaces have been chunked.  Run the same module
+            # on sequence-aligned pieces and copy the local sequence outputs
+            # into one autograd-connected buffer.  This is opt-in because it
+            # trades one large GEMM/collective for several smaller ones.
+            should_chunk_linear_proj = (
+                linear_proj_chunk_size > 0
+                and core_attn_out.size(0) > linear_proj_chunk_size
+                and self.tp_size > 1
+                and self.config.sequence_parallel
+            )
+            if defer_wo_a_projection:
+                if copy_attention_chunk is None:
+                    raise RuntimeError(
+                        'DSV4_TP_LINEAR_PROJ_CHUNK_SIZE requires the MCore '
+                        'copy_attention_chunk helper.'
+                    )
+                # Fuse the low-rank wo_a projection with the row-parallel
+                # projection.  Keeping only one sequence piece alive is what
+                # removes the otherwise unavoidable full [S, B, G, R] buffer.
+                chunk_size = min(linear_proj_chunk_size, output_chunk_size)
+                total_rows = core_attn_out.size(0)
+                remainder = total_rows % chunk_size
+                if chunk_size % self.tp_size != 0 or total_rows % self.tp_size != 0 or (
+                    remainder and remainder % self.tp_size != 0
+                ):
+                    raise ValueError(
+                        'TP output projection chunks must produce TP-aligned pieces: '
+                        f'chunk={chunk_size}, sequence={total_rows}, tp={self.tp_size}'
+                    )
+
+                output = None
+                bias = None
+                output_start = 0
+                for start in range(0, total_rows, chunk_size):
+                    end = min(start + chunk_size, total_rows)
+                    projected_chunk = torch.einsum(
+                        '...gd,grd->...gr', core_attn_out[start:end], wo_a_weight
+                    ).reshape(end - start, core_attn_out.size(1), -1)
+                    chunk_output, chunk_bias = self.linear_proj(projected_chunk)
+                    if output is None:
+                        if (total_rows * chunk_output.size(0)) % (end - start) != 0:
+                            raise ValueError(
+                                'TP output projection shape is not integral for '
+                                f'chunk={chunk_size}, input={total_rows}, '
+                                f'first_output_rows={chunk_output.size(0)}'
+                            )
+                        output = torch.empty(
+                            (
+                                total_rows * chunk_output.size(0) // (end - start),
+                                *chunk_output.shape[1:],
+                            ),
+                            dtype=chunk_output.dtype,
+                            device=chunk_output.device,
+                        )
+                        bias = chunk_bias
+                    output = copy_attention_chunk(output, chunk_output, output_start)
+                    output_start += chunk_output.size(0)
+                assert output is not None
+                assert output_start == output.size(0)
+            elif should_chunk_linear_proj:
+                if copy_attention_chunk is None:
+                    raise RuntimeError(
+                        'DSV4_TP_LINEAR_PROJ_CHUNK_SIZE requires the MCore '
+                        'copy_attention_chunk helper.'
+                    )
+                total_rows = core_attn_out.size(0)
+                # Sequence-parallel reduce-scatter requires every input piece
+                # to be divisible by TP.  The final tail may be shorter than
+                # the requested chunk, but it must remain TP-aligned.
+                remainder = total_rows % linear_proj_chunk_size
+                if linear_proj_chunk_size % self.tp_size != 0 or total_rows % self.tp_size != 0 or (
+                    remainder and remainder % self.tp_size != 0
+                ):
+                    raise ValueError(
+                        'DSV4_TP_LINEAR_PROJ_CHUNK_SIZE must produce TP-aligned '
+                        f'pieces: chunk={linear_proj_chunk_size}, '
+                        f'sequence={total_rows}, tp={self.tp_size}'
+                    )
+
+                output = None
+                bias = None
+                output_start = 0
+                for start in range(0, total_rows, linear_proj_chunk_size):
+                    end = start + linear_proj_chunk_size
+                    chunk_output, chunk_bias = self.linear_proj(core_attn_out[start:end])
+                    if output is None:
+                        if (total_rows * chunk_output.size(0)) % linear_proj_chunk_size != 0:
+                            raise ValueError(
+                                'TP linear projection output shape is not integral for '
+                                f'chunk={linear_proj_chunk_size}, input={total_rows}, '
+                                f'first_output_rows={chunk_output.size(0)}'
+                            )
+                        output = torch.empty(
+                            (
+                                total_rows * chunk_output.size(0) // linear_proj_chunk_size,
+                                *chunk_output.shape[1:],
+                            ),
+                            dtype=chunk_output.dtype,
+                            device=chunk_output.device,
+                        )
+                        bias = chunk_bias
+                    output = copy_attention_chunk(output, chunk_output, output_start)
+                    output_start += chunk_output.size(0)
+                assert output is not None
+                assert output_start == output.size(0)
+            else:
+                output, bias = self.linear_proj(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
 
         # Some TE versions reduce the row-parallel output across TP but leave

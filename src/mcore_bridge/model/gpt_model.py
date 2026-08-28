@@ -5,6 +5,7 @@ import megatron.core
 import os
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from collections import OrderedDict
 from megatron.core import mpu, parallel_state
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
@@ -354,6 +355,91 @@ class GPTModel(McoreGPTModel):
     def _forward_output_layer(self, hidden_states, *args, **kwargs):
         return self.output_layer(hidden_states, *args, **kwargs)[0]
 
+    def _compute_chunked_lm_loss(
+        self,
+        hidden_states,
+        labels,
+        output_weight,
+        runtime_gather_output,
+        chunk_size,
+    ):
+        """Compute native vocab-parallel CE without materializing full logits.
+
+        H200 is SM90, while MCore's fused linear+cross-entropy implementation
+        is currently restricted to SM100. The native CE path is therefore
+        retained, but its vocabulary projection is run in sequence chunks and
+        checkpointed so each chunk's logits are released before the next one.
+        """
+        sequence_length = hidden_states.size(0)
+        global_labels = labels
+        tp_size = int(self.config.tensor_model_parallel_size)
+        label_start = 0
+        if labels.size(-1) == sequence_length * tp_size and tp_size > 1:
+            tp_rank = parallel_state.get_tensor_model_parallel_rank()
+            label_start = tp_rank * sequence_length
+            labels = labels[..., label_start:label_start + sequence_length]
+        if labels.size(-1) != sequence_length:
+            raise ValueError(
+                'Chunked LM-head requires labels to cover the local sequence: '
+                f'hidden={sequence_length}, labels={labels.size(-1)}'
+            )
+        losses = []
+
+        def loss_chunk(hidden_chunk, labels_chunk):
+            # The normal output layer is sequence-parallel and therefore
+            # all-gathers hidden states before its vocab projection. Here each
+            # TP rank already owns a disjoint local sequence interval; gathering
+            # every chunk would recreate the global logits (and its memory
+            # peak). Toggle the module for the duration of both the initial
+            # checkpoint forward and its backward recompute.
+            original_sequence_parallel = self.output_layer.sequence_parallel
+            original_allreduce_dgrad = self.output_layer.allreduce_dgrad
+            original_disable_grad_reduce = self.output_layer.disable_grad_reduce
+            self.output_layer.sequence_parallel = False
+            self.output_layer.allreduce_dgrad = False
+            self.output_layer.disable_grad_reduce = True
+            try:
+                logits_chunk = self._forward_output_layer(
+                    hidden_chunk,
+                    weight=output_weight,
+                    runtime_gather_output=runtime_gather_output,
+                )
+                return self.compute_language_model_loss(labels_chunk, logits_chunk)
+            finally:
+                self.output_layer.sequence_parallel = original_sequence_parallel
+                self.output_layer.allreduce_dgrad = original_allreduce_dgrad
+                self.output_layer.disable_grad_reduce = original_disable_grad_reduce
+
+        for start in range(0, sequence_length, chunk_size):
+            end = min(start + chunk_size, sequence_length)
+            hidden_chunk = hidden_states[start:end]
+            labels_chunk = labels[..., start:end]
+            if self.training and torch.is_grad_enabled():
+                losses.append(
+                    torch_checkpoint(
+                        loss_chunk,
+                        hidden_chunk,
+                        labels_chunk,
+                        use_reentrant=False,
+                    )
+                )
+            else:
+                losses.append(loss_chunk(hidden_chunk, labels_chunk))
+        local_losses = torch.cat(losses, dim=-1)
+        if global_labels.size(-1) == sequence_length and tp_size == 1:
+            return local_losses
+
+        # Keep the trainer's existing global loss-mask contract without
+        # recreating logits: each rank contributes only its contiguous
+        # sequence slice, while zero-filled nonlocal positions are ignored
+        # by the global mask. The buffer is tiny compared with logits and
+        # its indexed assignment preserves the local loss autograd edge.
+        global_losses = local_losses.new_zeros(
+            (local_losses.size(0), global_labels.size(-1))
+        )
+        global_losses[..., label_start:label_start + sequence_length] = local_losses
+        return global_losses
+
     def _init_reranker_cache(self, weight):
         """One-time initialization of generative reranker constants."""
         positive_token = os.environ.get('GENERATIVE_RERANKER_POSITIVE_TOKEN', 'yes')
@@ -554,6 +640,50 @@ class GPTModel(McoreGPTModel):
                 # state ([B, H]) → unsqueeze back to [1, B, H]
                 # (so that the output layer, which expects S×B×H, receives only the final token)
                 hidden_states = inference_context.last_token_logits(hidden_states.squeeze(1).unsqueeze(0)).unsqueeze(1)
+
+        try:
+            lm_head_chunk_size = int(os.environ.get('DSV4_LM_HEAD_CHUNK_SIZE', '0') or 0)
+        except ValueError:
+            lm_head_chunk_size = 0
+        if (
+            labels is not None
+            and self.config.task_type == 'causal_lm'
+            and lm_head_chunk_size > 0
+            and not in_inference_mode
+        ):
+            if sequence_parallel_override:
+                self.output_layer.sequence_parallel = True
+            return self._compute_chunked_lm_loss(
+                hidden_states,
+                labels,
+                output_weight,
+                runtime_gather_output,
+                lm_head_chunk_size,
+            )
+
+        # MCore's LinearCrossEntropyModule can consume hidden states directly
+        # and stream the vocab-parallel linear + CE computation. The bridge's
+        # historical postprocess materialized logits before calling
+        # compute_language_model_loss, which is prohibitive for 256K tokens.
+        # Keep this opt-in behind the existing config switch; inference and
+        # non-generative task paths retain the logits behavior below.
+        use_linear_cross_entropy = (
+            labels is not None
+            and self.config.task_type == 'causal_lm'
+            and self.config.cross_entropy_loss_fusion
+            and self.config.cross_entropy_fusion_impl == 'linear'
+            and hasattr(self.output_layer, '_compute_linear_and_cross_entropy_loss')
+        )
+        if use_linear_cross_entropy:
+            if sequence_parallel_override:
+                self.output_layer.sequence_parallel = True
+            return self.output_layer(
+                input_=hidden_states,
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+                output_cross_entropy_loss=True,
+                labels=labels,
+            )
 
         if self.config.task_type == 'embedding':
             logits = F.normalize(hidden_states, p=2, dim=-1)

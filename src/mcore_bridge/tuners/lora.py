@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
 import megatron.core
+import os
 import peft
 import torch
 import torch.nn as nn
@@ -91,6 +92,75 @@ def _get_tensor_parallel_group_for_lora(base_layer):
     return getattr(base_layer, 'parallel_group', None)
 
 
+class _InplaceScaledAdd(torch.autograd.Function):
+    """Add one LoRA output slice into a non-leaf base output in place.
+
+    TE grouped linears return tensors backed by custom autograd Functions, so
+    modifying a ``result.narrow(...)`` view directly is rejected by PyTorch.
+    This small autograd bridge marks the base output dirty and supplies the
+    corresponding sliced gradient for the LoRA branch without allocating a
+    full-size ``result + delta`` tensor.
+    """
+
+    @staticmethod
+    def forward(ctx, base, delta, start, alpha):
+        start = int(start)
+        num_tokens = delta.shape[0]
+        ctx.start = start
+        ctx.num_tokens = num_tokens
+        ctx.alpha = float(alpha)
+        # TE grouped-linear outputs are custom autograd outputs.  Even a
+        # detached narrow view increments their version counter and is
+        # rejected by the view/in-place guard.  This adapter owns the backward
+        # rule explicitly, so use the raw storage update and avoid creating a
+        # tracked view or version-counter edge here.
+        base.data.narrow(0, start, num_tokens).add_(delta.data, alpha=ctx.alpha)
+        return base
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        delta_grad = grad_output.narrow(0, ctx.start, ctx.num_tokens).mul(ctx.alpha)
+        return grad_output, delta_grad, None, None
+
+
+class _InplaceScaledAddStrided(torch.autograd.Function):
+    """Accumulate a TP sequence-gathered LoRA chunk into global rows."""
+
+    @staticmethod
+    def forward(ctx, base, delta, local_start, local_num_tokens, local_total_tokens, alpha):
+        local_start = int(local_start)
+        local_num_tokens = int(local_num_tokens)
+        local_total_tokens = int(local_total_tokens)
+        replica_count = base.shape[0] // local_total_tokens
+        ctx.local_start = local_start
+        ctx.local_num_tokens = local_num_tokens
+        ctx.local_total_tokens = local_total_tokens
+        ctx.replica_count = replica_count
+        ctx.alpha = float(alpha)
+        for replica in range(replica_count):
+            base_start = replica * local_total_tokens + local_start
+            delta_start = replica * local_num_tokens
+            base.data.narrow(0, base_start, local_num_tokens).add_(
+                delta.data.narrow(0, delta_start, local_num_tokens), alpha=ctx.alpha
+            )
+        return base
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        delta_grad = torch.cat(
+            [
+                grad_output.narrow(
+                    0,
+                    replica * ctx.local_total_tokens + ctx.local_start,
+                    ctx.local_num_tokens,
+                )
+                for replica in range(ctx.replica_count)
+            ],
+            dim=0,
+        ).mul(ctx.alpha)
+        return grad_output, delta_grad, None, None, None, None
+
+
 class LoraParallelLinear(MegatronModule, LoraLayer):
 
     def __init__(
@@ -143,6 +213,213 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         )
 
         self.is_target_conv_1d_layer = False
+        self._dsv4_lora_debug_logged = False
+        self._dsv4_lora_chunk_debug_count = 0
+
+    @staticmethod
+    def _grouped_lora_token_counts(args, kwargs):
+        """Return grouped-linear token counts as a Python list."""
+        token_arg = args[0] if args else kwargs.get('tokens_per_expert')
+        if token_arg is None:
+            return None
+        if torch.is_tensor(token_arg):
+            token_arg = token_arg.detach().cpu().tolist()
+        return [int(count) for count in token_arg]
+
+    @staticmethod
+    def _grouped_lora_call_args(args, kwargs, token_counts):
+        """Replace ``tokens_per_expert`` while preserving other TE arguments."""
+        if args:
+            return (token_counts, *args[1:]), kwargs
+        grouped_kwargs = dict(kwargs)
+        grouped_kwargs['tokens_per_expert'] = token_counts
+        return args, grouped_kwargs
+
+    def _forward_grouped_lora_chunked(self, result, x, lora_A, lora_B, dropout, scaling, args, kwargs):
+        """Apply grouped LoRA in bounded token chunks.
+
+        MoE dispatch lays out rows contiguously by expert.  Splitting that
+        layout and accumulating each LoRA output directly into ``result``
+        avoids materializing the full ``lora_B(lora_A(x))`` delta and the
+        additional scaled/add result tensors at once.
+        """
+        try:
+            chunk_size = int(os.environ.get('DSV4_LORA_GROUPED_CHUNK_SIZE', '0') or 0)
+        except ValueError:
+            chunk_size = 0
+        debug = os.environ.get('DSV4_LORA_DEBUG_SHAPES', '0') == '1'
+        if debug and result.shape[0] >= 16384 and self._dsv4_lora_chunk_debug_count < 40:
+            print(
+                '[dsv4-lora-debug] grouped_enter base={} x_shape={} result_shape={} '
+                'args_len={} lora_a={} lora_b={} chunk_size={}'.format(
+                    type(self.base_layer).__name__,
+                    tuple(x.shape),
+                    tuple(result.shape),
+                    len(args),
+                    type(lora_A).__name__,
+                    type(lora_B).__name__,
+                    chunk_size,
+                ),
+                flush=True,
+            )
+            self._dsv4_lora_chunk_debug_count += 1
+        if chunk_size <= 0:
+            return None
+
+        token_counts = self._grouped_lora_token_counts(args, kwargs)
+        num_gemms = getattr(lora_A, 'num_gemms', None)
+        if token_counts is None or num_gemms is None or len(token_counts) != num_gemms:
+            if debug and result.shape[0] >= 16384 and self._dsv4_lora_chunk_debug_count < 40:
+                print(
+                    '[dsv4-lora-debug] grouped_skip_counts token_counts_len={} '
+                    'num_gemms={} token_sum={} x_rows={} result_rows={}'.format(
+                        None if token_counts is None else len(token_counts),
+                        num_gemms,
+                        None if token_counts is None else sum(token_counts),
+                        x.shape[0],
+                        result.shape[0],
+                    ),
+                    flush=True,
+                )
+                self._dsv4_lora_chunk_debug_count += 1
+            return None
+        if getattr(lora_B, 'num_gemms', num_gemms) != num_gemms:
+            return None
+        total_tokens = sum(token_counts)
+        if total_tokens <= chunk_size or total_tokens != x.shape[0] or total_tokens != result.shape[0]:
+            if debug and result.shape[0] >= 16384 and self._dsv4_lora_chunk_debug_count < 40:
+                print(
+                    '[dsv4-lora-debug] grouped_skip_rows token_sum={} x_rows={} '
+                    'result_rows={} chunk_size={}'.format(
+                        total_tokens, x.shape[0], result.shape[0], chunk_size
+                    ),
+                    flush=True,
+                )
+                self._dsv4_lora_chunk_debug_count += 1
+            return None
+
+        # The rank-sized A output is cheap to keep even for a long dispatched
+        # sequence.  Compute it once so chunking only changes the large B
+        # output; this also preserves the original dropout/RNG behavior and
+        # avoids compiling a second grouped-A variant for every chunk.
+        if isinstance(lora_A, (TEGroupedLinear, NpuGroupedLoraLinear)):
+            lora_a_result = lora_A(dropout(x), *args, **kwargs)
+        else:
+            lora_a_result = lora_A(dropout(x))
+        if isinstance(lora_a_result, tuple):
+            lora_a_result = lora_a_result[0]
+
+        def apply_chunk(start, num_tokens, counts):
+            nonlocal result
+            chunk_args, chunk_kwargs = self._grouped_lora_call_args(args, kwargs, counts)
+            chunk_lora_a = lora_a_result.narrow(0, start, num_tokens)
+            if isinstance(lora_B, (TEGroupedLinear, NpuGroupedLoraLinear)):
+                chunk_result = lora_B(chunk_lora_a, *chunk_args, **chunk_kwargs)
+            else:
+                chunk_result = lora_B(chunk_lora_a)
+            if isinstance(chunk_result, tuple):
+                chunk_result = chunk_result[0]
+            result = _InplaceScaledAdd.apply(result, chunk_result, start, scaling)
+
+        input_offset = 0
+        pending_start = None
+        pending_tokens = 0
+        pending_counts = [0] * num_gemms
+        for expert_idx, expert_tokens in enumerate(token_counts):
+            remaining = expert_tokens
+            while remaining > 0:
+                if pending_start is None:
+                    pending_start = input_offset
+                available = chunk_size - pending_tokens
+                take = min(remaining, available)
+                pending_counts[expert_idx] += take
+                pending_tokens += take
+                input_offset += take
+                remaining -= take
+                if pending_tokens == chunk_size:
+                    apply_chunk(pending_start, pending_tokens, pending_counts)
+                    pending_start = None
+                    pending_tokens = 0
+                    pending_counts = [0] * num_gemms
+        if pending_tokens:
+            apply_chunk(pending_start, pending_tokens, pending_counts)
+        return result
+
+    def _forward_lora_linear_chunked(self, result, x, lora_A, lora_B, dropout, scaling):
+        """Apply a regular (non-grouped) LoRA branch in row chunks.
+
+        Long V4 Indexer projections can produce a multi-GiB LoRA B output even
+        though the rank-sized A output is small.  Compute A once, then bound B
+        by the first (sequence/token) dimension and accumulate each slice with
+        the same explicit autograd bridge used by grouped experts.
+        """
+        try:
+            chunk_size = int(os.environ.get('DSV4_LORA_LINEAR_CHUNK_SIZE', '0') or 0)
+        except ValueError:
+            chunk_size = 0
+        debug_chunk = os.environ.get('DSV4_LORA_DEBUG_SHAPES', '0') == '1'
+        debug_large = result.numel() > 2**28
+        if debug_chunk and debug_large and self._dsv4_lora_chunk_debug_count < 20:
+            print(
+                '[dsv4-lora-debug] linear_chunk_enter x_shape={} result_shape={} '
+                'chunk_size={}'.format(tuple(x.shape), tuple(result.shape), chunk_size),
+                flush=True,
+            )
+            self._dsv4_lora_chunk_debug_count += 1
+        if chunk_size <= 0 or result.shape[0] <= chunk_size:
+            if debug_chunk and debug_large and self._dsv4_lora_chunk_debug_count < 20:
+                print('[dsv4-lora-debug] linear_chunk_skip early_dim0', flush=True)
+                self._dsv4_lora_chunk_debug_count += 1
+            return None
+
+        lora_a_result = lora_A(dropout(x))
+        if isinstance(lora_a_result, tuple):
+            lora_a_result = lora_a_result[0]
+        local_total_tokens = lora_a_result.shape[0]
+        if debug_chunk and debug_large and self._dsv4_lora_chunk_debug_count < 20:
+            print(
+                '[dsv4-lora-debug] linear_chunk_a_shape={} result_rows={} '.format(
+                    tuple(lora_a_result.shape), result.shape[0]
+                ),
+                flush=True,
+            )
+            self._dsv4_lora_chunk_debug_count += 1
+        if local_total_tokens <= 0 or result.shape[0] % local_total_tokens != 0:
+            if debug_chunk and debug_large and self._dsv4_lora_chunk_debug_count < 20:
+                print(
+                    '[dsv4-lora-debug] linear_chunk_skip a_shape={} result_shape={} '.format(
+                        tuple(lora_a_result.shape), tuple(result.shape)
+                    ),
+                    flush=True,
+                )
+            return None
+        replica_count = result.shape[0] // local_total_tokens
+        local_chunk_size = max(1, chunk_size // replica_count)
+        if os.environ.get('DSV4_LORA_DEBUG_SHAPES', '0') == '1' and result.numel() > 2**28:
+            print(
+                '[dsv4-lora-debug] linear_chunk_use a_shape={} result_shape={} replicas={} '
+                'local_chunk={} '.format(
+                    tuple(lora_a_result.shape),
+                    tuple(result.shape),
+                    replica_count,
+                    local_chunk_size,
+                ),
+                flush=True,
+            )
+        for start in range(0, local_total_tokens, local_chunk_size):
+            end = min(start + local_chunk_size, local_total_tokens)
+            chunk_result = lora_B(lora_a_result.narrow(0, start, end - start))
+            if isinstance(chunk_result, tuple):
+                chunk_result = chunk_result[0]
+            if chunk_result.shape[0] != replica_count * (end - start):
+                raise RuntimeError(
+                    'DSV4_LORA_LINEAR_CHUNK_SIZE expected sequence-parallel LoRA output '
+                    f'with {replica_count * (end - start)} rows, got {chunk_result.shape[0]}'
+                )
+            result = _InplaceScaledAddStrided.apply(
+                result, chunk_result, start, end - start, local_total_tokens, scaling
+            )
+        return result
 
     def update_layer(self, adapter_name, r, *, lora_alpha, **kwargs):
         if peft_019 and 'config' in kwargs:
@@ -431,6 +708,81 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                                                                     NpuGroupedLoraLinear)) else lora_A.weight.dtype
                 x = x.to(dtype)
 
+                if (os.environ.get('DSV4_LORA_DEBUG_SHAPES', '0') == '1'
+                        and not self._dsv4_lora_debug_logged and result.numel() > 2**28):
+                    print(
+                        '[dsv4-lora-debug] rank={} base={} is_grouped={} x_shape={} '
+                        'result_shape={} lora_a={} lora_b={} linear_chunk={} grouped_chunk={} '.format(
+                            os.environ.get('RANK', '?'),
+                            type(self.base_layer).__name__,
+                            self.is_grouped,
+                            tuple(x.shape),
+                            tuple(result.shape),
+                            type(lora_A).__name__,
+                            type(lora_B).__name__,
+                            os.environ.get('DSV4_LORA_LINEAR_CHUNK_SIZE', '0'),
+                            os.environ.get('DSV4_LORA_GROUPED_CHUNK_SIZE', '0'),
+                        ),
+                        flush=True,
+                    )
+                    if not isinstance(lora_A, (TEGroupedLinear, NpuGroupedLoraLinear)):
+                        print(
+                            '[dsv4-lora-debug] linear_candidate={} result_gt_chunk={} '
+                            'result_mod_x={} '.format(
+                                not self.is_grouped,
+                                result.shape[0] > int(
+                                    os.environ.get('DSV4_LORA_LINEAR_CHUNK_SIZE', '0') or 0
+                                ),
+                                (result.shape[0] % x.shape[0]) if x.shape[0] else 'zero',
+                            ),
+                            flush=True,
+                        )
+                    self._dsv4_lora_debug_logged = True
+
+                # Use the adapter's actual grouped type instead of the base
+                # layer's class hierarchy.  Some TE wrappers expose a
+                # sequence-parallel column-linear base under a grouped-looking
+                # wrapper, while their LoRA adapters are ordinary linears.
+                if isinstance(lora_A, (TEGroupedLinear, NpuGroupedLoraLinear)):
+                    chunked_result = self._forward_grouped_lora_chunked(
+                        result, x, lora_A, lora_B, dropout, scaling, args, kwargs)
+                    if chunked_result is not None:
+                        result = chunked_result
+                        continue
+                    if (os.environ.get('DSV4_LORA_DEBUG_SHAPES', '0') == '1'
+                            and result.numel() > 2**28):
+                        print(
+                            '[dsv4-lora-debug] grouped_chunk_fallback base={} '
+                            'x_shape={} result_shape={} args_len={} lora_a={} lora_b={}'.format(
+                                type(self.base_layer).__name__,
+                                tuple(x.shape),
+                                tuple(result.shape),
+                                len(args),
+                                type(lora_A).__name__,
+                                type(lora_B).__name__,
+                            ),
+                            flush=True,
+                        )
+                else:
+                    chunked_result = self._forward_lora_linear_chunked(
+                        result, x, lora_A, lora_B, dropout, scaling)
+                    if chunked_result is not None:
+                        result = chunked_result
+                        continue
+                    if (os.environ.get('DSV4_LORA_DEBUG_SHAPES', '0') == '1'
+                            and result.numel() > 2**28):
+                        print(
+                            '[dsv4-lora-debug] linear_chunk_fallback base={} '
+                            'x_shape={} result_shape={} lora_a={} lora_b={}'.format(
+                                type(self.base_layer).__name__,
+                                tuple(x.shape),
+                                tuple(result.shape),
+                                type(lora_A).__name__,
+                                type(lora_B).__name__,
+                            ),
+                            flush=True,
+                        )
+
                 lora_result = lora_A(dropout(x), *args, **kwargs) if isinstance(
                     lora_A, (TEGroupedLinear, NpuGroupedLoraLinear)) else lora_A(dropout(x))
                 if isinstance(lora_result, tuple):
@@ -439,8 +791,18 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                     lora_B, (TEGroupedLinear, NpuGroupedLoraLinear)) else lora_B(lora_result)
                 if isinstance(lora_result, tuple):
                     lora_result = lora_result[0]
-                lora_result = lora_result * scaling
-                result = result + lora_result
+                if lora_result.shape != result.shape:
+                    raise RuntimeError(
+                        'DSV4 LoRA fallback received mismatched base and adapter outputs: '
+                        f'base={tuple(result.shape)}, adapter={tuple(lora_result.shape)}'
+                    )
+                # The ordinary fallback used to allocate one full output for
+                # scaling and another for ``result + lora_result``.  Long TP
+                # streamed-Q chunks make that pair of copies large enough to
+                # OOM even though the adapter rank is tiny.  Reuse the same
+                # explicit autograd bridge as the chunked path; it preserves
+                # gradients for both branches without a full-size temporary.
+                result = _InplaceScaledAdd.apply(result, lora_result, 0, scaling)
 
         result = result.to(previous_dtype)
         return result, bias
