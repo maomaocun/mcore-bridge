@@ -23,6 +23,7 @@ from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import get_env_args, get_local_layer_specs, get_logger
 
 from ..constant import ModelType
+from ..modules.qsa_attention import qsa_sparse_forward
 from ..register import ModelLoader, ModelMeta, register_model
 
 try:
@@ -147,6 +148,17 @@ class Qwen3NextSelfAttention(SelfAttention):
         attention_bias: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
+        qsa_topk_indices: Optional[torch.Tensor] = None,
+        qsa_topk_length: Optional[torch.Tensor] = None,
+        qsa_kernel_backend: Optional[str] = None,
+        qsa_query_position_offset: int = 0,
+        qsa_key_position_offset: int = 0,
+        qsa_query_positions: Optional[torch.Tensor] = None,
+        qsa_global_kv: bool = False,
+        qsa_cp_exchange: bool = False,
+        qsa_global_seq_len: Optional[int] = None,
+        qsa_tp_sp_hidden_states: Optional[torch.Tensor] = None,
+        qsa_tp_sp_rotary_pos_emb: Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         **kwargs,
@@ -209,10 +221,78 @@ class Qwen3NextSelfAttention(SelfAttention):
         # =====================
         # Query, Key, and Value
         # =====================
+        if (qsa_topk_indices is not None and self.config.sequence_parallel
+                and self.config.tensor_model_parallel_size > 1):
+            if packed_seq_params is not None:
+                raise ValueError('QSA TP+SP phase-1 path supports SBHD/unpacked input only')
+            # TP+SP phase-1 correctness path. Sequence parallelism gives the
+            # layer a local sequence shard while TP keeps local Q/KV heads.
+            # Gather the sequence only inside the QSA attention layer, so the
+            # surrounding MLP/GDN and the output projection remain
+            # sequence-sharded. A later owner-exchange path can remove this
+            # full-sequence temporary without changing the route contract.
+            local_sequence = hidden_states.shape[0]
+            target_sequence = int(qsa_topk_indices.shape[1])
+            if qsa_tp_sp_hidden_states is not None:
+                hidden_states = qsa_tp_sp_hidden_states
+                if qsa_tp_sp_rotary_pos_emb is not None:
+                    rotary_pos_emb = qsa_tp_sp_rotary_pos_emb
+                    if not isinstance(rotary_pos_emb, tuple):
+                        rotary_pos_emb = (rotary_pos_emb,) * 2
+                target_sequence = hidden_states.shape[0]
+            if qsa_tp_sp_hidden_states is None and local_sequence != target_sequence:
+                if local_sequence * self.config.tensor_model_parallel_size != target_sequence:
+                    raise ValueError(
+                        'QSA TP+SP route/activation sequence mismatch: '
+                        f'local={local_sequence}, route={target_sequence}, '
+                        f'tp={self.config.tensor_model_parallel_size}')
+                hidden_states = gather_from_sequence_parallel_region(
+                    hidden_states,
+                    tensor_parallel_output_grad=False,
+                    group=self.pg_collection.tp,
+                )
+            if rotary_pos_emb is not None:
+                def gather_rope(rope):
+                    if rope is None or rope.shape[0] == target_sequence:
+                        return rope
+                    if rope.shape[0] * self.config.tensor_model_parallel_size != target_sequence:
+                        raise ValueError(
+                            'QSA TP+SP rope/route sequence mismatch: '
+                            f'rope={rope.shape[0]}, route={target_sequence}, '
+                            f'tp={self.config.tensor_model_parallel_size}')
+                    return gather_from_sequence_parallel_region(
+                        rope,
+                        tensor_parallel_output_grad=False,
+                        group=self.pg_collection.tp,
+                    )
+                if isinstance(rotary_pos_emb, tuple):
+                    rotary_pos_emb = tuple(gather_rope(rope) for rope in rotary_pos_emb)
+                else:
+                    rotary_pos_emb = gather_rope(rotary_pos_emb)
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         nvtx_range_push(suffix='qkv')
-        query, key, value, gate = self.get_query_key_value_tensors(hidden_states, key_value_states)
+        qsa_tp_sp_full_sequence = (
+            qsa_topk_indices is not None
+            and qsa_tp_sp_hidden_states is not None
+            and self.config.sequence_parallel
+            and self.config.tensor_model_parallel_size > 1
+        )
+        saved_qkv_sequence_parallel = None
+        if qsa_tp_sp_full_sequence and hasattr(self.linear_qkv, 'sequence_parallel'):
+            # TE ColumnParallelLinear assumes a sequence-parallel input when
+            # this flag is true and performs an internal sequence gather. The
+            # QSA phase-1 adapter has already supplied the full sequence, so
+            # disable only this projection's extra gather. Its backward still
+            # uses the regular TP dgrad reduction; linear_proj below retains
+            # sequence_parallel=True and reduce-scatters the final output.
+            saved_qkv_sequence_parallel = self.linear_qkv.sequence_parallel
+            self.linear_qkv.sequence_parallel = False
+        try:
+            query, key, value, gate = self.get_query_key_value_tensors(hidden_states, key_value_states)
+        finally:
+            if saved_qkv_sequence_parallel is not None:
+                self.linear_qkv.sequence_parallel = saved_qkv_sequence_parallel
         nvtx_range_pop(suffix='qkv')
 
         # ===================================================
@@ -316,7 +396,83 @@ class Qwen3NextSelfAttention(SelfAttention):
         # ==================================
 
         nvtx_range_push(suffix='core_attention')
-        if self.checkpoint_core_attention and self.training:
+        qsa_selected_kv = qsa_topk_indices is not None or qsa_topk_length is not None
+        if qsa_selected_kv:
+            if qsa_topk_indices is None or qsa_topk_length is None:
+                raise ValueError('QSA selected-KV attention requires both qsa_topk_indices and qsa_topk_length')
+            # SelfAttention normally derives this scale inside DotProductAttention.
+            # Keep the same value when MCore exposes it, while retaining a
+            # version-independent fallback for older Megatron-Core releases.
+            softmax_scale = getattr(self, 'softmax_scale', None)
+            if softmax_scale is None:
+                softmax_scale = getattr(self.core_attention, 'scale', None)
+            if softmax_scale is None:
+                softmax_scale = self.hidden_size_per_attention_head**-0.5
+            if packed_seq_params is not None:
+                from ..modules.qsa_attention import qsa_sparse_forward_packed
+
+                core_attn_out, _ = qsa_sparse_forward_packed(
+                    query,
+                    key,
+                    value,
+                    qsa_topk_indices,
+                    qsa_topk_length,
+                    packed_seq_params.cu_seqlens_q,
+                    packed_seq_params.cu_seqlens_kv,
+                    softmax_scale=softmax_scale,
+                    backend=qsa_kernel_backend or 'torch',
+                    query_tile_size=getattr(self.config, 'qsa_attention_query_tile_size', 16),
+                    require_backend=getattr(self.config, 'require_qsa_kernel', False),
+                    dkv_accum_dtype=getattr(self.config, 'qsa_dkv_accum_dtype', 'bf16'),
+                    dkv_reduction=getattr(self.config, 'qsa_dkv_reduction', 'atomic'),
+                    selected_token_group_size=getattr(self.config, 'indexer_compress_ratio', None),
+                )
+            else:
+                if qsa_global_kv:
+                    from ..modules.qsa_attention import qsa_reconstruct_cp_tensor
+
+                    key = qsa_reconstruct_cp_tensor(
+                        key, self.pg_collection.cp, getattr(self.config, 'cp_partition_mode', 'zigzag'))
+                    value = qsa_reconstruct_cp_tensor(
+                        value, self.pg_collection.cp, getattr(self.config, 'cp_partition_mode', 'zigzag'))
+                elif qsa_cp_exchange:
+                    from ..modules.qsa_cp_exchange import qsa_exchange_selected_kv
+
+                    key, value, qsa_topk_indices = qsa_exchange_selected_kv(
+                        key,
+                        value,
+                        qsa_topk_indices,
+                        qsa_topk_length,
+                        qsa_global_seq_len or query.shape[0],
+                        self.pg_collection.cp,
+                        getattr(self.config, 'cp_partition_mode', 'zigzag'),
+                    )
+                core_attn_out, _ = qsa_sparse_forward(
+                    query,
+                    key,
+                    value,
+                    qsa_topk_indices,
+                    qsa_topk_length,
+                    softmax_scale=softmax_scale,
+                    causal=not qsa_cp_exchange,
+                    backend=qsa_kernel_backend or 'torch',
+                    query_position_offset=qsa_query_position_offset,
+                    key_position_offset=qsa_key_position_offset,
+                    query_positions=qsa_query_positions,
+                    query_tile_size=getattr(self.config, 'qsa_attention_query_tile_size', 16),
+                    require_backend=getattr(self.config, 'require_qsa_kernel', False),
+                    dkv_accum_dtype=getattr(self.config, 'qsa_dkv_accum_dtype', 'bf16'),
+                    dkv_reduction=(
+                        'atomic' if qsa_cp_exchange else getattr(self.config, 'qsa_dkv_reduction', 'atomic')
+                    ),
+                    # Owner exchange packs arbitrary remote tokens, so its local
+                    # cache no longer preserves the ratio-sized contiguous block
+                    # layout required by segmented dK/dV reduction.
+                    selected_token_group_size=(
+                        None if qsa_cp_exchange else getattr(self.config, 'indexer_compress_ratio', None)
+                    ),
+                )
+        elif self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query,
                 key,
@@ -371,6 +527,13 @@ class Qwen3NextSelfAttention(SelfAttention):
         # Output. [sq, b, h]
         # =================
 
+        # MCore's dot-product attention returns a flattened [sq, b, h] tensor,
+        # while the selected-KV contract deliberately returns
+        # [sq, b, heads, head_dim].  Flatten both branches at this boundary so
+        # the TP-sharded output projection sees the same local feature width.
+        if core_attn_out.ndim == 4:
+            core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1)
+        gate = gate.reshape(gate.shape[0], gate.shape[1], -1)
         core_attn_out = core_attn_out * torch.sigmoid(gate.reshape_as(core_attn_out))
         nvtx_range_push(suffix='linear_proj')
         output, bias = self.linear_proj(core_attn_out)

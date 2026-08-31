@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
+import os
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -13,13 +14,15 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
+from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from transformers.utils import is_torch_npu_available
 from typing import List, Optional
 
-from mcore_bridge.utils import get_local_layer_specs, get_logger
+from mcore_bridge.utils import get_local_layer_specs, get_logger, split_cp_inputs
 
 from ..modules import (GatedDeltaNet, QSAIndexer, Qwen4ExpTextGatedResidual, Qwen4ExpTextPLELayer, TransformerBlock,
                        TransformerLayer)
+from ..modules.qsa_attention import QSAKernelUnavailable, resolve_qsa_backend
 from ..register import ModelLoader
 from .qwen3_next import Qwen3NextBridge, Qwen3NextRMSNorm, Qwen3NextSelfAttention
 
@@ -67,6 +70,7 @@ class Qwen4ExpLayer(TransformerLayer):
         packed_seq_params = kwargs.get('packed_seq_params')
         attn_kwargs = dict(
             attention_mask=attention_mask,
+            padding_mask=kwargs.get('padding_mask'),
             inference_context=kwargs.get('inference_context'),
             rotary_pos_emb=kwargs.get('rotary_pos_emb'),
             rotary_pos_cos=kwargs.get('rotary_pos_cos'),
@@ -82,9 +86,30 @@ class Qwen4ExpLayer(TransformerLayer):
 
         # attention sub-block (mirrors transformers Qwen4ExpTextDecoderLayer.forward)
         hidden_states, hyper_input, injection_weights = self.attn_hyper_connection(hidden_states)
-        qsa_mask = self._qsa_select_mask(hidden_states, attn_kwargs)
+        qsa_selection = self._qsa_select_topk(hidden_states, attn_kwargs)
+        qsa_mask = None
+        if qsa_selection is not None:
+            (topk_indices, topk_length, qsa_backend, qsa_query_positions, qsa_global_kv, qsa_cp_exchange,
+             qsa_global_seq_len) = qsa_selection
+            # The selected-KV backend owns causal validity.  Dropping the
+            # caller's dense causal mask here is intentional: retaining it
+            # would make the supported path pay the S-by-S allocation that the
+            # kernel is designed to remove.
+            attn_kwargs = dict(
+                attn_kwargs,
+                attention_mask=None,
+                qsa_topk_indices=topk_indices,
+                qsa_topk_length=topk_length,
+                qsa_kernel_backend=qsa_backend,
+                qsa_query_positions=qsa_query_positions,
+                qsa_global_kv=qsa_global_kv,
+                qsa_cp_exchange=qsa_cp_exchange,
+                qsa_global_seq_len=qsa_global_seq_len,
+            )
+        elif getattr(self.config, 'qsa_kernel_backend', 'none') == 'none':
+            qsa_mask = self._qsa_select_mask(hidden_states, attn_kwargs)
         if qsa_mask is not None:
-            # failed to full atention
+            # Legacy dense/reference compatibility path.
             attn_kwargs = dict(attn_kwargs, attention_mask=qsa_mask)
         with self._patch_apply_rotary_pos_emb(), self._qsa_arbitrary_mask(qsa_mask is not None):
             hidden_states, _ = self.self_attention(hidden_states=hidden_states, **attn_kwargs)
@@ -131,11 +156,394 @@ class Qwen4ExpLayer(TransformerLayer):
         # the user still sees it exactly once per distinct reason.
         get_logger().warning_once(f'QSA sparse selection disabled: {reason}')
 
+    @staticmethod
+    def _qsa_resolve_right_padding_mask(attn_kwargs, batch: int, sequence_length: int):
+        """Return a ``[B,S]`` mask for right-tail physical padding.
+
+        The SFT loss mask is deliberately not consulted here: ignored labels
+        are still valid context tokens.  Megatron normally exposes a row
+        padding mask derived from the 4-D attention mask; the direct
+        ``attention_mask`` reduction is retained for older bridge versions.
+        """
+
+        padding_mask = attn_kwargs.get('padding_mask')
+        if padding_mask is None:
+            attention_mask = attn_kwargs.get('attention_mask')
+            if isinstance(attention_mask, dict):
+                attention_mask = attention_mask.get('full_attention')
+            if attention_mask is not None and attention_mask.ndim >= 3:
+                # [B, 1, Sq, Sk] (and compatible broadcast forms): a
+                # right-padding position is a key column masked for every
+                # query row. This matches Megatron's existing ``seq_lens`` /
+                # padding-mask convention for a causal matrix.
+                reduce_dims = tuple(range(1, attention_mask.ndim - 1))
+                padding_mask = attention_mask.to(torch.bool).all(dim=reduce_dims)
+        if padding_mask is None:
+            return None
+        padding_mask = padding_mask.to(dtype=torch.bool)
+        if padding_mask.ndim != 2 or padding_mask.shape != (batch, sequence_length):
+            raise ValueError(
+                'QSA right-padding mask must have shape '
+                f'[{batch},{sequence_length}], got {tuple(padding_mask.shape)}')
+        return padding_mask
+
+    @staticmethod
+    def _qsa_resolve_packed_padding_mask(packed_seq_params, total_tokens: int, device):
+        """Build a packed ``[T]`` mask from physical and logical boundaries.
+
+        ``cu_seqlens_q`` describes the physical THD row, including any
+        collator alignment tail. ``seq_lens`` is the per-document logical
+        length captured before that padding. Keeping both lets QSA distinguish
+        an aligned document tail from the next real document, and also masks
+        the final ``S_pad - S_pack`` row tail without consulting labels.
+        """
+
+        logical_lengths = getattr(packed_seq_params, 'seq_lens', None)
+        cu_seqlens = getattr(packed_seq_params, 'cu_seqlens_q', None)
+        if logical_lengths is None or cu_seqlens is None:
+            return None
+        logical_lengths = torch.as_tensor(
+            logical_lengths, device=device, dtype=torch.long).reshape(-1)
+        cu_seqlens = torch.as_tensor(
+            cu_seqlens, device=device, dtype=torch.long).reshape(-1)
+        num_documents = min(logical_lengths.numel(), max(cu_seqlens.numel() - 1, 0))
+        if num_documents <= 0:
+            return None
+        logical_lengths = logical_lengths[:num_documents]
+        starts = cu_seqlens[:num_documents]
+        ends = cu_seqlens[1:num_documents + 1]
+        rows = torch.arange(total_tokens, device=device, dtype=torch.long)
+        # bucketize(..., right=True) assigns a row at a document boundary to
+        # the document beginning there (the boundary is the previous end).
+        document_ids = torch.bucketize(rows, ends, right=True)
+        in_documents = document_ids < num_documents
+        safe_documents = document_ids.clamp_max(num_documents - 1)
+        local_rows = rows - starts.index_select(0, safe_documents)
+        valid = (
+            in_documents
+            & (rows < ends[-1])
+            & (local_rows < logical_lengths.index_select(0, safe_documents))
+        )
+        return ~valid
+
+    def _qsa_selection_fallback(self, reason: str, sequence_length: int) -> None:
+        """Make unsupported selected-KV configurations explicit.
+
+        Dense arbitrary attention remains useful for short parity checks.  For
+        a long sequence, silently constructing its mask is exactly the failure
+        mode this backend is intended to remove, so fail with the requested
+        reason instead of turning a production run into an OOM.
+        """
+
+        if getattr(self.config, 'require_qsa_kernel', False):
+            raise QSAKernelUnavailable(
+                f'require_qsa_kernel=true but QSA selected-KV is unsupported: {reason}')
+        max_dense = getattr(self.config, 'qsa_dense_fallback_max_seq_len', 4096)
+        if sequence_length > max_dense:
+            raise QSAKernelUnavailable(
+                f'QSA selected-KV unavailable for sequence_length={sequence_length}: {reason}. '
+                f'Dense compatibility fallback is limited to sequence_length<={max_dense}; '
+                'set qsa_kernel_backend=torch or install the SM90 Triton backend.')
+        self._warn_qsa_fallback_once(
+            f'{reason}; using dense causal attention because sequence_length={sequence_length}<={max_dense}')
+
+    def _qsa_select_topk(self, hidden_states, attn_kwargs):
+        """Return selected-KV metadata or ``None`` for the legacy path."""
+
+        indexer = getattr(self.self_attention, 'indexer', None)
+        if indexer is None:
+            return None
+        requested = (getattr(self.config, 'qsa_kernel_backend', 'none') or 'none').lower()
+        sequence_length = hidden_states.shape[0]
+        if requested == 'none':
+            return None
+        if getattr(self.config, 'csa_dense_mode', False):
+            if getattr(self.config, 'require_qsa_kernel', False):
+                raise QSAKernelUnavailable('require_qsa_kernel=true conflicts with csa_dense_mode=true')
+            self._warn_qsa_fallback_once('csa_dense_mode=true')
+            return None
+        packed_seq_params = attn_kwargs.get('packed_seq_params')
+        if packed_seq_params is not None and str(getattr(packed_seq_params, 'qkv_format', '')).lower() != 'thd':
+            self._qsa_selection_fallback(
+                'only qkv_format=thd packed input is supported by QSA selected-KV', sequence_length)
+            return None
+        if packed_seq_params is not None and getattr(packed_seq_params, 'pad_between_seqs', False):
+            self._qsa_selection_fallback(
+                'pad_between_seqs=true is not supported by the segment-local QSA packing path', sequence_length)
+            return None
+        if attn_kwargs.get('inference_context') is not None:
+            self._qsa_selection_fallback('KV-cache/decode selected-KV is not implemented in phase 1', sequence_length)
+            return None
+        if attn_kwargs.get('attention_bias') is not None:
+            self._qsa_selection_fallback('attention_bias is not supported by the selected-KV contract', sequence_length)
+            return None
+        rotary_pos_emb = attn_kwargs.get('rotary_pos_emb')
+        if rotary_pos_emb is None:
+            self._qsa_selection_fallback('rotary_pos_emb is required by the QSA indexer', sequence_length)
+            return None
+        tp_size = getattr(self.config, 'tensor_model_parallel_size', 1)
+        sequence_parallel = bool(getattr(self.config, 'sequence_parallel', False))
+        cp_size = getattr(self.config, 'context_parallel_size', 1)
+        if tp_size > 1 and sequence_parallel and cp_size > 1:
+            self._qsa_selection_fallback(
+                'TP+SP+CP selected-KV is not supported yet; the TP+SP phase-1 '
+                'path requires context_parallel_size=1', sequence_length)
+            return None
+        if hasattr(self.config, 'hidden_size') and hidden_states.shape[-1] != self.config.hidden_size:
+            self._qsa_selection_fallback(
+                f'QSA indexer needs full hidden width for replicated projection, got {hidden_states.shape[-1]} '
+                f'vs config.hidden_size={self.config.hidden_size}', sequence_length)
+            return None
+
+        indexer_hidden_states = hidden_states
+        indexer_rotary_pos_emb = rotary_pos_emb
+        selection_attn_kwargs = attn_kwargs
+        if tp_size > 1 and sequence_parallel:
+            # Phase-1 TP+SP correctness path: the QSA indexer is replicated,
+            # so it must see the global sequence and global query positions.
+            # The gathered tensor is under no_grad (route IDs are frozen) and
+            # is released after selection. QSA attention performs the
+            # matching full-sequence gather before local-head QKV execution;
+            # the output projection reduce-scatters back to SP.
+            local_sequence = hidden_states.shape[0]
+
+            # MCore may pass a full-length causal mask/rope table even when
+            # the activation is already sequence-sharded (the multimodal
+            # embedding adapter has both modes). Prefer an explicit global
+            # hint and otherwise retain the activation length. The current
+            # multimodal bridge keeps the decoder activation full-length at
+            # this boundary even with SP enabled; using local*TP here would
+            # turn S into TP*S. A future truly sequence-sharded QSA input must
+            # pass an explicit global route/mask length.
+            explicit_length_hints = []
+            attention_mask_hint = attn_kwargs.get('attention_mask')
+            if isinstance(attention_mask_hint, dict):
+                attention_mask_hint = attention_mask_hint.get('full_attention')
+            if (torch.is_tensor(attention_mask_hint)
+                    and attention_mask_hint.ndim >= 2):
+                explicit_length_hints.append(int(attention_mask_hint.shape[-1]))
+
+            def rope_length(rope):
+                if isinstance(rope, tuple):
+                    rope = next((item for item in rope if item is not None), None)
+                return int(rope.shape[0]) if torch.is_tensor(rope) and rope.ndim else 0
+
+            rope_hint = rope_length(rotary_pos_emb)
+            if rope_hint:
+                explicit_length_hints.append(rope_hint)
+            # The multimodal bridge can pass a full-length decoder activation
+            # even when sequence_parallel=true. Prefer explicit mask/rope
+            # lengths in that case and otherwise retain the activation length;
+            # this avoids an accidental TP*S double gather.
+            # RoPE carries the actual position table consumed by QSA and is
+            # authoritative when an SP implementation exposes an internal
+            # attention-mask extent larger than the decoder sequence.
+            target_sequence = (
+                rope_hint if rope_hint else
+                max(explicit_length_hints or [local_sequence]))
+            target_sequence = max(target_sequence, local_sequence)
+            if local_sequence != target_sequence:
+                if local_sequence * tp_size != target_sequence:
+                    raise ValueError(
+                        'QSA TP+SP cannot infer a consistent global sequence: '
+                        f'local={local_sequence}, target={target_sequence}, tp={tp_size}')
+                indexer_hidden_states = gather_from_sequence_parallel_region(
+                    hidden_states,
+                    tensor_parallel_output_grad=False,
+                    group=self.pg_collection.tp,
+                )
+            sequence_length = indexer_hidden_states.shape[0]
+
+            def gather_rope(rope):
+                if rope is None or rope.shape[0] == target_sequence:
+                    return rope
+                if rope.shape[0] * tp_size != target_sequence:
+                    raise ValueError(
+                        'QSA TP+SP rope length does not match global sequence: '
+                        f'rope={rope.shape[0]}, target={target_sequence}, tp={tp_size}')
+                return gather_from_sequence_parallel_region(
+                    rope,
+                    tensor_parallel_output_grad=False,
+                    group=self.pg_collection.tp,
+                )
+
+            if isinstance(rotary_pos_emb, tuple):
+                indexer_rotary_pos_emb = tuple(gather_rope(rope) for rope in rotary_pos_emb)
+            else:
+                indexer_rotary_pos_emb = gather_rope(rotary_pos_emb)
+            # Carry the exact sequence-gather result into attention. The
+            # process-group used by a TE QKV module may represent a wider
+            # expert/TP composite than the sequence shard group, so repeating
+            # an implicit gather inside attention can produce TP*S.
+            attn_kwargs['qsa_tp_sp_hidden_states'] = indexer_hidden_states
+            attn_kwargs['qsa_tp_sp_rotary_pos_emb'] = indexer_rotary_pos_emb
+            local_padding_mask = attn_kwargs.get('padding_mask')
+            if (local_padding_mask is not None
+                    and local_padding_mask.ndim == 2
+                    and local_padding_mask.shape[-1] != sequence_length):
+                gathered_padding = gather_from_sequence_parallel_region(
+                    local_padding_mask.transpose(0, 1).contiguous(),
+                    tensor_parallel_output_grad=False,
+                    group=self.pg_collection.tp,
+                ).transpose(0, 1).contiguous()
+                selection_attn_kwargs = dict(
+                    attn_kwargs, padding_mask=gathered_padding)
+
+        qsa_global_kv = False
+        qsa_cp_exchange = False
+        qsa_query_positions = None
+        global_sequence_length = sequence_length
+        cp_mode = getattr(self.config, 'qsa_cp_mode', 'disabled')
+        if cp_size > 1:
+            if packed_seq_params is not None:
+                self._qsa_selection_fallback(
+                    'packed/THD plus context parallelism is not supported in the first packing path',
+                    sequence_length)
+                return None
+            if cp_mode not in {'all_gather_reference', 'selected_exchange'}:
+                self._qsa_selection_fallback(
+                    f'context_parallel_size={cp_size} requires qsa_cp_mode=all_gather_reference or '
+                    'selected_exchange (SBHD/unpacked only)', sequence_length)
+                return None
+            if getattr(self.config, 'sequence_parallel', False):
+                self._qsa_selection_fallback(
+                    'QSA CP reference currently requires sequence_parallel=false so CP shard positions are '
+                    'unambiguous', sequence_length)
+                return None
+        resolved = resolve_qsa_backend(
+            requested,
+            hidden_states.device,
+            require=getattr(self.config, 'require_qsa_kernel', False))
+
+        if cp_size > 1:
+            # The CP indexer gathers only pooled indexer block keys.  Query
+            # projection stays local, so this stage does not all-gather the
+            # full hidden state or full raw-token key tensor.
+            global_sequence_length = sequence_length * cp_size
+            global_positions = torch.arange(
+                global_sequence_length, device=hidden_states.device, dtype=torch.int32).view(-1, 1)
+            qsa_query_positions = split_cp_inputs(
+                global_positions,
+                None,
+                dim=0,
+                cp_partition_mode=getattr(self.config, 'cp_partition_mode', 'zigzag')).flatten()
+            if qsa_query_positions.shape[0] != sequence_length:
+                raise ValueError(
+                    f'QSA CP local position count mismatch: positions={qsa_query_positions.shape[0]}, '
+                    f'hidden_states={sequence_length}')
+            qsa_global_kv = cp_mode == 'all_gather_reference'
+            qsa_cp_exchange = cp_mode == 'selected_exchange'
+
+        if packed_seq_params is not None:
+            padding_mask = self._qsa_resolve_packed_padding_mask(
+                packed_seq_params, sequence_length, indexer_hidden_states.device)
+        else:
+            padding_mask = self._qsa_resolve_right_padding_mask(
+                selection_attn_kwargs, indexer_hidden_states.shape[1], sequence_length)
+        if padding_mask is not None and packed_seq_params is None:
+            # This backend supports the recommended right-tail padding
+            # contract. Interior/left padding changes logical positions and
+            # must go through an explicit packed/position-aware adapter.
+            valid_rows = ~padding_mask
+            has_interior_padding = bool(
+                (padding_mask[:, :-1] & valid_rows[:, 1:]).any().item())
+            if has_interior_padding:
+                self._qsa_selection_fallback(
+                    'only contiguous right-tail padding is supported by the '
+                    'unpacked QSA indexer', sequence_length)
+                return None
+
+        def run_indexer(backend):
+            if packed_seq_params is not None:
+                return indexer.select_topk_packed(
+                    indexer_hidden_states,
+                    indexer_rotary_pos_emb,
+                    packed_seq_params.cu_seqlens_q,
+                    backend=backend,
+                    query_tile_size=getattr(self.config, 'qsa_indexer_query_tile_size', 128),
+                    key_tile_size=getattr(self.config, 'qsa_indexer_key_tile_size', 512),
+                )
+            if cp_size > 1:
+                return indexer.select_topk_cp(
+                    indexer_hidden_states,
+                    indexer_rotary_pos_emb,
+                    qsa_query_positions,
+                    self.pg_collection.cp,
+                    partition_mode=getattr(self.config, 'cp_partition_mode', 'zigzag'),
+                    backend=backend,
+                    query_tile_size=getattr(self.config, 'qsa_indexer_query_tile_size', 128),
+                    key_tile_size=getattr(self.config, 'qsa_indexer_key_tile_size', 512),
+                )
+            return indexer.select_topk(
+                indexer_hidden_states,
+                indexer_rotary_pos_emb,
+                backend=backend,
+                query_tile_size=getattr(self.config, 'qsa_indexer_query_tile_size', 128),
+                key_tile_size=getattr(self.config, 'qsa_indexer_key_tile_size', 512),
+            )
+
+        try:
+            topk_indices, topk_length = run_indexer(resolved.actual)
+        except RuntimeError as exc:
+            # A Triton compile/runtime failure is recoverable only when strict
+            # mode is off.  Do not retry OOM: allocating a second backend's
+            # workspace after an OOM is not safe.
+            if resolved.actual != 'triton' or 'out of memory' in str(exc).lower() or getattr(
+                    self.config, 'require_qsa_kernel', False):
+                raise
+            self._warn_qsa_fallback_once(f'Triton indexer failure ({type(exc).__name__}: {exc}); using torch tiles')
+            resolved = resolved.__class__(resolved.requested, 'torch', str(exc))
+            topk_indices, topk_length = run_indexer('torch')
+
+        if tp_size > 1 and sequence_parallel:
+            qsa_query_positions = torch.arange(
+                sequence_length, device=indexer_hidden_states.device, dtype=torch.int32)
+
+        if padding_mask is not None:
+            # Keep route metadata self-describing for padded query rows. The
+            # in-place fill avoids a second [B,S,K] route allocation at 256K;
+            # labels/loss_scale are intentionally not part of this decision.
+            topk_indices.masked_fill_(padding_mask.unsqueeze(-1), -1)
+            topk_length.masked_fill_(padding_mask, 0)
+
+        capability = 'cpu'
+        if hidden_states.is_cuda:
+            capability = '.'.join(str(x) for x in torch.cuda.get_device_capability(hidden_states.device))
+        effective_min = int(topk_length.min().item()) if topk_length.numel() else 0
+        effective_max = int(topk_length.max().item()) if topk_length.numel() else 0
+        get_logger().info_once(
+            'QSA selected-KV: '
+            f'requested_backend={resolved.requested} actual_backend={resolved.actual} '
+            f'indexer_backend={resolved.actual} attention_backend={resolved.actual} '
+            f'topk_shape={tuple(topk_indices.shape)} topk_length=[{effective_min},{effective_max}] '
+            f'shape={tuple(hidden_states.shape)} dtype={hidden_states.dtype} capability={capability} '
+            f'tp_size={tp_size} cp_mode={cp_mode} '
+            f'dkv_reduction={getattr(self.config, "qsa_dkv_reduction", "atomic")}',
+            hash_id=f'qsa-backend-{id(self)}-{tuple(hidden_states.shape)}-{resolved.actual}')
+        if resolved.fallback_reason:
+            self._warn_qsa_fallback_once(
+                f'requested_backend={resolved.requested}, actual_backend={resolved.actual}: '
+                f'{resolved.fallback_reason}')
+        return (topk_indices, topk_length, resolved.actual, qsa_query_positions, qsa_global_kv, qsa_cp_exchange,
+                global_sequence_length)
+
     def _qsa_select_mask(self, hidden_states, attn_kwargs):
         # return None means full attention
         # TODO: support padding_free & cp
         indexer = getattr(self.self_attention, 'indexer', None)
         if indexer is None:
+            return None
+        if attn_kwargs.get('packed_seq_params') is not None:
+            self._warn_qsa_fallback_once(
+                'legacy dense QSA mask is disabled for packed input; using the model THD attention path')
+            return None
+        # Qwen4Exp reuses the generic CSA dense-mode switch for topology
+        # experiments.  In CP=1 long-context training, materializing the
+        # Python/Triton bridge's O(S^2) QSA mask is both expensive and
+        # incompatible with TE fused attention.  Dense mode keeps the causal
+        # attention path explicit and lets TE select the Hopper fused kernel.
+        if getattr(self.config, 'csa_dense_mode', False):
+            self._warn_qsa_fallback_once('csa_dense_mode=true')
             return None
         if attn_kwargs.get('packed_seq_params') is not None:
             self._warn_qsa_fallback_once(
@@ -347,10 +755,27 @@ class Qwen4ExpBridge(Qwen3NextBridge):
             self._converting_ple = False
 
     def _set_layer_state(self, mg_layer, hf_state_dict, hf_prefix: str, layer_idx: int, to_mcore: bool):
-        hf_prefix = f'{hf_prefix}{layer_idx}.'
+        # A one-layer QSA smoke keeps the target architecture at layer zero
+        # but can opt into loading a full-attention source layer from the
+        # alternating production checkpoint.  The default offset is zero, so
+        # full-model conversion and checkpoint export retain their old paths.
+        source_layer_idx = layer_idx
         if to_mcore:
-            hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
+            raw_offset = os.getenv('MCORE_BRIDGE_QWEN4_EXP_SOURCE_LAYER_OFFSET', '0')
+            try:
+                source_layer_idx += int(raw_offset)
+            except ValueError as exc:
+                raise ValueError(
+                    'MCORE_BRIDGE_QWEN4_EXP_SOURCE_LAYER_OFFSET must be an integer, '
+                    f'got {raw_offset!r}') from exc
+            if source_layer_idx < 0:
+                raise ValueError(
+                    'MCORE_BRIDGE_QWEN4_EXP_SOURCE_LAYER_OFFSET maps to a negative source layer: '
+                    f'target={layer_idx}, offset={raw_offset!r}')
+            source_prefix = f'{hf_prefix}{source_layer_idx}.'
+            hf_state_dict = self._remove_prefix(hf_state_dict, source_prefix)
         else:
+            source_prefix = f'{hf_prefix}{layer_idx}.'
             hf_state_dict = {}
         hf_state_dict.update(self._set_layer_attn(mg_layer, hf_state_dict, layer_idx, to_mcore))
         hf_state_dict.update(self._set_layer_mlp(mg_layer, hf_state_dict, layer_idx, to_mcore))
@@ -360,7 +785,7 @@ class Qwen4ExpBridge(Qwen3NextBridge):
         if to_mcore:
             hf_state_dict = {}
         else:
-            hf_state_dict = self._add_prefix(hf_state_dict, hf_prefix)
+            hf_state_dict = self._add_prefix(hf_state_dict, source_prefix)
         return hf_state_dict
 
     def _set_final_layernorm(self, lm_model, hf_state_dict, to_mcore):

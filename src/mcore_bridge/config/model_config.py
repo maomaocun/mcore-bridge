@@ -215,6 +215,17 @@ class ModelConfig(TransformerConfig):
     indexer_budget: Optional[int] = None
     indexer_compress_ratio: Optional[int] = None
     output_gate_type: Optional[str] = None
+    # QSA selected-KV execution. ``none`` preserves the legacy dense-mask
+    # reference path; ``triton`` is the SM90 online-softmax implementation.
+    qsa_kernel_backend: Literal['none', 'torch', 'triton', 'cudnn'] = 'none'
+    require_qsa_kernel: bool = False
+    qsa_dkv_accum_dtype: Literal['bf16', 'fp32'] = 'bf16'
+    qsa_dkv_reduction: Literal['atomic', 'segmented'] = 'atomic'
+    qsa_indexer_query_tile_size: int = 128
+    qsa_indexer_key_tile_size: int = 512
+    qsa_attention_query_tile_size: int = 16
+    qsa_dense_fallback_max_seq_len: int = 4096
+    qsa_cp_mode: Literal['disabled', 'all_gather_reference', 'selected_exchange'] = 'disabled'
 
     # nemotron_h (hybrid mamba2 + attention + moe)
     hybrid_layer_pattern: Optional[str] = None
@@ -311,6 +322,33 @@ class ModelConfig(TransformerConfig):
         from mcore_bridge.model import get_mcore_model_type, get_model_meta
         self._augment_mindspeed_defaults()
         self._format_config()
+        if (int(getattr(self, 'tensor_model_parallel_size', 1) or 1) > 1
+                and not getattr(self, 'sequence_parallel', False)):
+            raise ValueError(
+                'tensor_model_parallel_size>1 requires sequence_parallel=true; '
+                'enable sequence parallelism before constructing ModelConfig.')
+        if self.qsa_kernel_backend not in {'none', 'torch', 'triton', 'cudnn'}:
+            raise ValueError(
+                f'Unsupported qsa_kernel_backend={self.qsa_kernel_backend!r}; '
+                "choose 'none', 'torch', 'triton', or 'cudnn'.")
+        if self.qsa_dkv_accum_dtype not in {'bf16', 'fp32'}:
+            raise ValueError(
+                f'Unsupported qsa_dkv_accum_dtype={self.qsa_dkv_accum_dtype!r}; choose \'bf16\' or \'fp32\'.')
+        if self.qsa_dkv_reduction not in {'atomic', 'segmented'}:
+            raise ValueError(
+                f'Unsupported qsa_dkv_reduction={self.qsa_dkv_reduction!r}; '
+                "choose 'atomic' or 'segmented'.")
+        if self.qsa_cp_mode not in {'disabled', 'all_gather_reference', 'selected_exchange'}:
+            raise ValueError(
+                f'Unsupported qsa_cp_mode={self.qsa_cp_mode!r}; '
+                "choose 'disabled', 'all_gather_reference', or 'selected_exchange'.")
+        for name in ('qsa_indexer_query_tile_size', 'qsa_indexer_key_tile_size', 'qsa_attention_query_tile_size',
+                     'qsa_dense_fallback_max_seq_len'):
+            if getattr(self, name) <= 0:
+                raise ValueError(f'{name} must be positive, got {getattr(self, name)}')
+        if self.indexer_budget is not None and self.indexer_compress_ratio is not None:
+            if self.indexer_budget % self.indexer_compress_ratio:
+                raise ValueError('indexer_budget must be divisible by indexer_compress_ratio for QSA selected-KV')
         if self.experimental_attention_variant is not None:
             require_version('megatron-core>=0.16.0.dev',
                             'experimental attention variant requires megatron-core>=0.16.0')
