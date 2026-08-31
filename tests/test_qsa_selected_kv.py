@@ -15,9 +15,10 @@ import torch
 from mcore_bridge.model.modules.qsa_attention import (qsa_expand_block_route, qsa_sparse_forward,
                                                       qsa_sparse_forward_packed, qsa_sparse_forward_reference,
                                                       resolve_qsa_backend)
-from mcore_bridge.model.modules.qsa_cp_exchange import _build_owner_plan
+from mcore_bridge.model.modules.qsa_cp_exchange import _build_owner_plan, qsa_exchange_selected_kv
 from mcore_bridge.model.modules.qsa_indexer import QSAIndexer
 from mcore_bridge.model.modules.qsa_triton import (
+    qsa_expand_compact_route_triton,
     qsa_indexer_fused_topk_packed,
     qsa_indexer_fused_topk_with_ratio,
 )
@@ -558,6 +559,101 @@ def test_cp_owner_plan_remaps_zigzag_selected_tokens_once():
     assert plan.request_mask.tolist() == [[0, 0, 0, 0], [1, 0, 0, 0]]
 
 
+def test_cp_owner_plan_consumes_compact_blocks_without_global_token_route():
+    group = _FakeCPGroup(size=2, rank=0)
+    block_size = 2
+    query_positions = torch.tensor([2, 13], dtype=torch.int32)
+    blocks = torch.tensor(
+        [[[0, -1, -1], [0, 3, 5]]], dtype=torch.int32)
+    lengths = torch.tensor([[3, 6]], dtype=torch.int32)
+
+    compact_plan, compact_mapped = _build_owner_plan(
+        blocks,
+        lengths,
+        16,
+        group,
+        'zigzag',
+        route_block_size=block_size,
+        query_positions=query_positions,
+    )
+    expanded = qsa_expand_block_route(
+        blocks, lengths, query_positions, block_size)
+    token_plan, token_mapped = _build_owner_plan(
+        expanded, lengths, 16, group, 'zigzag')
+
+    assert torch.equal(compact_mapped, token_mapped)
+    assert compact_mapped.tolist() == [
+        [[0, 1, 2, -1, -1, -1, -1],
+         [0, 1, 8, 9, 10, 11, -1]]
+    ]
+    assert compact_plan.send_splits == token_plan.send_splits == [0, 4]
+    assert torch.equal(compact_plan.request_mask, token_plan.request_mask)
+    assert compact_plan.request_mask.tolist() == [
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 1, 1, 0, 0, 1, 1],
+    ]
+
+
+def test_cp1_owner_exchange_preserves_token_output_contract_for_compact_input():
+    group = _FakeCPGroup(size=1, rank=0)
+    key = torch.randn(8, 1, 2, 4)
+    value = torch.randn_like(key)
+    positions = torch.tensor([2, 7], dtype=torch.int32)
+    blocks = torch.tensor(
+        [[[0, -1], [0, 2]]], dtype=torch.int32)
+    lengths = torch.tensor([[3, 5]], dtype=torch.int32)
+
+    actual_key, actual_value, actual_route = qsa_exchange_selected_kv(
+        key,
+        value,
+        blocks,
+        lengths,
+        8,
+        group,
+        route_block_size=2,
+        query_positions=positions,
+    )
+    expected_route = qsa_expand_block_route(
+        blocks, lengths, positions, block_size=2)
+
+    assert actual_key is key
+    assert actual_value is value
+    assert torch.equal(actual_route, expected_route)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_triton_cp_owner_plan_matches_cpu_compact_zigzag():
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('requires H100/SM90')
+    group = _FakeCPGroup(size=2, rank=0)
+    query_positions = torch.tensor([2, 13], dtype=torch.int32)
+    blocks = torch.tensor(
+        [[[0, -1, -1], [0, 3, 5]]], dtype=torch.int32)
+    lengths = torch.tensor([[3, 6]], dtype=torch.int32)
+    expected_plan, expected_mapped = _build_owner_plan(
+        blocks,
+        lengths,
+        16,
+        group,
+        'zigzag',
+        route_block_size=2,
+        query_positions=query_positions,
+    )
+    actual_plan, actual_mapped = _build_owner_plan(
+        blocks.cuda(),
+        lengths.cuda(),
+        16,
+        group,
+        'zigzag',
+        route_block_size=2,
+        query_positions=query_positions.cuda(),
+    )
+    assert torch.equal(actual_mapped.cpu(), expected_mapped)
+    assert torch.equal(
+        actual_plan.request_mask.cpu(), expected_plan.request_mask)
+    assert actual_plan.send_splits == expected_plan.send_splits
+
+
 def test_backend_resolution_never_hides_strict_triton_fallback():
     resolved = resolve_qsa_backend('triton', torch.device('cpu'))
     assert resolved.actual == 'torch'
@@ -641,6 +737,33 @@ def test_compact_block_route_expands_to_public_token_contract():
     )
     assert torch.equal(actual[0], expected[0])
     assert torch.equal(actual[1], expected[1])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_triton_compact_route_expansion_matches_torch_with_padding():
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('requires H100/SM90')
+    device = 'cuda'
+    block_size = 4
+    positions = torch.arange(7, device=device, dtype=torch.int32)
+    lengths = torch.tensor(
+        [[1, 2, 3, 4, 5, 6, 7], [1, 2, 3, 4, 5, 6, 0]],
+        device=device,
+        dtype=torch.int32,
+    )
+    blocks = torch.tensor(
+        [[[2, -1, -1], [1, -1, -1], [0, -1, -1],
+          [2, -1, -1], [1, -1, -1], [0, -1, -1], [2, -1, -1]],
+         [[1, -1, -1], [2, -1, -1], [0, -1, -1],
+          [1, -1, -1], [2, -1, -1], [0, -1, -1], [-1, -1, -1]]],
+        device=device,
+        dtype=torch.int32,
+    )
+    expected = qsa_expand_block_route(
+        blocks, lengths, positions, block_size)
+    actual = qsa_expand_compact_route_triton(
+        blocks, lengths, positions, block_size)
+    assert torch.equal(actual, expected)
 
 
 def test_compact_block_route_rejects_effective_segmented_override(monkeypatch):

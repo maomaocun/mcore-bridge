@@ -448,7 +448,13 @@ class Qwen3NextSelfAttention(SelfAttention):
                         qsa_global_seq_len or query.shape[0],
                         self.pg_collection.cp,
                         getattr(self.config, 'cp_partition_mode', 'zigzag'),
+                        route_block_size=qsa_route_block_size,
+                        query_positions=qsa_query_positions,
                     )
+                    # Owner caches contain arbitrary unique remote tokens, so
+                    # exchange always returns its final cache-local token ABI
+                    # even when the indexer input was compact blocks.
+                    qsa_route_block_size = 1
                 core_attn_out, _ = qsa_sparse_forward(
                     query,
                     key,

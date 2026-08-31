@@ -462,7 +462,6 @@ class Qwen4ExpLayer(TransformerLayer):
             bool(getattr(self.config, 'qsa_compact_block_route', True))
             and resolved.actual == 'triton'
             and effective_dkv_reduction == 'atomic'
-            and not qsa_cp_exchange
             and indexer.compress_ratio > 1
         )
         qsa_route_block_size = (

@@ -465,6 +465,334 @@ if TRITON_AVAILABLE:
         )
 
     @triton.jit
+    def _qsa_expand_compact_route_kernel(
+        block_ptr,
+        length_ptr,
+        out_ptr,
+        query_position_ptr,
+        seq_len,
+        stride_bb,
+        stride_bs,
+        stride_lb,
+        stride_ls,
+        stride_ob,
+        stride_os,
+        ROUTE_SLOTS: tl.constexpr,
+        BLOCK_ROUTE: tl.constexpr,
+        BLOCK_TAIL: tl.constexpr,
+        RATIO: tl.constexpr,
+    ):
+        """Expand compact block IDs into one final-width token buffer."""
+
+        row = tl.program_id(0)
+        batch = row // seq_len
+        query = row - batch * seq_len
+        length = tl.load(
+            length_ptr + batch * stride_lb + query * stride_ls
+        ).to(tl.int32)
+        max_length = ROUTE_SLOTS * RATIO + RATIO - 1
+        length = tl.maximum(0, tl.minimum(length, max_length))
+        selected_blocks = tl.minimum(length // RATIO, ROUTE_SLOTS)
+        tail_count = length - selected_blocks * RATIO
+
+        block_offsets = tl.arange(0, BLOCK_ROUTE)
+        block_mask = block_offsets < ROUTE_SLOTS
+        block_ids = tl.load(
+            block_ptr
+            + batch * stride_bb
+            + query * stride_bs
+            + block_offsets,
+            mask=block_mask,
+            other=-1,
+        ).to(tl.int32)
+        valid_blocks = (
+            block_mask
+            & (block_offsets < selected_blocks)
+            & (block_ids >= 0)
+        )
+        out_base = out_ptr + batch * stride_ob + query * stride_os
+        for lane in tl.static_range(0, RATIO):
+            output_offsets = block_offsets * RATIO + lane
+            tl.store(
+                out_base + output_offsets,
+                tl.where(valid_blocks, block_ids * RATIO + lane, -1),
+                mask=block_mask,
+            )
+
+        tail_offsets = tl.arange(0, BLOCK_TAIL)
+        tail_mask = tail_offsets < RATIO - 1
+        # Initialize the fixed tail suffix before a saturated row potentially
+        # writes its dynamic causal tail to those same positions.
+        tl.store(
+            out_base + ROUTE_SLOTS * RATIO + tail_offsets,
+            -1,
+            mask=tail_mask,
+        )
+        query_position = tl.load(query_position_ptr + query).to(tl.int32)
+        tail_start = ((query_position + 1) // RATIO) * RATIO
+        tail_output = selected_blocks * RATIO + tail_offsets
+        tl.store(
+            out_base + tail_output,
+            tail_start + tail_offsets,
+            mask=tail_mask & (tail_offsets < tail_count),
+        )
+
+    @triton.jit
+    def _qsa_cp_request_mask_kernel(
+        route_ptr,
+        length_ptr,
+        request_mask_ptr,
+        route_numel,
+        global_seq_len,
+        local_key_len,
+        chunk_len,
+        rank,
+        ROUTE_SLOTS: tl.constexpr,
+        CP_SIZE: tl.constexpr,
+        ZIGZAG: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """Mark unique remote token requests without full owner/local tensors."""
+
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        in_bounds = offsets < route_numel
+        row = offsets // ROUTE_SLOTS
+        slot = offsets - row * ROUTE_SLOTS
+        length = tl.load(length_ptr + row, mask=in_bounds, other=0).to(tl.int32)
+        token = tl.load(route_ptr + offsets, mask=in_bounds, other=-1).to(tl.int32)
+        valid = (
+            in_bounds
+            & (slot < length)
+            & (token >= 0)
+            & (token < global_seq_len)
+        )
+        if ZIGZAG:
+            chunk = token // chunk_len
+            within = token - chunk * chunk_len
+            owner = tl.where(chunk < CP_SIZE, chunk, 2 * CP_SIZE - 1 - chunk)
+            local = tl.where(chunk < CP_SIZE, within, chunk_len + within)
+        else:
+            owner = token // local_key_len
+            local = token - owner * local_key_len
+        remote = valid & (owner != rank)
+        safe_owner = tl.maximum(0, tl.minimum(owner, CP_SIZE - 1))
+        safe_local = tl.maximum(0, tl.minimum(local, local_key_len - 1))
+        tl.atomic_xchg(
+            request_mask_ptr + safe_owner * local_key_len + safe_local,
+            1,
+            mask=remote,
+        )
+
+    @triton.jit
+    def _qsa_cp_compact_request_mask_kernel(
+        block_ptr,
+        length_ptr,
+        query_position_ptr,
+        request_mask_ptr,
+        route_numel,
+        seq_len,
+        global_seq_len,
+        local_key_len,
+        chunk_len,
+        rank,
+        ROUTE_SLOTS: tl.constexpr,
+        CP_SIZE: tl.constexpr,
+        RATIO: tl.constexpr,
+        ZIGZAG: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """Mark owner requests directly from compact blocks and causal tails."""
+
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        in_bounds = offsets < route_numel
+        row = offsets // ROUTE_SLOTS
+        slot = offsets - row * ROUTE_SLOTS
+        length = tl.load(length_ptr + row, mask=in_bounds, other=0).to(tl.int32)
+        max_length = ROUTE_SLOTS * RATIO + RATIO - 1
+        length = tl.maximum(0, tl.minimum(length, max_length))
+        selected_blocks = tl.minimum(length // RATIO, ROUTE_SLOTS)
+        tail_count = length - selected_blocks * RATIO
+        block_id = tl.load(block_ptr + offsets, mask=in_bounds, other=-1).to(tl.int32)
+        block_valid = in_bounds & (slot < selected_blocks) & (block_id >= 0)
+
+        for lane in tl.static_range(0, RATIO):
+            token = block_id * RATIO + lane
+            valid = block_valid & (token >= 0) & (token < global_seq_len)
+            if ZIGZAG:
+                chunk = token // chunk_len
+                within = token - chunk * chunk_len
+                owner = tl.where(
+                    chunk < CP_SIZE, chunk, 2 * CP_SIZE - 1 - chunk)
+                local = tl.where(
+                    chunk < CP_SIZE, within, chunk_len + within)
+            else:
+                owner = token // local_key_len
+                local = token - owner * local_key_len
+            remote = valid & (owner != rank)
+            safe_owner = tl.maximum(0, tl.minimum(owner, CP_SIZE - 1))
+            safe_local = tl.maximum(0, tl.minimum(local, local_key_len - 1))
+            tl.atomic_xchg(
+                request_mask_ptr + safe_owner * local_key_len + safe_local,
+                1,
+                mask=remote,
+            )
+
+        # Exactly the slot-zero lane for each row emits its incomplete causal
+        # block, avoiding a separate token-route or tail kernel.
+        query = row - (row // seq_len) * seq_len
+        query_position = tl.load(
+            query_position_ptr + query, mask=in_bounds, other=0).to(tl.int32)
+        tail_start = ((query_position + 1) // RATIO) * RATIO
+        tail_source = in_bounds & (slot == 0)
+        for lane in tl.static_range(0, RATIO - 1):
+            token = tail_start + lane
+            valid = (
+                tail_source
+                & (lane < tail_count)
+                & (token >= 0)
+                & (token < global_seq_len)
+            )
+            if ZIGZAG:
+                chunk = token // chunk_len
+                within = token - chunk * chunk_len
+                owner = tl.where(
+                    chunk < CP_SIZE, chunk, 2 * CP_SIZE - 1 - chunk)
+                local = tl.where(
+                    chunk < CP_SIZE, within, chunk_len + within)
+            else:
+                owner = token // local_key_len
+                local = token - owner * local_key_len
+            remote = valid & (owner != rank)
+            safe_owner = tl.maximum(0, tl.minimum(owner, CP_SIZE - 1))
+            safe_local = tl.maximum(0, tl.minimum(local, local_key_len - 1))
+            tl.atomic_xchg(
+                request_mask_ptr + safe_owner * local_key_len + safe_local,
+                1,
+                mask=remote,
+            )
+
+    @triton.jit
+    def _qsa_cp_remap_route_kernel(
+        route_ptr,
+        length_ptr,
+        cache_offset_ptr,
+        out_ptr,
+        route_numel,
+        global_seq_len,
+        local_key_len,
+        chunk_len,
+        ROUTE_SLOTS: tl.constexpr,
+        CP_SIZE: tl.constexpr,
+        ZIGZAG: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """Map global token IDs to owner-cache offsets in one pass."""
+
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        in_bounds = offsets < route_numel
+        row = offsets // ROUTE_SLOTS
+        slot = offsets - row * ROUTE_SLOTS
+        length = tl.load(length_ptr + row, mask=in_bounds, other=0).to(tl.int32)
+        token = tl.load(route_ptr + offsets, mask=in_bounds, other=-1).to(tl.int32)
+        valid = (
+            in_bounds
+            & (slot < length)
+            & (token >= 0)
+            & (token < global_seq_len)
+        )
+        if ZIGZAG:
+            chunk = token // chunk_len
+            within = token - chunk * chunk_len
+            owner = tl.where(chunk < CP_SIZE, chunk, 2 * CP_SIZE - 1 - chunk)
+            local = tl.where(chunk < CP_SIZE, within, chunk_len + within)
+        else:
+            owner = token // local_key_len
+            local = token - owner * local_key_len
+        safe_owner = tl.maximum(0, tl.minimum(owner, CP_SIZE - 1))
+        safe_local = tl.maximum(0, tl.minimum(local, local_key_len - 1))
+        mapped = tl.load(
+            cache_offset_ptr + safe_owner * local_key_len + safe_local,
+            mask=valid,
+            other=-1,
+        )
+        tl.store(out_ptr + offsets, mapped, mask=in_bounds)
+
+    @triton.jit
+    def _qsa_cp_compact_remap_route_kernel(
+        block_ptr,
+        length_ptr,
+        query_position_ptr,
+        cache_offset_ptr,
+        out_ptr,
+        output_numel,
+        seq_len,
+        global_seq_len,
+        local_key_len,
+        chunk_len,
+        ROUTE_SLOTS: tl.constexpr,
+        OUTPUT_SLOTS: tl.constexpr,
+        CP_SIZE: tl.constexpr,
+        RATIO: tl.constexpr,
+        ZIGZAG: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """Write cache-local token routes directly from compact block IDs."""
+
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        in_bounds = offsets < output_numel
+        row = offsets // OUTPUT_SLOTS
+        output_slot = offsets - row * OUTPUT_SLOTS
+        length = tl.load(length_ptr + row, mask=in_bounds, other=0).to(tl.int32)
+        max_length = ROUTE_SLOTS * RATIO + RATIO - 1
+        length = tl.maximum(0, tl.minimum(length, max_length))
+        selected_blocks = tl.minimum(length // RATIO, ROUTE_SLOTS)
+        tail_count = length - selected_blocks * RATIO
+
+        block_token_count = selected_blocks * RATIO
+        is_block_token = output_slot < block_token_count
+        block_slot = output_slot // RATIO
+        block_lane = output_slot - block_slot * RATIO
+        safe_block_slot = tl.maximum(0, tl.minimum(block_slot, ROUTE_SLOTS - 1))
+        block_id = tl.load(
+            block_ptr + row * ROUTE_SLOTS + safe_block_slot,
+            mask=in_bounds & is_block_token,
+            other=-1,
+        ).to(tl.int32)
+        block_token = block_id * RATIO + block_lane
+
+        tail_lane = output_slot - block_token_count
+        query = row - (row // seq_len) * seq_len
+        query_position = tl.load(
+            query_position_ptr + query, mask=in_bounds, other=0).to(tl.int32)
+        tail_token = ((query_position + 1) // RATIO) * RATIO + tail_lane
+        is_tail_token = (tail_lane >= 0) & (tail_lane < tail_count)
+        token = tl.where(is_block_token, block_token, tail_token)
+        valid = (
+            in_bounds
+            & ((is_block_token & (block_id >= 0)) | is_tail_token)
+            & (token >= 0)
+            & (token < global_seq_len)
+        )
+        if ZIGZAG:
+            chunk = token // chunk_len
+            within = token - chunk * chunk_len
+            owner = tl.where(
+                chunk < CP_SIZE, chunk, 2 * CP_SIZE - 1 - chunk)
+            local = tl.where(
+                chunk < CP_SIZE, within, chunk_len + within)
+        else:
+            owner = token // local_key_len
+            local = token - owner * local_key_len
+        safe_owner = tl.maximum(0, tl.minimum(owner, CP_SIZE - 1))
+        safe_local = tl.maximum(0, tl.minimum(local, local_key_len - 1))
+        mapped = tl.load(
+            cache_offset_ptr + safe_owner * local_key_len + safe_local,
+            mask=valid,
+            other=-1,
+        )
+        tl.store(out_ptr + offsets, mapped, mask=in_bounds)
+
+    @triton.jit
     def _qsa_indexer_fused_topk_packed_kernel(
         q_ptr,
         block_key_ptr,
@@ -3707,6 +4035,339 @@ if TRITON_AVAILABLE:
                 tl.store(value_output_ptrs, grad_value_acc, mask=output_mask)
 
 
+def qsa_expand_compact_route_triton(
+    block_indices: torch.Tensor,
+    topk_length: torch.Tensor,
+    query_positions: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Expand compact blocks with one bandwidth-only Triton launch."""
+
+    if not TRITON_AVAILABLE:
+        raise RuntimeError('QSA compact route expansion requires Triton')
+    if not block_indices.is_cuda:
+        raise ValueError('QSA Triton compact route expansion requires CUDA')
+    if block_indices.ndim != 3:
+        raise ValueError(
+            'QSA compact route expansion expects block_indices=[B,S,Kb]')
+    batch, seq_len, route_slots = block_indices.shape
+    if route_slots <= 0:
+        raise ValueError('QSA compact route expansion requires route slots')
+    if topk_length.shape != (batch, seq_len):
+        raise ValueError('QSA compact route expansion route/length shape mismatch')
+    block_size = int(block_size)
+    if block_size <= 1:
+        raise ValueError('QSA compact route expansion requires block_size > 1')
+    query_positions = query_positions.to(
+        device=block_indices.device, dtype=torch.int32).reshape(-1).contiguous()
+    if query_positions.shape != (seq_len,):
+        raise ValueError(
+            f'QSA compact route query_positions must have shape [{seq_len}]')
+    block_indices = block_indices.to(dtype=torch.int32).contiguous()
+    topk_length = topk_length.to(
+        device=block_indices.device, dtype=torch.int32).contiguous()
+    token_slots = route_slots * block_size + block_size - 1
+    output = torch.empty(
+        (batch, seq_len, token_slots),
+        device=block_indices.device,
+        dtype=torch.int32,
+    )
+    _qsa_expand_compact_route_kernel[(batch * seq_len,)](
+        block_indices,
+        topk_length,
+        output,
+        query_positions,
+        seq_len,
+        block_indices.stride(0),
+        block_indices.stride(1),
+        topk_length.stride(0),
+        topk_length.stride(1),
+        output.stride(0),
+        output.stride(1),
+        ROUTE_SLOTS=route_slots,
+        BLOCK_ROUTE=triton.next_power_of_2(route_slots),
+        BLOCK_TAIL=max(1, triton.next_power_of_2(block_size - 1)),
+        RATIO=block_size,
+        num_warps=1,
+        num_stages=1,
+    )
+    return output
+
+
+def _qsa_cp_partition_args(
+    global_seq_len: int,
+    cp_size: int,
+    rank: int,
+    partition_mode: str,
+):
+    global_seq_len = int(global_seq_len)
+    cp_size = int(cp_size)
+    rank = int(rank)
+    if cp_size <= 1 or not 0 <= rank < cp_size:
+        raise ValueError(
+            f'QSA CP planner expects cp_size>1 and rank in range, got '
+            f'cp_size={cp_size}, rank={rank}')
+    if global_seq_len <= 0 or global_seq_len % cp_size:
+        raise ValueError(
+            'QSA CP planner requires global sequence divisible by CP size')
+    local_key_len = global_seq_len // cp_size
+    if partition_mode == 'contiguous':
+        return global_seq_len, cp_size, rank, local_key_len, local_key_len, False
+    if partition_mode != 'zigzag':
+        raise ValueError(f'unsupported QSA CP partition mode: {partition_mode!r}')
+    if global_seq_len % (2 * cp_size):
+        raise ValueError(
+            'QSA zigzag CP requires global sequence divisible by 2*cp_size')
+    return (
+        global_seq_len,
+        cp_size,
+        rank,
+        local_key_len,
+        global_seq_len // (2 * cp_size),
+        True,
+    )
+
+
+def qsa_cp_request_mask_triton(
+    token_indices: torch.Tensor,
+    topk_length: torch.Tensor,
+    global_seq_len: int,
+    cp_size: int,
+    rank: int,
+    partition_mode: str,
+) -> torch.Tensor:
+    """Build a byte owner-request mask without full-width mapping tensors."""
+
+    if not TRITON_AVAILABLE or not token_indices.is_cuda:
+        raise RuntimeError('QSA CP Triton planner requires CUDA and Triton')
+    if token_indices.ndim != 3 or topk_length.shape != token_indices.shape[:2]:
+        raise ValueError('QSA CP Triton planner route/length shape mismatch')
+    if token_indices.dtype != torch.int32:
+        raise ValueError('QSA CP Triton planner requires int32 token indices')
+    token_indices = token_indices.contiguous()
+    topk_length = topk_length.to(
+        device=token_indices.device, dtype=torch.int32).contiguous()
+    (global_seq_len, cp_size, rank, local_key_len,
+     chunk_len, zigzag) = _qsa_cp_partition_args(
+         global_seq_len, cp_size, rank, partition_mode)
+    request_mask_i32 = torch.zeros(
+        (cp_size, local_key_len),
+        device=token_indices.device,
+        dtype=torch.int32,
+    )
+    block = 256
+    route_numel = token_indices.numel()
+    _qsa_cp_request_mask_kernel[(triton.cdiv(route_numel, block),)](
+        token_indices,
+        topk_length,
+        request_mask_i32,
+        route_numel,
+        global_seq_len,
+        local_key_len,
+        chunk_len,
+        rank,
+        ROUTE_SLOTS=token_indices.shape[-1],
+        CP_SIZE=cp_size,
+        ZIGZAG=zigzag,
+        BLOCK=block,
+        num_warps=4,
+        num_stages=1,
+    )
+    return request_mask_i32.to(torch.uint8)
+
+
+def qsa_cp_compact_request_mask_triton(
+    block_indices: torch.Tensor,
+    topk_length: torch.Tensor,
+    query_positions: torch.Tensor,
+    block_size: int,
+    global_seq_len: int,
+    cp_size: int,
+    rank: int,
+    partition_mode: str,
+) -> torch.Tensor:
+    """Build owner requests directly from compact blocks and causal tails."""
+
+    if not TRITON_AVAILABLE or not block_indices.is_cuda:
+        raise RuntimeError('QSA compact CP planner requires CUDA and Triton')
+    if block_indices.ndim != 3 or topk_length.shape != block_indices.shape[:2]:
+        raise ValueError('QSA compact CP planner route/length shape mismatch')
+    if block_indices.dtype != torch.int32:
+        raise ValueError('QSA compact CP planner requires int32 block indices')
+    batch, seq_len, route_slots = block_indices.shape
+    if batch <= 0 or seq_len <= 0 or route_slots <= 0:
+        raise ValueError('QSA compact CP planner requires non-empty routes')
+    block_size = int(block_size)
+    if block_size <= 1:
+        raise ValueError('QSA compact CP planner requires block_size > 1')
+    block_indices = block_indices.contiguous()
+    topk_length = topk_length.to(
+        device=block_indices.device, dtype=torch.int32).contiguous()
+    query_positions = query_positions.to(
+        device=block_indices.device, dtype=torch.int32).reshape(-1).contiguous()
+    if query_positions.shape != (seq_len,):
+        raise ValueError(
+            f'QSA compact CP planner query_positions must have shape '
+            f'[{seq_len}]')
+    (global_seq_len, cp_size, rank, local_key_len,
+     chunk_len, zigzag) = _qsa_cp_partition_args(
+         global_seq_len, cp_size, rank, partition_mode)
+    request_mask_i32 = torch.zeros(
+        (cp_size, local_key_len),
+        device=block_indices.device,
+        dtype=torch.int32,
+    )
+    block = 128
+    route_numel = block_indices.numel()
+    _qsa_cp_compact_request_mask_kernel[(
+        triton.cdiv(route_numel, block),
+    )](
+        block_indices,
+        topk_length,
+        query_positions,
+        request_mask_i32,
+        route_numel,
+        seq_len,
+        global_seq_len,
+        local_key_len,
+        chunk_len,
+        rank,
+        ROUTE_SLOTS=route_slots,
+        CP_SIZE=cp_size,
+        RATIO=block_size,
+        ZIGZAG=zigzag,
+        BLOCK=block,
+        num_warps=4,
+        num_stages=1,
+    )
+    return request_mask_i32.to(torch.uint8)
+
+
+def qsa_cp_remap_route_triton(
+    token_indices: torch.Tensor,
+    topk_length: torch.Tensor,
+    cache_offsets: torch.Tensor,
+    global_seq_len: int,
+    cp_size: int,
+    rank: int,
+    partition_mode: str,
+    in_place: bool = False,
+) -> torch.Tensor:
+    """Map global token IDs to final owner-cache offsets in one launch."""
+
+    if not TRITON_AVAILABLE or not token_indices.is_cuda:
+        raise RuntimeError('QSA CP Triton remap requires CUDA and Triton')
+    if token_indices.ndim != 3 or topk_length.shape != token_indices.shape[:2]:
+        raise ValueError('QSA CP Triton remap route/length shape mismatch')
+    if token_indices.dtype != torch.int32:
+        raise ValueError('QSA CP Triton remap requires int32 token indices')
+    if in_place and not token_indices.is_contiguous():
+        raise ValueError('QSA CP in-place remap requires a contiguous route')
+    token_indices = token_indices.contiguous()
+    topk_length = topk_length.to(
+        device=token_indices.device, dtype=torch.int32).contiguous()
+    (global_seq_len, cp_size, rank, local_key_len,
+     chunk_len, zigzag) = _qsa_cp_partition_args(
+         global_seq_len, cp_size, rank, partition_mode)
+    if cache_offsets.shape != (cp_size, local_key_len):
+        raise ValueError('QSA CP cache-offset table shape mismatch')
+    cache_offsets = cache_offsets.to(
+        device=token_indices.device, dtype=torch.int32).contiguous()
+    output = token_indices if in_place else torch.empty_like(token_indices)
+    block = 256
+    route_numel = token_indices.numel()
+    _qsa_cp_remap_route_kernel[(triton.cdiv(route_numel, block),)](
+        token_indices,
+        topk_length,
+        cache_offsets,
+        output,
+        route_numel,
+        global_seq_len,
+        local_key_len,
+        chunk_len,
+        ROUTE_SLOTS=token_indices.shape[-1],
+        CP_SIZE=cp_size,
+        ZIGZAG=zigzag,
+        BLOCK=block,
+        num_warps=4,
+        num_stages=1,
+    )
+    return output
+
+
+def qsa_cp_compact_remap_route_triton(
+    block_indices: torch.Tensor,
+    topk_length: torch.Tensor,
+    query_positions: torch.Tensor,
+    cache_offsets: torch.Tensor,
+    block_size: int,
+    global_seq_len: int,
+    cp_size: int,
+    rank: int,
+    partition_mode: str,
+) -> torch.Tensor:
+    """Write the final owner-cache token route directly from compact blocks."""
+
+    if not TRITON_AVAILABLE or not block_indices.is_cuda:
+        raise RuntimeError('QSA compact CP remap requires CUDA and Triton')
+    if block_indices.ndim != 3 or topk_length.shape != block_indices.shape[:2]:
+        raise ValueError('QSA compact CP remap route/length shape mismatch')
+    if block_indices.dtype != torch.int32:
+        raise ValueError('QSA compact CP remap requires int32 block indices')
+    batch, seq_len, route_slots = block_indices.shape
+    if batch <= 0 or seq_len <= 0 or route_slots <= 0:
+        raise ValueError('QSA compact CP remap requires non-empty routes')
+    block_size = int(block_size)
+    if block_size <= 1:
+        raise ValueError('QSA compact CP remap requires block_size > 1')
+    block_indices = block_indices.contiguous()
+    topk_length = topk_length.to(
+        device=block_indices.device, dtype=torch.int32).contiguous()
+    query_positions = query_positions.to(
+        device=block_indices.device, dtype=torch.int32).reshape(-1).contiguous()
+    if query_positions.shape != (seq_len,):
+        raise ValueError(
+            f'QSA compact CP remap query_positions must have shape [{seq_len}]')
+    (global_seq_len, cp_size, rank, local_key_len,
+     chunk_len, zigzag) = _qsa_cp_partition_args(
+         global_seq_len, cp_size, rank, partition_mode)
+    if cache_offsets.shape != (cp_size, local_key_len):
+        raise ValueError('QSA compact CP cache-offset table shape mismatch')
+    cache_offsets = cache_offsets.to(
+        device=block_indices.device, dtype=torch.int32).contiguous()
+    token_slots = route_slots * block_size + block_size - 1
+    output = torch.empty(
+        (batch, seq_len, token_slots),
+        device=block_indices.device,
+        dtype=torch.int32,
+    )
+    block = 1024
+    output_numel = output.numel()
+    _qsa_cp_compact_remap_route_kernel[(
+        triton.cdiv(output_numel, block),
+    )](
+        block_indices,
+        topk_length,
+        query_positions,
+        cache_offsets,
+        output,
+        output_numel,
+        seq_len,
+        global_seq_len,
+        local_key_len,
+        chunk_len,
+        ROUTE_SLOTS=route_slots,
+        OUTPUT_SLOTS=token_slots,
+        CP_SIZE=cp_size,
+        RATIO=block_size,
+        ZIGZAG=zigzag,
+        BLOCK=block,
+        num_warps=4,
+        num_stages=1,
+    )
+    return output
+
+
 def qsa_indexer_score_tile_with_ratio(
     q: torch.Tensor,
     block_keys: torch.Tensor,
@@ -5521,7 +6182,9 @@ def qsa_selected_kv_backward(
     default_num_warps = 4 if tensorized_default else 1
     backward_num_warps = int(os.environ.get(
         'MCORE_BRIDGE_QSA_BACKWARD_WARPS', str(default_num_warps)))
-    backward_num_stages = int(os.environ.get('MCORE_BRIDGE_QSA_BACKWARD_STAGES', '1'))
+    default_num_stages = 2 if tensorized_default else 1
+    backward_num_stages = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_BACKWARD_STAGES', str(default_num_stages)))
     if backward_num_warps not in {1, 2, 4, 8} or backward_num_stages not in {1, 2, 3, 4}:
         raise ValueError(
             'QSA backward tuning expects warps in {1,2,4,8} and stages in {1,2,3,4}')
@@ -5804,7 +6467,9 @@ def qsa_selected_kv_backward_packed(
     default_num_warps = 4 if tensorized_default else 1
     num_warps = int(os.environ.get(
         'MCORE_BRIDGE_QSA_BACKWARD_WARPS', str(default_num_warps)))
-    num_stages = int(os.environ.get('MCORE_BRIDGE_QSA_BACKWARD_STAGES', '1'))
+    default_num_stages = 2 if tensorized_default else 1
+    num_stages = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_BACKWARD_STAGES', str(default_num_stages)))
     if num_warps not in {1, 2, 4, 8} or num_stages not in {1, 2, 3, 4}:
         raise ValueError('QSA packed backward tuning has invalid warps/stages')
     _qsa_selected_kv_backward_packed_grouped_kernel[
@@ -5894,6 +6559,11 @@ def qsa_selected_kv_backward_packed(
 __all__ = [
     "TRITON_AVAILABLE",
     "is_sm90",
+    "qsa_cp_compact_remap_route_triton",
+    "qsa_cp_compact_request_mask_triton",
+    "qsa_cp_remap_route_triton",
+    "qsa_cp_request_mask_triton",
+    "qsa_expand_compact_route_triton",
     "qsa_indexer_fused_topk_with_ratio",
     "qsa_indexer_fused_topk_packed",
     "qsa_indexer_score_tile_with_ratio",
