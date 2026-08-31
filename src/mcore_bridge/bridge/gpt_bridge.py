@@ -116,7 +116,7 @@ class GPTBridge:
         if mg_key is None:
             return
         if '.' not in mg_key:
-            if mg_key in {'dt_bias', 'A_log'}:
+            if mg_key in {'dt_bias', 'A_log', 'linear_o_group_proj'}:
                 return 0
             else:
                 return
@@ -132,6 +132,8 @@ class GPTBridge:
             'linear_q_proj',
             'linear_q_up_proj',
             'linear_kv_up_proj',
+            # DSv4 hybrid attention's manually-created grouped output matrix
+            'linear_o_group_proj',
             # mtp
             'eh_proj',
         } | self.additional_dim0_keys
@@ -143,7 +145,7 @@ class GPTBridge:
             key, suffix = mg_key.rsplit('.', 2)[-2:]
             if suffix == 'layer_norm_weight':
                 return
-            elif mg_key == 'core_attention.softmax_offset':
+            elif mg_key in {'core_attention.softmax_offset', 'core_attention.attn_sink'}:
                 return 0
             elif key in dim0_keys:
                 return 0
@@ -215,6 +217,9 @@ class GPTBridge:
                 tensor = tensor.view(torch.uint8)
                 param._rowwise_data.data.copy_(tensor)
                 self._copy_scale_inv(param, hf_scale_inv)
+                # Regenerate columnwise data in-place from freshly-loaded rowwise data
+                if hasattr(param, '_create_columnwise') and param._columnwise_data is not None:
+                    param._create_columnwise()
                 del param.get_high_precision_init_val
         else:
             if hf_scale_inv is not None:
@@ -267,9 +272,12 @@ class GPTBridge:
             incompatible_keys = mg_module.load_state_dict(hf_state_dict, strict=False)
             missing_keys = incompatible_keys.missing_keys
             if self._peft_format:
+                # In multi-LoRA mode, only the current adapter slot is saved/loaded.
+                # Other idle slots (e.g. lora_1~N) are not in the checkpoint and
+                # their absence is expected — only validate the active adapter.
                 missing_keys = [
-                    k for k in incompatible_keys.missing_keys
-                    if '.lora_A.' in k or '.lora_B.' in k or '.modules_to_save.' in k
+                    k for k in incompatible_keys.missing_keys if
+                    ('.lora_A.' in k or '.lora_B.' in k or '.modules_to_save.' in k) and f'.{self._adapter_name}.' in k
                 ]
             assert len(missing_keys) == 0, f'incompatible_keys.missing_keys: {missing_keys}'
             return {}
@@ -403,9 +411,10 @@ class GPTBridge:
                 tensor = [t._rowwise_data for t in tensor]
             del mg_weight
             assert isinstance(tensor, (list, tuple)), f'mg_key: {mg_key}'
-            tensor = torch.concat(tensor, dim=0)
+            # Skip full-size cat copy when single shard (TP==1) to avoid OOM in colocate sync
+            tensor = tensor[0] if len(tensor) == 1 else torch.concat(tensor, dim=0)
             if mg_scale_inv is not None:
-                mg_scale_inv = torch.concat(mg_scale_inv, dim=0)
+                mg_scale_inv = mg_scale_inv[0] if len(mg_scale_inv) == 1 else torch.concat(mg_scale_inv, dim=0)
         num_local_experts = self.config.num_moe_experts // self.ep_size if is_expert else 1
         tp_dim = self._get_tp_split_dim(mg_key)
         is_linear_fc1 = (mg_key is not None and mg_key.split('.', 1)[0] == 'linear_fc1' and tp_dim is not None)
@@ -501,9 +510,9 @@ class GPTBridge:
             if to_mcore:
                 assert mg_param is not None, f'mg_module: {mg_module}, mg_key: {mg_key}'
                 hf_weight = hf_state_dict[hf_key].load()
-                if module_key in {
-                        'embedding.word_embeddings', 'output_layer'
-                } and hf_weight.shape[0] < self.config.padded_vocab_size and self.config.task_type != 'seq_cls':
+                if hf_weight.shape[0] < self.config.padded_vocab_size and (module_key == 'embedding.word_embeddings'
+                                                                           or module_key == 'output_layer'
+                                                                           and self.config.task_type != 'seq_cls'):
                     hf_weight = F.pad(hf_weight, (0, 0, 0, self.config.padded_vocab_size - hf_weight.shape[0]))
                 hf_scale_inv = None
                 if f'{hf_key}_scale_inv' in hf_state_dict:
@@ -1608,8 +1617,11 @@ class GPTBridge:
                 self._set_state_dict(mg_attn, 'linear_kv_up_proj.layer_norm_weight', hf_state_dict,
                                      'kv_a_layernorm.weight', to_mcore)
         if self.config.experimental_attention_variant == 'dsa':
-            indexer = None if mg_attn is None else mg_attn.core_attention.indexer
-            hf_state_dict.update(self._set_indexer(indexer, hf_state_dict, 'indexer.', to_mcore))
+            has_indexer = False if mg_attn is None else mg_attn.core_attention.indexer is not None
+            has_indexer = self._reduce_tensor_pp_group(has_indexer, to_mcore)
+            if has_indexer:
+                indexer = None if mg_attn is None else mg_attn.core_attention.indexer
+                hf_state_dict.update(self._set_indexer(indexer, hf_state_dict, 'indexer.', to_mcore))
         if to_mcore:
             hf_state_dict = {}
         else:
@@ -1987,6 +1999,7 @@ class GPTBridge:
         adapter_name: str = 'default',
         converter: Optional[Callable] = None,
         max_shard_size: str = '5GB',
+        save_missing_weights: Union[bool, str] = False,
     ) -> None:
         """Save Megatron model checkpoint in safetensors (HuggingFace) format.
 
@@ -2003,6 +2016,9 @@ class GPTBridge:
             adapter_name: Name of the adapter for PEFT models. Defaults to 'default'.
             converter: Used to perform key-value conversion on the newly exported state_dict.
             max_shard_size: Maximum size of a single storage file, default is '5GB'.
+            save_missing_weights: Compatibility flag consumed by the ms-swift
+                wrapper. The bridge exporter already streams all converted
+                weights and does not need a second missing-weight pass.
         """
         gc_collect()
         saver = StreamingSafetensorSaver(save_dir=output_dir, max_shard_size=max_shard_size, peft_format=peft_format)

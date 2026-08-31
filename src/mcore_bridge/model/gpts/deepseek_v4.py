@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
 import torch
+import transformer_engine.pytorch as te
 from contextlib import contextmanager
 from megatron.core import tensor_parallel
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
@@ -12,6 +13,7 @@ from mcore_bridge.utils import Fp8Dequantizer, fp4_to_fp8
 
 from ..constant import ModelType
 from ..gpt_model import GPTModel
+from ..modules.compressor import Compressor, CSAIndexer
 from ..register import ModelLoader, ModelMeta, register_model
 from ..rope import get_rope_inv_freq
 
@@ -68,6 +70,24 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             super().__init__(config, *args, **kwargs)
         self.layer_type = self.config.hf_config.layer_types[self.layer_number - 1]
         self.rope_layer_type = 'main' if self.layer_type == 'sliding_attention' else 'compress'
+        if config.fp8_param:
+            group_proj_in_size = self.query_projection_size // config.o_groups
+            del self.linear_o_group_proj
+            if config.o_groups % self.tp_size != 0:
+                raise ValueError(
+                    "o_groups must be divisible by tensor model parallel size for FP8 grouped output: "
+                    f"{config.o_groups} % {self.tp_size} != 0"
+                )
+            self.linear_o_group_proj = te.GroupedLinear(
+                num_gemms=self.o_local_groups,
+                in_features=group_proj_in_size,
+                out_features=config.o_lora_rank,
+                bias=False,
+                params_dtype=config.params_dtype,
+            )
+            self._o_group_proj_is_grouped_linear = True
+        else:
+            self._o_group_proj_is_grouped_linear = False
 
     def get_query_key_value_tensors(
         self,
@@ -79,6 +99,8 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         rotary_pos_emb=None,
         *,
         inference_params=None,
+        boundary_hidden=None,
+        boundary_rotary_pos_emb=None,
     ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
@@ -126,7 +148,11 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         # QKV up projection and RoPE apply
         # =========================================
 
-        def qkv_up_proj_and_rope_apply(q_compressed, kv_compressed, rotary_pos_emb):
+        def qkv_up_proj_and_rope_apply(q_compressed,
+                                       kv_compressed,
+                                       rotary_pos_emb,
+                                       boundary_kv_compressed=None,
+                                       boundary_rotary_pos_emb=None):
             """
             Apply the up projection and RoPE to the query and key.
             When sequence packing enabled, the input tensors adopt a packed shape of [t, ...];
@@ -141,21 +167,58 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
             q = _q_rms_norm(q, self.config.layernorm_epsilon)
 
-            kv, _ = self.linear_kv_proj(kv_compressed)
-            kv = self.kv_layernorm(kv)
+            # The Bridge path owns its RoPE application instead of calling the
+            # MCore DSv4 implementation.  With sequence parallelism, q-up and
+            # kv projection expose the TP-local sequence length only after the
+            # projections; slice the global position table at that point.
+            local_rotary_pos_emb = rotary_pos_emb
+            local_kv_rotary_pos_emb = None
+            if self.tp_size > 1 and self.config.sequence_parallel and packed_seq_params is None:
+                tp_rank = torch.distributed.get_rank(group=self.pg_collection.tp)
 
-            # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
-            q_len = q.size()[0]
-            if packed_seq_params is None or self.config.context_parallel_size == 1:
-                # Shorten rotary_pos_emb to the sequence length when inference_params
-                # is not provided. This makes sure we can run forward directly with
-                # any sequence length. During training, the sequence length is always
-                # the full rotary_pos_emb length, except for sequence packing + CP.
-                # When sequence packing and context parallel are both enabled, the
-                # position embedding will not split rotary_pos_emb, so it may exceed
-                # the sequence length on this CP rank, but we need the full rotary_pos_emb
-                # to cover the full sequence, so we do not shorten it here.
-                rotary_pos_emb = rotary_pos_emb[0:q_len]
+                def _slice_tp_rope(tensor, local_seq_len):
+                    if tensor is None or tensor.size(0) == local_seq_len:
+                        return tensor
+                    start = tp_rank * local_seq_len
+                    if start + local_seq_len > tensor.size(0):
+                        raise RuntimeError(
+                            "DSv4 Bridge TP RoPE table is shorter than the local sequence slice: "
+                            f"table={tensor.size(0)}, start={start}, local={local_seq_len}"
+                        )
+                    return tensor.narrow(0, start, local_seq_len)
+
+                local_rotary_pos_emb = _slice_tp_rope(local_rotary_pos_emb, q.size(0))
+
+            boundary_rows = 0
+            if boundary_kv_compressed is not None:
+                boundary_rows = boundary_kv_compressed.shape[0]
+                kv_projection_input = torch.cat([boundary_kv_compressed, kv_compressed], dim=0)
+                kv_rotary_pos_emb = torch.cat([boundary_rotary_pos_emb, rotary_pos_emb], dim=0)
+            else:
+                kv_projection_input = kv_compressed
+                kv_rotary_pos_emb = rotary_pos_emb
+
+            kv, _ = self.linear_kv_proj(kv_projection_input)
+            kv = self.kv_layernorm(kv)
+            if self.tp_size > 1 and self.config.sequence_parallel:
+                # q-up is a standard SP column-parallel projection and
+                # therefore sees the complete CP-local sequence. The V4 KV
+                # projection is duplicated, so gather its local output to the
+                # same sequence space before CSA/attention.
+                if boundary_rows:
+                    boundary_kv_part = kv[:boundary_rows]
+                    local_kv_part = tensor_parallel.gather_from_sequence_parallel_region(
+                        kv[boundary_rows:], group=self.pg_collection.tp
+                    )
+                    kv = torch.cat([boundary_kv_part, local_kv_part], dim=0)
+                else:
+                    kv = tensor_parallel.gather_from_sequence_parallel_region(
+                        kv, group=self.pg_collection.tp
+                    )
+            local_kv_rotary_pos_emb = kv_rotary_pos_emb
+            if self.tp_size > 1 and self.config.sequence_parallel and packed_seq_params is None:
+                local_kv_rotary_pos_emb = _slice_tp_rope(local_kv_rotary_pos_emb, kv.size(0))
+            boundary_kv = None
 
             # q_no_pe: [num_tokens, n, qk_head_dim]
             # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
@@ -166,7 +229,7 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
             q_pos_emb = apply_rotary_pos_emb(
                 q_pos_emb,
-                rotary_pos_emb,
+                local_rotary_pos_emb,
                 config=self.config,
                 cu_seqlens=cu_seqlens_q,
                 cp_group=self.pg_collection.cp,
@@ -181,7 +244,7 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
             k_pos_emb = apply_rotary_pos_emb(
                 k_pos_emb,
-                rotary_pos_emb,
+                local_kv_rotary_pos_emb,
                 config=self.config,
                 cu_seqlens=cu_seqlens_kv,
                 cp_group=self.pg_collection.cp,
@@ -191,24 +254,45 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
 
             # Single head: key = value = [num_tokens, 1, v_head_dim]
             kv = torch.cat([kv_no_pe, k_pos_emb], dim=-1).unsqueeze(-2)
+            if boundary_kv_compressed is not None:
+                boundary_kv = kv[:boundary_rows]
+                kv = kv[boundary_rows:]
             key = kv
             value = kv
 
             query = query.contiguous()
             key = key.contiguous()
             value = value.contiguous()
-
-            return query, key, value
+            if boundary_kv is not None:
+                boundary_kv = boundary_kv.contiguous()
+            if boundary_kv is None:
+                return query, key, value
+            return query, key, value, boundary_kv
 
         if self.recompute_up_proj:
             quantization = self.config.fp8 or self.config.fp4
             self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
-            query, key, value = self.qkv_up_checkpoint.checkpoint(qkv_up_proj_and_rope_apply, q_compressed,
-                                                                  kv_compressed, rotary_pos_emb)
+            if boundary_hidden is None:
+                query, key, value = self.qkv_up_checkpoint.checkpoint(qkv_up_proj_and_rope_apply, q_compressed,
+                                                                      kv_compressed, rotary_pos_emb)
+                boundary_kv = None
+            else:
+                query, key, value, boundary_kv = self.qkv_up_checkpoint.checkpoint(qkv_up_proj_and_rope_apply,
+                                                                                   q_compressed, kv_compressed,
+                                                                                   rotary_pos_emb, boundary_hidden,
+                                                                                   boundary_rotary_pos_emb)
         else:
-            query, key, value = qkv_up_proj_and_rope_apply(q_compressed, kv_compressed, rotary_pos_emb)
+            if boundary_hidden is None:
+                query, key, value = qkv_up_proj_and_rope_apply(q_compressed, kv_compressed, rotary_pos_emb)
+                boundary_kv = None
+            else:
+                query, key, value, boundary_kv = qkv_up_proj_and_rope_apply(q_compressed, kv_compressed, rotary_pos_emb,
+                                                                            boundary_hidden, boundary_rotary_pos_emb)
 
-        return query, key, value, q_compressed, kv_compressed
+        result = (query, key, value, q_compressed, kv_compressed)
+        if boundary_kv is not None:
+            return result + (boundary_kv, )
+        return result
 
     def forward(
         self,
@@ -236,19 +320,73 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         assert (inference_context is None
                 and inference_params is None), 'Inference is not supported for DSv4HybridAttention.'
 
+        # Select this microbatch's dynamic CP group. QKV captures it explicitly
+        # for recompute; the rest of this forward reads it from pg_collection.
+        # Restore the static group before returning.
+        cp_group = self.pg_collection.cp
+        cp_size = cp_group.size()
+        qkv_format = packed_seq_params.qkv_format if packed_seq_params is not None else None
+        if cp_size > 1 and qkv_format != 'thd':
+            raise ValueError("DSv4 Hybrid with CP requires qkv_format='thd'.")
+        use_thd_cp = cp_size > 1 and qkv_format == 'thd'
+        if use_thd_cp and packed_seq_params.cp_partition_mode != 'contiguous':
+            raise ValueError('DSv4 THD CP requires a contiguous CP partition.')
+
+        sequence_parallel_local_length = hidden_states.size(0)
+        core_hidden_states = hidden_states
+        if self.tp_size > 1 and self.config.sequence_parallel:
+            # q-up uses TE's standard SP all-gather. The duplicated KV path
+            # and CSA compressor need the same CP-local sequence explicitly.
+            core_hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
+                hidden_states, group=self.pg_collection.tp
+            )
+
+        boundary_hidden = None
+        boundary_rotary_pos_emb = None
+        if use_thd_cp:
+            from megatron.core.transformer.experimental_attention_variant import csa_cp_utils as cp_utils
+            boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
+                core_hidden_states,
+                self._dsv4_compress_ratio,
+                self.config.csa_window_size,
+                self.pg_collection.cp,
+            )
+            boundary_rotary_pos_emb = cp_utils.exchange_cp_boundary_hidden(
+                rotary_pos_emb,
+                self._dsv4_compress_ratio,
+                self.config.csa_window_size,
+                self.pg_collection.cp,
+            )
         # =====================
         # Query, Key, and Value
         # =====================
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
-        query, key, value, q_compressed, kv_compressed = self.get_query_key_value_tensors(
+        qkv = self.get_query_key_value_tensors(
             hidden_states,
             key_value_states,
             position_ids,
             packed_seq_params,
             rotary_pos_emb=rotary_pos_emb,
             inference_context=inference_context,
+            boundary_hidden=boundary_hidden,
+            boundary_rotary_pos_emb=boundary_rotary_pos_emb,
         )
+        if use_thd_cp:
+            query, key, value, q_compressed, kv_compressed, boundary_kv = qkv
+        else:
+            query, key, value, q_compressed, kv_compressed = qkv
+            boundary_kv = None
+
+        core_q_compressed = q_compressed
+        if self.tp_size > 1 and self.config.sequence_parallel:
+            # q-down is duplicated and remains TP-local, while CSA's learned
+            # indexer consumes the same complete CP-local sequence as the
+            # gathered hidden states. Keep the local q-compressed tensor for
+            # q-up, and provide a gathered copy to the core-attention path.
+            core_q_compressed = tensor_parallel.gather_from_sequence_parallel_region(
+                q_compressed, group=self.pg_collection.tp
+            )
 
         # TODO: Currently, TE can only accept contiguous tensors for MLA
         query = query.contiguous()
@@ -261,16 +399,24 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         # Need corresponding TE change
         core_attn_manager = off_interface(self.offload_core_attention and self.training, query, 'core_attn')
         with core_attn_manager as query:
+            core_attn_kwargs = {}
+            if boundary_hidden is not None:
+                core_attn_kwargs['boundary_hidden'] = boundary_hidden
+                core_attn_kwargs['boundary_kv'] = boundary_kv
             core_attn_out = self.core_attention(
                 query,
                 key,
                 value,
                 attention_mask,
                 packed_seq_params=packed_seq_params,
-                x=hidden_states,
-                qr=q_compressed,
+                x=core_hidden_states,
+                qr=core_q_compressed,
+                **core_attn_kwargs,
             )
-        core_attn_out = core_attn_manager.group_offload(core_attn_out, forced_released_tensors=[query, key, value])
+        forced_released_tensors = [query, key, value]
+        if boundary_kv is not None:
+            forced_released_tensors.append(boundary_kv)
+        core_attn_out = core_attn_manager.group_offload(core_attn_out, forced_released_tensors=forced_released_tensors)
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
@@ -298,8 +444,12 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             cu_seqlens_kv = None
 
         content_part, rot_part = torch.split(core_attn_out, [core_attn_out.size(-1) - pos_dim, pos_dim], dim=-1)
-        rot_part = apply_rotary_pos_emb(
-            rot_part,
+        if packed_seq:
+            rot_part_in = rot_part.squeeze(1)
+        else:
+            rot_part_in = rot_part
+        rot_part_out = apply_rotary_pos_emb(
+            rot_part_in,
             rotary_pos_emb,
             self.config,
             cu_seqlens=cu_seqlens_kv,
@@ -308,14 +458,31 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             inverse=True,
             mla_output_remove_interleaving=True,
         )
+        if packed_seq:
+            rot_part = rot_part_out.unsqueeze(1)
+        else:
+            rot_part = rot_part_out
         core_attn_out = torch.cat([content_part, rot_part], dim=-1)
         core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), -1)
 
         # Grouped output
-        core_attn_out = core_attn_out.view(core_attn_out.size(0), core_attn_out.size(1), self.o_local_groups, -1)
-        wo_a_weight = self.linear_o_group_proj.view(self.o_local_groups, self.config.o_lora_rank, -1)
-        core_attn_out = torch.einsum('...gd,grd->...gr', core_attn_out, wo_a_weight)
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+        if self._o_group_proj_is_grouped_linear:
+            s, b = core_attn_out.size(0), core_attn_out.size(1)
+            # [s, b, G*D] -> [G, s*b, D] -> [G*s*b, D]
+            core_attn_out = core_attn_out.view(s, b, self.o_local_groups, -1)
+            core_attn_out = core_attn_out.permute(2, 0, 1, 3).contiguous()
+            core_attn_out = core_attn_out.reshape(-1, core_attn_out.size(-1))
+            m_splits = [s * b] * self.o_local_groups
+            core_attn_out = self.linear_o_group_proj(core_attn_out, m_splits)
+            # [G*s*b, R] -> [G, s, b, R] -> [s, b, G*R]
+            core_attn_out = core_attn_out.view(self.o_local_groups, s, b, -1)
+            core_attn_out = core_attn_out.permute(1, 2, 0, 3).contiguous()
+            core_attn_out = core_attn_out.reshape(s, b, -1)
+        else:
+            core_attn_out = core_attn_out.view(core_attn_out.size(0), core_attn_out.size(1), self.o_local_groups, -1)
+            wo_a_weight = self.linear_o_group_proj.view(self.o_local_groups, self.config.o_lora_rank, -1)
+            core_attn_out = torch.einsum('...gd,grd->...gr', core_attn_out, wo_a_weight)
+            core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
         # =================
         # Output. [sq, b, h]
@@ -324,6 +491,21 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         with attn_proj_manager as core_attn_out:
             output, bias = self.linear_proj(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
+
+        # Some TE versions reduce the row-parallel output across TP but leave
+        # the sequence dimension gathered. Restore the standard
+        # sequence-parallel module contract (local sequence on return) when
+        # that backend behavior is observed; do not double-scatter versions
+        # that already return the local shape.
+        if (
+            self.tp_size > 1
+            and self.config.sequence_parallel
+            and output.size(0) != sequence_parallel_local_length
+            and output.size(0) % self.tp_size == 0
+        ):
+            output = tensor_parallel.scatter_to_sequence_parallel_region(
+                output, group=self.pg_collection.tp
+            )
 
         return output, bias
 
@@ -367,6 +549,12 @@ class DeepseekV4Loader(ModelLoader):
         transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(self.config, vp_stage)
         for layer_spec in transformer_layer_spec.layer_specs:
             layer_spec.submodules.self_attention.module = DSv4HybridSelfAttention
+            core_attention_submodules = layer_spec.submodules.self_attention.submodules.core_attention.submodules
+            if getattr(core_attention_submodules, 'compressor', None) is not None:
+                core_attention_submodules.compressor.module = Compressor
+            if getattr(core_attention_submodules, 'indexer', None) is not None:
+                core_attention_submodules.indexer.module = CSAIndexer
+                core_attention_submodules.indexer.submodules.compressor.module = Compressor
         return transformer_layer_spec
 
 
@@ -380,6 +568,37 @@ class DeepseekV4Bridge(GPTBridge):
     hf_input_layernorm_key = 'attn_norm.weight'
     hf_post_attention_layernorm_key = 'ffn_norm.weight'
     hf_expert_bias_key = 'gate.bias'
+
+    def _set_o_group_proj_grouped(self, mg_attn, hf_state_dict, to_mcore):
+        """Handle GroupedLinear state dict for linear_o_group_proj in fp8 mode.
+
+        HF stores a single wo_a.weight of shape [G*R, D].
+        GroupedLinear stores per-gemm weight{i} each of shape [R, D].
+        """
+        o_groups = self.config.o_groups
+        local_groups = o_groups // self.tp_size
+        if to_mcore:
+            hf_weight = hf_state_dict['wo_a.weight'].load()
+            hf_scale_inv = None
+            if 'wo_a.weight_scale_inv' in hf_state_dict:
+                hf_scale_inv = hf_state_dict['wo_a.weight_scale_inv'].load()
+            weights = hf_weight.chunk(o_groups, dim=0)
+            scale_invs = hf_scale_inv.chunk(o_groups, dim=0) if hf_scale_inv is not None else [None] * o_groups
+            start = self.tp_rank * local_groups
+            for i, (w, s) in enumerate(zip(weights[start:start + local_groups],
+                                             scale_invs[start:start + local_groups])):
+                param = getattr(mg_attn.linear_o_group_proj, f'weight{i}')
+                self._set_param(param, w, s)
+        else:
+            if mg_attn is None:
+                mg_weight = None
+            else:
+                mg_weight = [getattr(mg_attn.linear_o_group_proj, f'weight{i}') for i in range(local_groups)]
+            weight, scale_inv = self._get_weight(mg_weight, 'linear_o_group_proj.weight0')
+            if weight is not None:
+                hf_state_dict['wo_a.weight'] = weight
+            if scale_inv is not None:
+                hf_state_dict['wo_a.weight_scale_inv'] = scale_inv
 
     def _convert_hf_state_dict(self, hf_state_dict, to_mcore):
         res = super()._convert_hf_state_dict(hf_state_dict, to_mcore)
@@ -436,7 +655,10 @@ class DeepseekV4Bridge(GPTBridge):
         else:
             hf_state_dict = {}
         self._set_state_dict(mg_attn, 'linear_proj.weight', hf_state_dict, 'wo_b.weight', to_mcore)
-        self._set_state_dict(mg_attn, 'linear_o_group_proj', hf_state_dict, 'wo_a.weight', to_mcore)
+        if self.config.fp8_param:
+            self._set_o_group_proj_grouped(mg_attn, hf_state_dict, to_mcore)
+        else:
+            self._set_state_dict(mg_attn, 'linear_o_group_proj', hf_state_dict, 'wo_a.weight', to_mcore)
         self._set_state_dict(mg_attn, 'linear_q_down_proj.weight', hf_state_dict, 'wq_a.weight', to_mcore)
         self._set_state_dict(mg_attn, 'linear_q_up_proj.weight', hf_state_dict, 'wq_b.weight', to_mcore)
         self._set_state_dict(mg_attn, 'linear_kv_proj.weight', hf_state_dict, 'wkv.weight', to_mcore)
@@ -503,7 +725,7 @@ class DeepseekV4Bridge(GPTBridge):
         tensor = fp4_to_fp8(tensor)
         tensor = tensor.reshape(*param.shape)
         scale_inv = scale_inv.reshape(-1, scale_inv.shape[-1])
-        tensor = Fp8Dequantizer().convert(tensor, scale_inv)
+        tensor = Fp8Dequantizer(block_size='auto').convert(tensor, scale_inv)
         if self._is_fp8_param(param):
             param._high_precision_init_val.copy_(tensor)
         param.data.copy_(tensor)
