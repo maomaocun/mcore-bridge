@@ -64,6 +64,21 @@ def is_sm90(device: Optional[torch.device] = None) -> bool:
         return False
 
 
+def _qsa_trim_causal_loop(causal: bool, sequence_extent: int, logical_k: int) -> bool:
+    """Select the short-sequence loop variant without a device synchronization."""
+
+    mode = os.environ.get(
+        'MCORE_BRIDGE_QSA_TRIM_CAUSAL_LOOP',
+        os.environ.get('MCORE_BRIDGE_QSA_BACKWARD_TRIM_CAUSAL_LOOP', 'auto'),
+    ).lower()
+    if mode not in {'auto', '0', '1'}:
+        raise ValueError(
+            'QSA causal-loop trimming expects one of {auto,0,1}')
+    if not causal:
+        return False
+    return sequence_extent <= 8 * logical_k if mode == 'auto' else mode == '1'
+
+
 if TRITON_AVAILABLE:
 
     @triton.jit
@@ -2220,6 +2235,147 @@ if TRITON_AVAILABLE:
         return selected, route_valid
 
     @triton.jit
+    def _qsa_emit_split64_dkv(
+        q,
+        grad_output,
+        d_score,
+        probabilities,
+        safe_selected,
+        emit_mask,
+        grad_k_base,
+        grad_v_base,
+        head_dim,
+        softmax_scale,
+        stride_dks,
+        stride_dkd,
+        stride_dvs,
+        stride_dvd,
+        HEADS_PER_KV: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        DKV_ACCUM_BF16: tl.constexpr,
+    ):
+        """Emit a 64-key derivative tile as two bounded 32-key WGMMA results."""
+
+        half_k: tl.constexpr = 32
+        d_offsets = tl.arange(0, BLOCK_D)
+        score_halves = tl.permute(
+            tl.reshape(d_score, (HEADS_PER_KV, 2, half_k)),
+            (0, 2, 1),
+        )
+        d_score_low, d_score_high = tl.split(score_halves)
+        probability_halves = tl.permute(
+            tl.reshape(probabilities, (HEADS_PER_KV, 2, half_k)),
+            (0, 2, 1),
+        )
+        probability_low, probability_high = tl.split(probability_halves)
+        selected_halves = tl.permute(
+            tl.reshape(safe_selected, (2, half_k)), (1, 0)
+        )
+        selected_low, selected_high = tl.split(selected_halves)
+        mask_halves = tl.permute(
+            tl.reshape(emit_mask, (2, half_k)), (1, 0)
+        )
+        mask_low, mask_high = tl.split(mask_halves)
+
+        grad_k_low = tl.dot(
+            tl.trans(d_score_low.to(tl.bfloat16)),
+            q,
+            out_dtype=tl.float32,
+        ) * softmax_scale
+        grad_k_low_ptrs = (
+            grad_k_base
+            + selected_low[:, None] * stride_dks
+            + d_offsets[None, :] * stride_dkd
+        )
+        if DKV_ACCUM_BF16:
+            tl.atomic_add(
+                grad_k_low_ptrs,
+                grad_k_low.to(tl.bfloat16),
+                mask=mask_low[:, None] & (d_offsets[None, :] < head_dim),
+                sem="relaxed",
+            )
+        else:
+            tl.atomic_add(
+                grad_k_low_ptrs,
+                grad_k_low,
+                mask=mask_low[:, None] & (d_offsets[None, :] < head_dim),
+                sem="relaxed",
+            )
+        grad_k_high = tl.dot(
+            tl.trans(d_score_high.to(tl.bfloat16)),
+            q,
+            out_dtype=tl.float32,
+        ) * softmax_scale
+        grad_k_high_ptrs = (
+            grad_k_base
+            + selected_high[:, None] * stride_dks
+            + d_offsets[None, :] * stride_dkd
+        )
+        if DKV_ACCUM_BF16:
+            tl.atomic_add(
+                grad_k_high_ptrs,
+                grad_k_high.to(tl.bfloat16),
+                mask=mask_high[:, None] & (d_offsets[None, :] < head_dim),
+                sem="relaxed",
+            )
+        else:
+            tl.atomic_add(
+                grad_k_high_ptrs,
+                grad_k_high,
+                mask=mask_high[:, None] & (d_offsets[None, :] < head_dim),
+                sem="relaxed",
+            )
+
+        grad_v_low = tl.dot(
+            tl.trans(probability_low.to(tl.bfloat16)),
+            grad_output.to(tl.bfloat16),
+            out_dtype=tl.float32,
+        )
+        grad_v_low_ptrs = (
+            grad_v_base
+            + selected_low[:, None] * stride_dvs
+            + d_offsets[None, :] * stride_dvd
+        )
+        if DKV_ACCUM_BF16:
+            tl.atomic_add(
+                grad_v_low_ptrs,
+                grad_v_low.to(tl.bfloat16),
+                mask=mask_low[:, None] & (d_offsets[None, :] < head_dim),
+                sem="relaxed",
+            )
+        else:
+            tl.atomic_add(
+                grad_v_low_ptrs,
+                grad_v_low,
+                mask=mask_low[:, None] & (d_offsets[None, :] < head_dim),
+                sem="relaxed",
+            )
+        grad_v_high = tl.dot(
+            tl.trans(probability_high.to(tl.bfloat16)),
+            grad_output.to(tl.bfloat16),
+            out_dtype=tl.float32,
+        )
+        grad_v_high_ptrs = (
+            grad_v_base
+            + selected_high[:, None] * stride_dvs
+            + d_offsets[None, :] * stride_dvd
+        )
+        if DKV_ACCUM_BF16:
+            tl.atomic_add(
+                grad_v_high_ptrs,
+                grad_v_high.to(tl.bfloat16),
+                mask=mask_high[:, None] & (d_offsets[None, :] < head_dim),
+                sem="relaxed",
+            )
+        else:
+            tl.atomic_add(
+                grad_v_high_ptrs,
+                grad_v_high,
+                mask=mask_high[:, None] & (d_offsets[None, :] < head_dim),
+                sem="relaxed",
+            )
+
+    @triton.jit
     def _qsa_selected_kv_forward_grouped_kernel(
         q_ptr,
         k_ptr,
@@ -2268,6 +2424,7 @@ if TRITON_AVAILABLE:
         BLOCK_K: tl.constexpr,
         BLOCK_D: tl.constexpr,
         CAUSAL: tl.constexpr,
+        TRIM_CAUSAL_LOOP: tl.constexpr,
         ROUTE_SLOTS: tl.constexpr,
         ROUTE_BLOCK_SIZE: tl.constexpr,
     ):
@@ -2293,7 +2450,10 @@ if TRITON_AVAILABLE:
         denominator = tl.zeros((HEADS_PER_KV,), dtype=tl.float32)
         accumulator = tl.zeros((HEADS_PER_KV, BLOCK_D), dtype=tl.float32)
 
-        for key_start in tl.range(0, K, BLOCK_K):
+        loop_end = K
+        if TRIM_CAUSAL_LOOP:
+            loop_end = tl.minimum(length, K)
+        for key_start in tl.range(0, loop_end, BLOCK_K):
             key_offsets = key_start + tl.arange(0, BLOCK_K)
             selected, route_valid = _qsa_load_route_tokens(
                 index_ptr + batch * stride_ib + query * stride_is,
@@ -2410,6 +2570,7 @@ if TRITON_AVAILABLE:
         BLOCK_K: tl.constexpr,
         BLOCK_D: tl.constexpr,
         CAUSAL: tl.constexpr,
+        TRIM_CAUSAL_LOOP: tl.constexpr,
         ROUTE_SLOTS: tl.constexpr,
         ROUTE_BLOCK_SIZE: tl.constexpr,
     ):
@@ -2445,7 +2606,10 @@ if TRITON_AVAILABLE:
         denominator = tl.zeros((HEADS_PER_KV,), dtype=tl.float32)
         accumulator = tl.zeros((HEADS_PER_KV, BLOCK_D), dtype=tl.float32)
 
-        for key_offset_start in tl.range(0, K, BLOCK_K):
+        loop_end = K
+        if TRIM_CAUSAL_LOOP:
+            loop_end = tl.minimum(length, K)
+        for key_offset_start in tl.range(0, loop_end, BLOCK_K):
             key_offsets = key_offset_start + tl.arange(0, BLOCK_K)
             selected, route_valid = _qsa_load_route_tokens(
                 index_ptr + token * stride_it,
@@ -2615,6 +2779,7 @@ if TRITON_AVAILABLE:
         USE_OUTPUT_DELTA: tl.constexpr,
         DKV_ACCUM_BF16: tl.constexpr,
         TENSORIZE_DERIVATIVES: tl.constexpr,
+        TRIM_CAUSAL_LOOP: tl.constexpr,
         ROUTE_SLOTS: tl.constexpr,
         ROUTE_BLOCK_SIZE: tl.constexpr,
         SEGMENT_BLOCK_TOPK: tl.constexpr,
@@ -2679,7 +2844,12 @@ if TRITON_AVAILABLE:
             correction = tl.sum(output * grad_output, axis=1)
         else:
             correction = tl.zeros((HEADS_PER_KV,), dtype=tl.float32)
-            for key_start in tl.range(0, K, CORRECTION_BLOCK_K):
+            correction_loop_end = K
+            if TRIM_CAUSAL_LOOP:
+                correction_loop_end = tl.minimum(length, K)
+            for key_start in tl.range(
+                0, correction_loop_end, CORRECTION_BLOCK_K
+            ):
                 key_offsets = key_start + tl.arange(0, CORRECTION_BLOCK_K)
                 selected, route_valid = _qsa_load_route_tokens(
                     index_ptr + batch * stride_ib + query * stride_is,
@@ -2733,7 +2903,10 @@ if TRITON_AVAILABLE:
             tl.store(correction_ptrs, correction, mask=head_valid)
 
         grad_q = tl.zeros((HEADS_PER_KV, BLOCK_D), dtype=tl.float32)
-        for key_start in tl.range(0, K, BLOCK_K):
+        loop_end = K
+        if TRIM_CAUSAL_LOOP:
+            loop_end = tl.minimum(length, K)
+        for key_start in tl.range(0, loop_end, BLOCK_K):
             key_offsets = key_start + tl.arange(0, BLOCK_K)
             selected, route_valid = _qsa_load_route_tokens(
                 index_ptr + batch * stride_ib + query * stride_is,
@@ -2791,64 +2964,98 @@ if TRITON_AVAILABLE:
                 # this dQ/correction kernel.  The small causal tail has a
                 # dedicated kernel below; otherwise the segmented reducer is
                 # the sole producer of complete-block dK/dV.
-                if TENSORIZE_DERIVATIVES:
+                if TENSORIZE_DERIVATIVES and BLOCK_K == 64:
+                    _qsa_emit_split64_dkv(
+                        q,
+                        grad_output,
+                        d_score,
+                        probabilities,
+                        safe_selected,
+                        emit_mask,
+                        grad_k_ptr
+                        + batch * stride_dkb
+                        + kv_head * stride_dkh,
+                        grad_v_ptr
+                        + batch * stride_dvb
+                        + kv_head * stride_dvh,
+                        head_dim,
+                        softmax_scale,
+                        stride_dks,
+                        stride_dkd,
+                        stride_dvs,
+                        stride_dvd,
+                        HEADS_PER_KV,
+                        BLOCK_D,
+                        DKV_ACCUM_BF16,
+                    )
+                elif TENSORIZE_DERIVATIVES:
                     grad_k = tl.dot(
                         tl.trans(d_score.to(tl.bfloat16)),
                         q,
                         out_dtype=tl.float32,
                     ) * softmax_scale
-                    grad_v = tl.dot(
-                        tl.trans(probabilities.to(tl.bfloat16)),
-                        grad_output.to(tl.bfloat16),
-                        out_dtype=tl.float32,
-                    )
                 else:
                     grad_k = tl.sum(
                         d_score[:, :, None] * q[:, None, :], axis=0
                     ) * softmax_scale
-                    grad_v = tl.sum(
-                        probabilities[:, :, None] * grad_output[:, None, :], axis=0
+                if not (TENSORIZE_DERIVATIVES and BLOCK_K == 64):
+                    grad_k_ptrs = (
+                        grad_k_ptr
+                        + batch * stride_dkb
+                        + safe_selected[:, None] * stride_dks
+                        + kv_head * stride_dkh
+                        + d_offsets[None, :] * stride_dkd
                     )
-                grad_k_ptrs = (
-                    grad_k_ptr
-                    + batch * stride_dkb
-                    + safe_selected[:, None] * stride_dks
-                    + kv_head * stride_dkh
-                    + d_offsets[None, :] * stride_dkd
-                )
-                grad_v_ptrs = (
-                    grad_v_ptr
-                    + batch * stride_dvb
-                    + safe_selected[:, None] * stride_dvs
-                    + kv_head * stride_dvh
-                    + d_offsets[None, :] * stride_dvd
-                )
-                if DKV_ACCUM_BF16:
-                    tl.atomic_add(
-                        grad_k_ptrs,
-                        grad_k.to(tl.bfloat16),
-                        mask=emit_mask[:, None] & (d_offsets[None, :] < head_dim),
-                        sem="relaxed",
+                    if DKV_ACCUM_BF16:
+                        tl.atomic_add(
+                            grad_k_ptrs,
+                            grad_k.to(tl.bfloat16),
+                            mask=emit_mask[:, None] & (d_offsets[None, :] < head_dim),
+                            sem="relaxed",
+                        )
+                    else:
+                        tl.atomic_add(
+                            grad_k_ptrs,
+                            grad_k,
+                            mask=emit_mask[:, None] & (d_offsets[None, :] < head_dim),
+                            sem="relaxed",
+                        )
+
+                    # Retire the dK tensor-core result before creating dV.  The
+                    # two [BLOCK_K, D] FP32 accumulators otherwise overlap their
+                    # live ranges and force the SM90 kernel to its 255-register
+                    # ceiling even though their atomics are already serialized.
+                    if TENSORIZE_DERIVATIVES:
+                        grad_v = tl.dot(
+                            tl.trans(probabilities.to(tl.bfloat16)),
+                            grad_output.to(tl.bfloat16),
+                            out_dtype=tl.float32,
+                        )
+                    else:
+                        grad_v = tl.sum(
+                            probabilities[:, :, None] * grad_output[:, None, :], axis=0
+                        )
+                    grad_v_ptrs = (
+                        grad_v_ptr
+                        + batch * stride_dvb
+                        + safe_selected[:, None] * stride_dvs
+                        + kv_head * stride_dvh
+                        + d_offsets[None, :] * stride_dvd
                     )
-                    tl.atomic_add(
-                        grad_v_ptrs,
-                        grad_v.to(tl.bfloat16),
-                        mask=emit_mask[:, None] & (d_offsets[None, :] < head_dim),
-                        sem="relaxed",
-                    )
-                else:
-                    tl.atomic_add(
-                        grad_k_ptrs,
-                        grad_k,
-                        mask=emit_mask[:, None] & (d_offsets[None, :] < head_dim),
-                        sem="relaxed",
-                    )
-                    tl.atomic_add(
-                        grad_v_ptrs,
-                        grad_v,
-                        mask=emit_mask[:, None] & (d_offsets[None, :] < head_dim),
-                        sem="relaxed",
-                    )
+                    if DKV_ACCUM_BF16:
+                        tl.atomic_add(
+                            grad_v_ptrs,
+                            grad_v.to(tl.bfloat16),
+                            mask=emit_mask[:, None] & (d_offsets[None, :] < head_dim),
+                            sem="relaxed",
+                        )
+                    else:
+                        tl.atomic_add(
+                            grad_v_ptrs,
+                            grad_v,
+                            mask=emit_mask[:, None] & (d_offsets[None, :] < head_dim),
+                            sem="relaxed",
+                        )
 
         grad_q_ptrs = (grad_q_ptr + batch * stride_dqb + query * stride_dqs + heads[:, None] * stride_dqh +
                        d_offsets[None, :] * stride_dqd)
@@ -2925,6 +3132,7 @@ if TRITON_AVAILABLE:
         USE_OUTPUT_DELTA: tl.constexpr,
         DKV_ACCUM_BF16: tl.constexpr,
         TENSORIZE_DERIVATIVES: tl.constexpr,
+        TRIM_CAUSAL_LOOP: tl.constexpr,
         ROUTE_SLOTS: tl.constexpr,
         ROUTE_BLOCK_SIZE: tl.constexpr,
     ):
@@ -2995,7 +3203,12 @@ if TRITON_AVAILABLE:
             correction = tl.sum(output * grad_output, axis=1)
         else:
             correction = tl.zeros((HEADS_PER_KV,), dtype=tl.float32)
-            for key_offset_start in tl.range(0, K, CORRECTION_BLOCK_K):
+            correction_loop_end = K
+            if TRIM_CAUSAL_LOOP:
+                correction_loop_end = tl.minimum(length, K)
+            for key_offset_start in tl.range(
+                0, correction_loop_end, CORRECTION_BLOCK_K
+            ):
                 key_offsets = key_offset_start + tl.arange(0, CORRECTION_BLOCK_K)
                 selected, route_valid = _qsa_load_route_tokens(
                     index_ptr + token * stride_it,
@@ -3054,7 +3267,10 @@ if TRITON_AVAILABLE:
                 correction += tl.sum(probabilities * d_probability, axis=1)
 
         grad_q = tl.zeros((HEADS_PER_KV, BLOCK_D), dtype=tl.float32)
-        for key_offset_start in tl.range(0, K, BLOCK_K):
+        loop_end = K
+        if TRIM_CAUSAL_LOOP:
+            loop_end = tl.minimum(length, K)
+        for key_offset_start in tl.range(0, loop_end, BLOCK_K):
             key_offsets = key_offset_start + tl.arange(0, BLOCK_K)
             selected, route_valid = _qsa_load_route_tokens(
                 index_ptr + token * stride_it,
@@ -3116,7 +3332,30 @@ if TRITON_AVAILABLE:
             )
             d_score = tl.where(
                 valid[None, :] & head_valid[:, None], d_score, 0.0)
-            if TENSORIZE_DERIVATIVES:
+            if TENSORIZE_DERIVATIVES and BLOCK_K == 64:
+                grad_q += tl.dot(
+                    d_score.to(tl.bfloat16), k, out_dtype=tl.float32
+                ) * softmax_scale
+                _qsa_emit_split64_dkv(
+                    q,
+                    grad_output,
+                    d_score,
+                    probabilities,
+                    safe_selected,
+                    valid,
+                    grad_k_ptr + kv_head * stride_dkh,
+                    grad_v_ptr + kv_head * stride_dvh,
+                    head_dim,
+                    softmax_scale,
+                    stride_dkt,
+                    stride_dkd,
+                    stride_dvt,
+                    stride_dvd,
+                    HEADS_PER_KV,
+                    BLOCK_D,
+                    DKV_ACCUM_BF16,
+                )
+            elif TENSORIZE_DERIVATIVES:
                 grad_q += tl.dot(
                     d_score.to(tl.bfloat16), k, out_dtype=tl.float32
                 ) * softmax_scale
@@ -3140,44 +3379,45 @@ if TRITON_AVAILABLE:
                 grad_v = tl.sum(
                     probabilities[:, :, None] * grad_output[:, None, :], axis=0
                 )
-            grad_k_ptrs = (
-                grad_k_ptr
-                + safe_selected[:, None] * stride_dkt
-                + kv_head * stride_dkh
-                + d_offsets[None, :] * stride_dkd
-            )
-            grad_v_ptrs = (
-                grad_v_ptr
-                + safe_selected[:, None] * stride_dvt
-                + kv_head * stride_dvh
-                + d_offsets[None, :] * stride_dvd
-            )
-            if DKV_ACCUM_BF16:
-                tl.atomic_add(
-                    grad_k_ptrs,
-                    grad_k.to(tl.bfloat16),
-                    mask=valid[:, None] & (d_offsets[None, :] < head_dim),
-                    sem="relaxed",
+            if not (TENSORIZE_DERIVATIVES and BLOCK_K == 64):
+                grad_k_ptrs = (
+                    grad_k_ptr
+                    + safe_selected[:, None] * stride_dkt
+                    + kv_head * stride_dkh
+                    + d_offsets[None, :] * stride_dkd
                 )
-                tl.atomic_add(
-                    grad_v_ptrs,
-                    grad_v.to(tl.bfloat16),
-                    mask=valid[:, None] & (d_offsets[None, :] < head_dim),
-                    sem="relaxed",
+                grad_v_ptrs = (
+                    grad_v_ptr
+                    + safe_selected[:, None] * stride_dvt
+                    + kv_head * stride_dvh
+                    + d_offsets[None, :] * stride_dvd
                 )
-            else:
-                tl.atomic_add(
-                    grad_k_ptrs,
-                    grad_k,
-                    mask=valid[:, None] & (d_offsets[None, :] < head_dim),
-                    sem="relaxed",
-                )
-                tl.atomic_add(
-                    grad_v_ptrs,
-                    grad_v,
-                    mask=valid[:, None] & (d_offsets[None, :] < head_dim),
-                    sem="relaxed",
-                )
+                if DKV_ACCUM_BF16:
+                    tl.atomic_add(
+                        grad_k_ptrs,
+                        grad_k.to(tl.bfloat16),
+                        mask=valid[:, None] & (d_offsets[None, :] < head_dim),
+                        sem="relaxed",
+                    )
+                    tl.atomic_add(
+                        grad_v_ptrs,
+                        grad_v.to(tl.bfloat16),
+                        mask=valid[:, None] & (d_offsets[None, :] < head_dim),
+                        sem="relaxed",
+                    )
+                else:
+                    tl.atomic_add(
+                        grad_k_ptrs,
+                        grad_k,
+                        mask=valid[:, None] & (d_offsets[None, :] < head_dim),
+                        sem="relaxed",
+                    )
+                    tl.atomic_add(
+                        grad_v_ptrs,
+                        grad_v,
+                        mask=valid[:, None] & (d_offsets[None, :] < head_dim),
+                        sem="relaxed",
+                    )
 
         grad_q_ptrs = (
             grad_q_ptr
@@ -5705,7 +5945,16 @@ def qsa_selected_kv_forward(query: torch.Tensor, key: torch.Tensor, value: torch
     # a 65,536-row sequence cannot be placed directly on grid.y (max 65,535).
     grid = (batch * sq, num_kv_heads * num_head_tiles)
     block_d = max(16, triton.next_power_of_2(head_dim))
-    block_k = int(os.environ.get('MCORE_BRIDGE_QSA_FORWARD_BLOCK_K', '16'))
+    # The wider SM90 tile amortizes compact-route decode and online-softmax
+    # bookkeeping while still fitting three 4-warp CTAs per SM (166 registers
+    # and about 76 KiB shared memory on the production D=256 shape).
+    default_block_k = (
+        64
+        if head_tile_size == 16 and head_dim == 256 and is_sm90(query.device)
+        else 16
+    )
+    block_k = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_FORWARD_BLOCK_K', str(default_block_k)))
     if block_k not in {8, 16, 32, 64, 128}:
         raise ValueError('QSA forward BLOCK_K expects one of {8,16,32,64,128}')
     default_num_warps = min(4, max(1, head_tile_size // 4))
@@ -5731,6 +5980,7 @@ def qsa_selected_kv_forward(query: torch.Tensor, key: torch.Tensor, value: torch
     }
     if forward_maxnreg:
         launch_options['maxnreg'] = forward_maxnreg
+    trim_causal_loop = _qsa_trim_causal_loop(causal, sq, k_slots)
     _qsa_selected_kv_forward_grouped_kernel[grid](
         query,
         key,
@@ -5779,6 +6029,7 @@ def qsa_selected_kv_forward(query: torch.Tensor, key: torch.Tensor, value: torch
         BLOCK_K=block_k,
         BLOCK_D=block_d,
         CAUSAL=causal,
+        TRIM_CAUSAL_LOOP=trim_causal_loop,
         ROUTE_SLOTS=route_slots,
         ROUTE_BLOCK_SIZE=route_block_size,
         **launch_options,
@@ -5853,7 +6104,13 @@ def qsa_selected_kv_forward_packed(
         raise ValueError('QSA packed forward head tile expects one of {1,2,4,8,16}')
     num_head_tiles = triton.cdiv(group_size, head_tile_size)
     block_d = max(16, triton.next_power_of_2(head_dim))
-    block_k = int(os.environ.get('MCORE_BRIDGE_QSA_FORWARD_BLOCK_K', '16'))
+    default_block_k = (
+        64
+        if head_tile_size == 16 and head_dim == 256 and is_sm90(query.device)
+        else 16
+    )
+    block_k = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_FORWARD_BLOCK_K', str(default_block_k)))
     if block_k not in {8, 16, 32, 64, 128}:
         raise ValueError('QSA packed forward BLOCK_K expects one of {8,16,32,64,128}')
     default_num_warps = min(4, max(1, head_tile_size // 4))
@@ -5878,6 +6135,9 @@ def qsa_selected_kv_forward_packed(
     }
     if forward_maxnreg:
         launch_options['maxnreg'] = forward_maxnreg
+    # As in packed backward, total_q is conservative and avoids reading a
+    # GPU-resident maximum document length onto the host.
+    trim_causal_loop = _qsa_trim_causal_loop(causal, total_q, logical_k)
     _qsa_selected_kv_forward_packed_grouped_kernel[
         (total_q, num_kv_heads * num_head_tiles)
     ](
@@ -5925,6 +6185,7 @@ def qsa_selected_kv_forward_packed(
         BLOCK_K=block_k,
         BLOCK_D=block_d,
         CAUSAL=causal,
+        TRIM_CAUSAL_LOOP=trim_causal_loop,
         ROUTE_SLOTS=route_slots,
         ROUTE_BLOCK_SIZE=route_block_size,
         **launch_options,
@@ -6579,7 +6840,6 @@ def qsa_selected_kv_backward(
         group_size >= 5
         and head_dim >= 64
         and dkv_accum_dtype == 'bf16'
-        and not use_segmented_reduction
     )
     default_head_tile = 16 if tensorized_default else min(
         4, 1 << max(0, group_size - 1).bit_length())
@@ -6587,13 +6847,27 @@ def qsa_selected_kv_backward(
         'MCORE_BRIDGE_QSA_BACKWARD_HEAD_TILE', str(default_head_tile)))
     if head_tile_size not in {1, 2, 4, 8, 16}:
         raise ValueError('QSA backward head tile expects one of {1,2,4,8,16}')
+    tensorized_tile = (
+        head_tile_size >= 16
+        and head_dim >= 64
+        and dkv_accum_dtype == 'bf16'
+    )
     num_head_tiles = triton.cdiv(group_size, head_tile_size)
     grid = (batch * sq, num_kv_heads * num_head_tiles)
     block_d = max(16, triton.next_power_of_2(head_dim))
-    # A 32-token tensor tile amortizes route decode and loop overhead without
-    # reducing occupancy on the production H100 GQA shape.  The previous
-    # 16-token default left ~15% backward throughput on the table at 4K.
-    default_block_k = 32 if tensorized_default else 8
+    # Split-64 removes loop/decode overhead while the causal prefix is short.
+    # At long context it concentrates too many atomics from one CTA on the hot
+    # KV rows produced by the real indexer, so production falls back to K32.
+    default_block_k = (
+        64
+        if (
+            tensorized_tile
+            and head_dim == 256
+            and is_sm90(query.device)
+            and sq <= 8 * logical_k
+        )
+        else 32 if tensorized_tile else 8
+    )
     block_k = int(os.environ.get(
         'MCORE_BRIDGE_QSA_BACKWARD_BLOCK_K', str(default_block_k)))
     if block_k not in {4, 8, 16, 32, 64, 128}:
@@ -6603,15 +6877,21 @@ def qsa_selected_kv_backward(
     if correction_block_k not in {4, 8, 16, 32, 64, 128}:
         raise ValueError(
             'QSA backward correction BLOCK_K expects one of {4,8,16,32,64,128}')
-    default_num_warps = 4 if tensorized_default else 1
+    tensorize_derivatives = tensorized_tile and block_k >= 16
+    default_num_warps = 4 if tensorize_derivatives else 1
     backward_num_warps = int(os.environ.get(
         'MCORE_BRIDGE_QSA_BACKWARD_WARPS', str(default_num_warps)))
-    default_num_stages = 2 if tensorized_default else 1
+    default_num_stages = 2 if tensorize_derivatives else 1
     backward_num_stages = int(os.environ.get(
         'MCORE_BRIDGE_QSA_BACKWARD_STAGES', str(default_num_stages)))
     if backward_num_warps not in {1, 2, 4, 8} or backward_num_stages not in {1, 2, 3, 4}:
         raise ValueError(
             'QSA backward tuning expects warps in {1,2,4,8} and stages in {1,2,3,4}')
+    # A runtime loop bound avoids masked tensor-core work for the causal
+    # prefix, but also prevents Triton from fully static-pipelining the loop.
+    # The saved work wins when the sequence is roughly no longer than 8*K;
+    # long sequences keep the faster compile-time K bound.
+    trim_causal_loop = _qsa_trim_causal_loop(causal, sq, logical_k)
     _qsa_selected_kv_backward_grouped_kernel[grid](
         query,
         key,
@@ -6705,12 +6985,8 @@ def qsa_selected_kv_backward(
         # dedicated tail launch below; keeping EMIT_DKV false here removes
         # the otherwise duplicated complete-block reductions.
         EMIT_DKV=not use_segmented_reduction,
-        TENSORIZE_DERIVATIVES=(
-            head_tile_size >= 16
-            and block_k >= 16
-            and dkv_accum_dtype == 'bf16'
-            and not use_segmented_reduction
-        ),
+        TENSORIZE_DERIVATIVES=tensorize_derivatives,
+        TRIM_CAUSAL_LOOP=trim_causal_loop,
         ROUTE_SLOTS=route_slots,
         ROUTE_BLOCK_SIZE=route_block_size,
         num_warps=backward_num_warps,
@@ -6876,9 +7152,14 @@ def qsa_selected_kv_backward_packed(
         'MCORE_BRIDGE_QSA_BACKWARD_HEAD_TILE', str(default_head_tile)))
     if head_tile_size not in {1, 2, 4, 8, 16}:
         raise ValueError('QSA packed backward head tile expects one of {1,2,4,8,16}')
+    tensorized_tile = (
+        head_tile_size >= 16
+        and head_dim >= 64
+        and dkv_accum_dtype == 'bf16'
+    )
     num_head_tiles = triton.cdiv(group_size, head_tile_size)
     block_d = max(16, triton.next_power_of_2(head_dim))
-    default_block_k = 32 if tensorized_default else 8
+    default_block_k = 32 if tensorized_tile else 8
     block_k = int(os.environ.get(
         'MCORE_BRIDGE_QSA_BACKWARD_BLOCK_K', str(default_block_k)))
     if block_k not in {4, 8, 16, 32, 64, 128}:
@@ -6888,14 +7169,19 @@ def qsa_selected_kv_backward_packed(
     if correction_block_k not in {4, 8, 16, 32, 64, 128}:
         raise ValueError(
             'QSA packed backward correction BLOCK_K expects one of {4,8,16,32,64,128}')
-    default_num_warps = 4 if tensorized_default else 1
+    tensorize_derivatives = tensorized_tile and block_k >= 16
+    default_num_warps = 4 if tensorize_derivatives else 1
     num_warps = int(os.environ.get(
         'MCORE_BRIDGE_QSA_BACKWARD_WARPS', str(default_num_warps)))
-    default_num_stages = 2 if tensorized_default else 1
+    default_num_stages = 2 if tensorize_derivatives else 1
     num_stages = int(os.environ.get(
         'MCORE_BRIDGE_QSA_BACKWARD_STAGES', str(default_num_stages)))
     if num_warps not in {1, 2, 4, 8} or num_stages not in {1, 2, 3, 4}:
         raise ValueError('QSA packed backward tuning has invalid warps/stages')
+    # total_q is a conservative proxy for the longest packed document.  It
+    # enables the profitable short-document variant without synchronizing on
+    # GPU-resident per-token key lengths.
+    trim_causal_loop = _qsa_trim_causal_loop(causal, total_q, logical_k)
     _qsa_selected_kv_backward_packed_grouped_kernel[
         (total_q, num_kv_heads * num_head_tiles)
     ](
@@ -6967,11 +7253,8 @@ def qsa_selected_kv_backward_packed(
         HAS_GRAD_LSE=grad_lse_present,
         USE_OUTPUT_DELTA=use_output_delta,
         DKV_ACCUM_BF16=dkv_accum_dtype == 'bf16',
-        TENSORIZE_DERIVATIVES=(
-            head_tile_size >= 16
-            and block_k >= 16
-            and dkv_accum_dtype == 'bf16'
-        ),
+        TENSORIZE_DERIVATIVES=tensorize_derivatives,
+        TRIM_CAUSAL_LOOP=trim_causal_loop,
         ROUTE_SLOTS=route_slots,
         ROUTE_BLOCK_SIZE=route_block_size,
         num_warps=num_warps,

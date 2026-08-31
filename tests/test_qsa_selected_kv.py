@@ -231,6 +231,74 @@ def test_triton_packed_varlen_backward_matches_torch_on_sm90():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_triton_packed_split64_backward_matches_torch_on_sm90(monkeypatch):
+    """Cover the explicit packed K64 derivative-subtile tuning path."""
+
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('requires H100/SM90')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_BACKWARD_HEAD_TILE', '16')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_BACKWARD_BLOCK_K', '64')
+
+    torch.manual_seed(762)
+    device = 'cuda'
+    segments = (17, 11)
+    total = sum(segments)
+    hq, hkv, dim, slots = 24, 2, 256, 67
+    query_base = torch.randn(
+        total, hq, dim, device=device, dtype=torch.bfloat16)
+    key_base = torch.randn(
+        total, hkv, dim, device=device, dtype=torch.bfloat16)
+    value_base = torch.randn_like(key_base)
+    cu = torch.tensor([0, segments[0], total], device=device, dtype=torch.int32)
+    indices = torch.full(
+        (1, total, slots), -1, device=device, dtype=torch.int32)
+    lengths = torch.zeros((1, total), device=device, dtype=torch.int32)
+    offset = 0
+    for segment_length in segments:
+        for row in range(segment_length):
+            count = row + 1
+            values = torch.arange(count, device=device, dtype=torch.int32)
+            if count >= 5:
+                values[-2:] = values[1]
+            indices[0, offset + row, :count] = values
+            lengths[0, offset + row] = count
+        offset += segment_length
+    grad_output = torch.randn_like(query_base)
+    grad_lse = torch.randn(
+        1, hq, total, device=device, dtype=torch.float32)
+
+    def run(backend):
+        query = query_base.detach().clone().requires_grad_()
+        key = key_base.detach().clone().requires_grad_()
+        value = value_base.detach().clone().requires_grad_()
+        output, lse = qsa_sparse_forward_packed(
+            query,
+            key,
+            value,
+            indices,
+            lengths,
+            cu,
+            cu,
+            backend=backend,
+            dkv_accum_dtype='bf16',
+        )
+        ((output.float() * grad_output.float()).sum()
+         + (lse * grad_lse).sum()).backward()
+        return output.detach(), lse.detach(), query.grad, key.grad, value.grad
+
+    torch_result = run('torch')
+    triton_result = run('triton')
+    assert torch.allclose(
+        triton_result[0].float(), torch_result[0].float(), atol=2e-2, rtol=2e-2)
+    assert torch.allclose(
+        triton_result[1], torch_result[1], atol=2e-2, rtol=2e-2)
+    for triton_grad, torch_grad in zip(triton_result[2:], torch_result[2:]):
+        assert torch.isfinite(triton_grad).all()
+        assert torch.allclose(
+            triton_grad.float(), torch_grad.float(), atol=0.125, rtol=0.1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
 def test_triton_packed_indexer_direct_fill_matches_segment_contract_on_sm90():
     if torch.cuda.get_device_capability() != (9, 0):
         pytest.skip('requires H100/SM90')
