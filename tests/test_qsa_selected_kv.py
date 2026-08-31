@@ -21,6 +21,7 @@ from mcore_bridge.model.modules.qsa_triton import (
     qsa_expand_compact_route_triton,
     qsa_indexer_fused_topk_packed,
     qsa_indexer_fused_topk_with_ratio,
+    qsa_indexer_slab_topk_with_ratio,
 )
 from mcore_bridge.model.gpts.qwen4_exp import Qwen4ExpLayer
 
@@ -1159,6 +1160,61 @@ def test_triton_fused_indexer_large_budget_prefix_on_sm90():
                        (row + 1 - ((row + 1) // ratio) * ratio)],
                 torch.arange((row + 1) // ratio * ratio, row + 1,
                              device=device, dtype=torch.int32))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_triton_indexer_score_slab_matches_streaming_sets_on_sm90():
+    """Guard the production query-tiled score/Top-K route and tie fallback."""
+
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('requires H100/SM90')
+    torch.manual_seed(241)
+    device = 'cuda'
+    seq_len, ratio, block_topk = 4096, 4, 512
+    batch = 2
+    q = torch.randn(
+        batch, seq_len, 4, 128, device=device, dtype=torch.bfloat16)
+    block_keys = torch.randn(
+        batch, seq_len // ratio, 128, device=device, dtype=torch.bfloat16)
+    positions = torch.arange(seq_len, device=device, dtype=torch.int32)
+    expected = qsa_indexer_fused_topk_with_ratio(
+        q, block_keys, positions, ratio, block_topk, return_block_ids=True)
+    actual = qsa_indexer_slab_topk_with_ratio(
+        q, block_keys, positions, ratio, block_topk)
+    assert torch.equal(
+        torch.sort(actual, dim=-1).values,
+        torch.sort(expected, dim=-1).values,
+    )
+
+    # The production path must not synchronize through ``.item()`` or build a
+    # host-side ambiguous-row list: both would make capture fail.  Replaying
+    # the captured score/Top-K/tie-mask sequence must retain the exact set.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = qsa_indexer_slab_topk_with_ratio(
+            q, block_keys, positions, ratio, block_topk,
+            validate_positions=False,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(
+        torch.sort(captured, dim=-1).values,
+        torch.sort(expected, dim=-1).values,
+    )
+
+    # Equal scores cross the K/K+1 boundary on every saturated row.  Those
+    # rows must take the deterministic packed-key fallback and keep the lower
+    # block IDs, rather than inheriting CUDA Top-K's unspecified tie order.
+    tied = qsa_indexer_slab_topk_with_ratio(
+        torch.zeros_like(q),
+        torch.zeros_like(block_keys),
+        positions,
+        ratio,
+        block_topk,
+    )
+    expected_tie_ids = torch.arange(
+        block_topk, device=device, dtype=torch.int32).expand(batch, -1)
+    assert torch.equal(torch.sort(tied[:, -1]).values, expected_tie_ids)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')

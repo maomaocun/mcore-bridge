@@ -272,6 +272,7 @@ class QSAIndexer(nn.Module):
         query_tile_size: int,
         key_tile_size: int,
         return_block_ids: bool = False,
+        dense_zero_based: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Top-k merge for projected queries and globally indexed block keys.
 
@@ -337,7 +338,45 @@ class QSAIndexer(nn.Module):
                 block_topk > 0 and (block_topk & (block_topk - 1)) == 0 and
                 ratio >= 2 and
                 os.environ.get('MCORE_BRIDGE_QSA_INDEXER_FUSED', '1') != '0'):
-            from .qsa_triton import qsa_indexer_fused_topk_with_ratio
+            from .qsa_triton import (
+                is_sm90,
+                qsa_indexer_fused_topk_with_ratio,
+                qsa_indexer_slab_topk_with_ratio,
+            )
+
+            # The production Qwen shape benefits from scoring query rows in
+            # tensor-core tiles and selecting each bounded FP32 slab with
+            # CUDA Top-K.  Packed documents and CP use non-contiguous logical
+            # positions, so they retain the segment-aware streaming kernels.
+            use_score_slabs = (
+                return_block_ids
+                and block_topk == 512
+                and ratio == 4
+                and q.shape[2:] == (4, 128)
+                and dense_zero_based
+                and is_sm90(q.device)
+                and os.environ.get(
+                    'MCORE_BRIDGE_QSA_INDEXER_SCORE_SLAB', '1') != '0'
+            )
+            if use_score_slabs:
+                max_score_mb = int(os.environ.get(
+                    'MCORE_BRIDGE_QSA_INDEXER_SCORE_SLAB_MB', '512'))
+                if max_score_mb <= 0:
+                    raise ValueError(
+                        'MCORE_BRIDGE_QSA_INDEXER_SCORE_SLAB_MB must be positive')
+                boundary_guard = float(os.environ.get(
+                    'MCORE_BRIDGE_QSA_INDEXER_SCORE_BOUNDARY_GUARD', '0'))
+                selected_blocks = qsa_indexer_slab_topk_with_ratio(
+                    q.contiguous(),
+                    block_keys.contiguous(),
+                    query_positions,
+                    ratio,
+                    block_topk,
+                    max_score_bytes=max_score_mb * 2**20,
+                    boundary_guard=boundary_guard,
+                    validate_positions=False,
+                )
+                return selected_blocks, topk_length
 
             max_partial_mb = int(os.environ.get(
                 'MCORE_BRIDGE_QSA_INDEXER_MAX_PARTIAL_MB', '64'))
@@ -455,7 +494,8 @@ class QSAIndexer(nn.Module):
             q, block_keys, query_positions, backend,
             query_tile_size or getattr(self.config, 'qsa_indexer_query_tile_size', 128),
             key_tile_size or getattr(self.config, 'qsa_indexer_key_tile_size', 512),
-            return_block_ids=return_block_ids)
+            return_block_ids=return_block_ids,
+            dense_zero_based=True)
 
     @staticmethod
     def _slice_packed_freqs(freqs, start: int, end: int, length: int, total_length: int):

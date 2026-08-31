@@ -139,6 +139,108 @@ if TRITON_AVAILABLE:
         tl.store(out_ptrs, scores, mask=block_offsets < output_num_blocks)
 
     @triton.jit
+    def _qsa_indexer_score_batched_kernel(
+        q_ptr,
+        block_key_ptr,
+        out_ptr,
+        query_position_ptr,
+        seq_len,
+        num_blocks,
+        num_heads,
+        head_dim,
+        indexer_scale,
+        compress_ratio,
+        stride_qp,
+        stride_qb,
+        stride_qs,
+        stride_qh,
+        stride_qd,
+        stride_bb,
+        stride_bs,
+        stride_bd,
+        stride_ob,
+        stride_os,
+        stride_ok,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        """Materialize one bounded QSA score slab with query-side K reuse.
+
+        Unlike the compatibility scorer above, one CTA owns ``BLOCK_M``
+        queries and reuses each compressed-key tile across them.  ReLU and
+        the index-head reduction are fused before the FP32 score is written,
+        so the workspace is ``[B, Q, N]`` rather than ``[B, H*Q, N]``.
+        """
+
+        query_tile = tl.program_id(0)
+        block_tile = tl.program_id(1)
+        batch = tl.program_id(2)
+        query_offsets = query_tile * BLOCK_M + tl.arange(0, BLOCK_M)
+        block_offsets = block_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+        query_valid = query_offsets < seq_len
+        block_valid = block_offsets < num_blocks
+        query_positions = tl.load(
+            query_position_ptr + query_offsets * stride_qp,
+            mask=query_valid,
+            other=-1,
+        ).to(tl.int32)
+        complete_blocks = (query_positions + 1) // compress_ratio
+        score_valid = (
+            query_valid[:, None]
+            & block_valid[None, :]
+            & (block_offsets[None, :] < complete_blocks[:, None])
+        )
+
+        head_offsets = tl.arange(0, BLOCK_H)
+        dim_offsets = tl.arange(0, BLOCK_D)
+        q_ptrs = (
+            q_ptr
+            + batch * stride_qb
+            + query_offsets[:, None, None] * stride_qs
+            + head_offsets[None, :, None] * stride_qh
+            + dim_offsets[None, None, :] * stride_qd
+        )
+        q = tl.load(
+            q_ptrs,
+            mask=query_valid[:, None, None]
+            & (head_offsets[None, :, None] < num_heads)
+            & (dim_offsets[None, None, :] < head_dim),
+            other=0.0,
+        )
+        q = tl.reshape(q, (BLOCK_M * BLOCK_H, BLOCK_D))
+        k_ptrs = (
+            block_key_ptr
+            + batch * stride_bb
+            + dim_offsets[:, None] * stride_bd
+            + block_offsets[None, :] * stride_bs
+        )
+        keys = tl.load(
+            k_ptrs,
+            mask=(dim_offsets[:, None] < head_dim) & block_valid[None, :],
+            other=0.0,
+        )
+        dots = tl.dot(q, keys, out_dtype=tl.float32)
+        dots = tl.reshape(dots, (BLOCK_M, BLOCK_H, BLOCK_N))
+        head_valid = head_offsets[None, :, None] < num_heads
+        scores = tl.sum(
+            tl.where(head_valid, tl.maximum(dots, 0.0), 0.0), axis=1)
+        scores *= indexer_scale
+        scores = tl.where(score_valid, scores, -float("inf"))
+        out_ptrs = (
+            out_ptr
+            + batch * stride_ob
+            + query_offsets[:, None] * stride_os
+            + block_offsets[None, :] * stride_ok
+        )
+        tl.store(
+            out_ptrs,
+            scores,
+            mask=query_valid[:, None] & block_valid[None, :],
+        )
+
+    @triton.jit
     def _qsa_pad_topk_candidates(candidates, BLOCK_TOPK: tl.constexpr, BLOCK_N: tl.constexpr):
         """Pad a score/id tile to the compile-time streaming Top-K width."""
 
@@ -200,6 +302,7 @@ if TRITON_AVAILABLE:
         INDEX_MASK: tl.constexpr,
         RATIO: tl.constexpr,
         USE_TOKEN_IDS: tl.constexpr,
+        FILTER_ROW_MASK: tl.constexpr,
         BATCH_ONE: tl.constexpr,
         OUTPUT_BLOCKS: tl.constexpr,
     ):
@@ -214,7 +317,11 @@ if TRITON_AVAILABLE:
         """
 
         pid = tl.program_id(0)
-        if USE_TOKEN_IDS:
+        if FILTER_ROW_MASK:
+            row = pid
+            if tl.load(token_ids_ptr + pid) == 0:
+                return
+        elif USE_TOKEN_IDS:
             row = tl.load(token_ids_ptr + pid).to(tl.int32)
         else:
             row = pid
@@ -2207,8 +2314,16 @@ if TRITON_AVAILABLE:
                       d_offsets[None, :] * stride_kd)
             v_ptrs = (v_ptr + batch * stride_vb + safe_selected[:, None] * stride_vs + kv_head * stride_vh +
                       d_offsets[None, :] * stride_vd)
-            k = tl.load(k_ptrs, mask=valid[:, None] & (d_offsets[None, :] < head_dim), other=0.0).to(tl.bfloat16)
-            v = tl.load(v_ptrs, mask=valid[:, None] & (d_offsets[None, :] < head_dim), other=0.0).to(tl.bfloat16)
+            k = tl.load(
+                k_ptrs,
+                mask=valid[:, None] & (d_offsets[None, :] < head_dim),
+                other=0.0,
+            ).to(tl.bfloat16)
+            v = tl.load(
+                v_ptrs,
+                mask=valid[:, None] & (d_offsets[None, :] < head_dim),
+                other=0.0,
+            ).to(tl.bfloat16)
             scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * softmax_scale
             scores = tl.where(valid[None, :], scores, -float("inf"))
             tile_max = tl.max(scores, axis=1)
@@ -4368,6 +4483,282 @@ def qsa_cp_compact_remap_route_triton(
     return output
 
 
+def qsa_indexer_score_slab_with_ratio(
+    q: torch.Tensor,
+    block_keys: torch.Tensor,
+    query_positions: torch.Tensor,
+    compress_ratio: int,
+) -> torch.Tensor:
+    """Materialize a bounded FP32 score slab with batched-query K reuse."""
+
+    if not TRITON_AVAILABLE:
+        raise RuntimeError("QSA Triton kernels require triton to be installed")
+    if not q.is_cuda or not block_keys.is_cuda:
+        raise ValueError("QSA Triton indexer requires CUDA tensors")
+    if q.ndim != 4 or block_keys.ndim != 3:
+        raise ValueError(
+            f"unexpected QSA indexer shapes: q={tuple(q.shape)}, "
+            f"block_keys={tuple(block_keys.shape)}")
+    batch, seq_len, num_heads, head_dim = q.shape
+    block_count = block_keys.shape[1]
+    if block_keys.shape[0] != batch or block_keys.shape[-1] != head_dim:
+        raise ValueError(
+            f"QSA indexer shape mismatch: q={tuple(q.shape)}, "
+            f"block_keys={tuple(block_keys.shape)}")
+    if q.dtype != torch.bfloat16 or block_keys.dtype != torch.bfloat16:
+        raise ValueError("QSA batched score slab currently requires BF16 inputs")
+    if compress_ratio < 2:
+        raise ValueError("QSA score slab requires compress_ratio >= 2")
+    if block_count == 0:
+        return q.new_empty((batch, seq_len, 0), dtype=torch.float32)
+    query_positions = query_positions.to(
+        device=q.device, dtype=torch.int32).contiguous()
+    if query_positions.shape != (seq_len,):
+        raise ValueError(
+            f"QSA indexer query_positions must have shape [{seq_len}], "
+            f"got {tuple(query_positions.shape)}")
+    block_m = int(os.environ.get('MCORE_BRIDGE_QSA_INDEXER_SLAB_BLOCK_M', '16'))
+    block_n = int(os.environ.get('MCORE_BRIDGE_QSA_INDEXER_SLAB_BLOCK_N', '128'))
+    if block_m not in {4, 8, 16, 32} or block_n not in {32, 64, 128, 256}:
+        raise ValueError(
+            'QSA indexer score slab expects BLOCK_M in {4,8,16,32} and '
+            'BLOCK_N in {32,64,128,256}')
+    num_warps = int(os.environ.get('MCORE_BRIDGE_QSA_INDEXER_SLAB_WARPS', '4'))
+    num_stages = int(os.environ.get('MCORE_BRIDGE_QSA_INDEXER_SLAB_STAGES', '1'))
+    if num_warps not in {4, 8} or num_stages not in {1, 2, 3, 4}:
+        raise ValueError(
+            'QSA indexer score slab expects warps in {4,8} and stages in {1,2,3,4}')
+    maxnreg = int(os.environ.get('MCORE_BRIDGE_QSA_INDEXER_SLAB_MAXNREG', '128'))
+    if maxnreg < 0:
+        raise ValueError('QSA indexer score slab maxnreg must be non-negative')
+    launch_options = {
+        'num_warps': num_warps,
+        'num_stages': num_stages,
+    }
+    if maxnreg:
+        launch_options['maxnreg'] = maxnreg
+    output = torch.empty(
+        (batch, seq_len, block_count), device=q.device, dtype=torch.float32)
+    grid = (
+        triton.cdiv(seq_len, block_m),
+        triton.cdiv(block_count, block_n),
+        batch,
+    )
+    _qsa_indexer_score_batched_kernel[grid](
+        q,
+        block_keys,
+        output,
+        query_positions,
+        seq_len,
+        block_count,
+        num_heads,
+        head_dim,
+        head_dim**-0.5,
+        compress_ratio,
+        query_positions.stride(0),
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        block_keys.stride(0),
+        block_keys.stride(1),
+        block_keys.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_H=max(1, triton.next_power_of_2(num_heads)),
+        BLOCK_D=max(16, triton.next_power_of_2(head_dim)),
+        **launch_options,
+    )
+    return output
+
+
+def qsa_indexer_slab_topk_with_ratio(
+    q: torch.Tensor,
+    block_keys: torch.Tensor,
+    query_positions: torch.Tensor,
+    compress_ratio: int,
+    block_topk: int,
+    max_score_bytes: int = 512 * 1024 * 1024,
+    boundary_guard: float = 0.0,
+    validate_positions: bool = True,
+) -> torch.Tensor:
+    """Select compact block routes through bounded score slabs.
+
+    The hot path computes ``BLOCK_M`` queries together so every compressed K
+    tile is reused across query rows, then delegates the row selection to
+    CUDA's float Top-K.  At most ``max_score_bytes`` of FP32 scores are live.
+    Rows whose K/K+1 boundary is numerically ambiguous are recomputed by the
+    deterministic streaming selector, preserving the established packed-key
+    tie rule without taxing ordinary rows with int64 Top-K.
+
+    This path deliberately accepts only dense, zero-based causal positions.
+    Packed documents and CP shards retain their segment-aware streaming
+    kernels.
+    """
+
+    if not TRITON_AVAILABLE:
+        raise RuntimeError("QSA Triton kernels require triton to be installed")
+    if q.ndim != 4 or block_keys.ndim != 3:
+        raise ValueError(
+            f"unexpected QSA slab Top-K shapes: q={tuple(q.shape)}, "
+            f"block_keys={tuple(block_keys.shape)}")
+    if not q.is_cuda or not block_keys.is_cuda:
+        raise ValueError("QSA slab Top-K requires CUDA tensors")
+    batch, seq_len, num_heads, head_dim = q.shape
+    num_blocks = block_keys.shape[1]
+    if block_keys.shape != (batch, num_blocks, head_dim):
+        raise ValueError(
+            f"QSA slab Top-K shape mismatch: q={tuple(q.shape)}, "
+            f"block_keys={tuple(block_keys.shape)}")
+    if q.dtype != torch.bfloat16 or block_keys.dtype != torch.bfloat16:
+        raise ValueError("QSA slab Top-K currently requires BF16 inputs")
+    if compress_ratio < 2 or block_topk < 1:
+        raise ValueError("QSA slab Top-K requires positive K and compress_ratio >= 2")
+    if num_blocks <= block_topk:
+        raise ValueError("QSA slab Top-K is only needed when blocks exceed the budget")
+    if max_score_bytes <= 0:
+        raise ValueError("QSA slab Top-K max_score_bytes must be positive")
+    if boundary_guard < 0:
+        raise ValueError("QSA slab Top-K boundary_guard must be non-negative")
+    query_positions = query_positions.to(
+        device=q.device, dtype=torch.int32).contiguous()
+    if query_positions.shape != (seq_len,):
+        raise ValueError(
+            "QSA slab Top-K requires one query position per sequence row")
+    if validate_positions and not torch.equal(
+            query_positions,
+            torch.arange(seq_len, device=q.device, dtype=torch.int32)):
+        raise ValueError(
+            "QSA slab Top-K requires contiguous zero-based query positions")
+
+    selected = torch.empty(
+        (batch, seq_len, block_topk), device=q.device, dtype=torch.int32)
+    slots = torch.arange(block_topk, device=q.device, dtype=torch.int32)
+    # visible_blocks first exceeds K at zero-based position (K+1)*R-1.
+    sparse_start = min(seq_len, (block_topk + 1) * compress_ratio - 1)
+    if sparse_start:
+        direct_counts = ((query_positions[:sparse_start] + 1) // compress_ratio).clamp_max(
+            block_topk)
+        selected[:, :sparse_start] = torch.where(
+            slots[None, None, :] < direct_counts[None, :, None],
+            slots[None, None, :],
+            -1,
+        )
+    if sparse_start == seq_len:
+        return selected
+
+    block_m = int(os.environ.get('MCORE_BRIDGE_QSA_INDEXER_SLAB_BLOCK_M', '16'))
+    if block_m not in {4, 8, 16, 32}:
+        raise ValueError(
+            'QSA indexer score slab BLOCK_M expects one of {4,8,16,32}')
+    max_rows_by_workspace = max_score_bytes // max(
+        batch * num_blocks * torch.empty((), dtype=torch.float32).element_size(), 1)
+    if max_rows_by_workspace < block_m:
+        raise RuntimeError(
+            "QSA slab Top-K workspace limit is too small for one query tile: "
+            f"need at least {batch * num_blocks * 4 * block_m} bytes")
+    desired_rows = min(8192, max(2048, seq_len // 4))
+    slab_rows = min(desired_rows, max_rows_by_workspace)
+    slab_rows = max(block_m, (slab_rows // block_m) * block_m)
+    ambiguous = torch.zeros(
+        (batch, seq_len), device=q.device, dtype=torch.bool)
+    for query_start in range(sparse_start, seq_len, slab_rows):
+        query_end = min(seq_len, query_start + slab_rows)
+        # Positions are contiguous, so the last row gives the largest causal
+        # block prefix without a device-to-host scalar synchronization.
+        visible_blocks = min(num_blocks, query_end // compress_ratio)
+        scores = qsa_indexer_score_slab_with_ratio(
+            q[:, query_start:query_end],
+            block_keys[:, :visible_blocks],
+            query_positions[query_start:query_end],
+            compress_ratio,
+        )
+        values, indices = torch.topk(
+            scores, block_topk + 1, dim=-1, largest=True, sorted=False)
+        next_value, drop_offset = torch.min(values, dim=-1)
+        output_offsets = torch.arange(
+            block_topk, device=q.device, dtype=drop_offset.dtype)
+        keep_offsets = output_offsets + (
+            output_offsets < drop_offset[..., None]).logical_not()
+        selected[:, query_start:query_end] = torch.gather(
+            indices, -1, keep_offsets).to(torch.int32)
+        if boundary_guard == 0:
+            boundary_ambiguous = torch.sum(
+                values == next_value[..., None], dim=-1) > 1
+        else:
+            candidate_offsets = torch.arange(
+                block_topk + 1, device=q.device, dtype=drop_offset.dtype)
+            kth = torch.where(
+                candidate_offsets == drop_offset[..., None],
+                float('inf'),
+                values,
+            ).amin(dim=-1)
+            tolerance = kth.abs().clamp_min(1.0) * boundary_guard
+            boundary_ambiguous = kth - next_value <= tolerance
+        ambiguous[:, query_start:query_end] = boundary_ambiguous
+
+    # Keep the tie path entirely on-device.  Launching one tiny predicate CTA
+    # per row is cheaper than synchronizing the host to materialize nonzero
+    # row IDs, and remains compatible with CUDA Graph capture.  Ordinary rows
+    # return before loading Q/K; exact-boundary rows run the deterministic
+    # packed-key selector and overwrite their provisional CUDA Top-K result.
+    index_bits = max(1, (num_blocks - 1).bit_length())
+    index_mask = (1 << index_bits) - 1
+    stream_block_n = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_INDEXER_STREAM_BLOCK_N', str(block_topk)))
+    if (stream_block_n < 1 or (stream_block_n & (stream_block_n - 1))
+            or stream_block_n > block_topk
+            or block_topk % stream_block_n):
+        raise ValueError(
+            'QSA fused indexer stream BLOCK_N must be a positive '
+            'power-of-two not larger than block_topk and divide block_topk')
+    indexer_num_warps = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_INDEXER_WARPS', '8'))
+    indexer_num_stages = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_INDEXER_STAGES', '1'))
+    _qsa_indexer_fused_topk_kernel[(batch * seq_len,)](
+        q,
+        block_keys,
+        selected,
+        query_positions,
+        seq_len,
+        num_blocks,
+        num_heads,
+        head_dim,
+        compress_ratio,
+        head_dim**-0.5,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        block_keys.stride(0),
+        block_keys.stride(1),
+        block_keys.stride(2),
+        selected.stride(0),
+        selected.stride(1),
+        ambiguous,
+        BLOCK_TOPK=block_topk,
+        BLOCK_N=stream_block_n,
+        BLOCK_H=max(1, triton.next_power_of_2(num_heads)),
+        BLOCK_D=max(16, triton.next_power_of_2(head_dim)),
+        BLOCK_TAIL=max(
+            1, triton.next_power_of_2(compress_ratio - 1)),
+        INDEX_BITS=index_bits,
+        INDEX_MASK=index_mask,
+        RATIO=compress_ratio,
+        USE_TOKEN_IDS=False,
+        FILTER_ROW_MASK=True,
+        BATCH_ONE=batch == 1,
+        OUTPUT_BLOCKS=True,
+        num_warps=indexer_num_warps,
+        num_stages=indexer_num_stages,
+    )
+    return selected
+
+
 def qsa_indexer_score_tile_with_ratio(
     q: torch.Tensor,
     block_keys: torch.Tensor,
@@ -4599,6 +4990,7 @@ def qsa_indexer_fused_topk_with_ratio(
             INDEX_MASK=index_mask,
             RATIO=compress_ratio,
             USE_TOKEN_IDS=False,
+            FILTER_ROW_MASK=False,
             BATCH_ONE=batch_one,
             OUTPUT_BLOCKS=True,
             num_warps=indexer_num_warps,
@@ -4768,6 +5160,7 @@ def qsa_indexer_fused_topk_with_ratio(
                     INDEX_MASK=index_mask,
                     RATIO=compress_ratio,
                     USE_TOKEN_IDS=True,
+                    FILTER_ROW_MASK=False,
                     BATCH_ONE=batch_one,
                     OUTPUT_BLOCKS=return_block_ids,
                     num_warps=indexer_num_warps,
@@ -4805,6 +5198,7 @@ def qsa_indexer_fused_topk_with_ratio(
             BLOCK_TAIL=max(1, triton.next_power_of_2(compress_ratio - 1)),
             RATIO=compress_ratio,
             USE_TOKEN_IDS=False,
+            FILTER_ROW_MASK=False,
             BATCH_ONE=batch_one,
             OUTPUT_BLOCKS=return_block_ids,
             num_warps=indexer_num_warps,
@@ -5321,6 +5715,22 @@ def qsa_selected_kv_forward(query: torch.Tensor, key: torch.Tensor, value: torch
     if forward_num_warps not in {1, 2, 4, 8} or forward_num_stages not in {1, 2, 3, 4}:
         raise ValueError(
             'QSA forward tuning expects warps in {1,2,4,8} and stages in {1,2,3,4}')
+    default_forward_maxnreg = (
+        88
+        if (head_tile_size == 16 and head_dim == 256 and block_k == 16
+            and is_sm90(query.device))
+        else 0
+    )
+    forward_maxnreg = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_FORWARD_MAXNREG', str(default_forward_maxnreg)))
+    if forward_maxnreg < 0:
+        raise ValueError('QSA forward maxnreg must be non-negative')
+    launch_options = {
+        'num_warps': forward_num_warps,
+        'num_stages': forward_num_stages,
+    }
+    if forward_maxnreg:
+        launch_options['maxnreg'] = forward_maxnreg
     _qsa_selected_kv_forward_grouped_kernel[grid](
         query,
         key,
@@ -5371,8 +5781,7 @@ def qsa_selected_kv_forward(query: torch.Tensor, key: torch.Tensor, value: torch
         CAUSAL=causal,
         ROUTE_SLOTS=route_slots,
         ROUTE_BLOCK_SIZE=route_block_size,
-        num_warps=forward_num_warps,
-        num_stages=forward_num_stages,
+        **launch_options,
     )
     return output, lse
 
@@ -5453,6 +5862,22 @@ def qsa_selected_kv_forward_packed(
     num_stages = int(os.environ.get('MCORE_BRIDGE_QSA_FORWARD_STAGES', '2'))
     if num_warps not in {1, 2, 4, 8} or num_stages not in {1, 2, 3, 4}:
         raise ValueError('QSA packed forward tuning has invalid warps/stages')
+    default_forward_maxnreg = (
+        88
+        if (head_tile_size == 16 and head_dim == 256 and block_k == 16
+            and is_sm90(query.device))
+        else 0
+    )
+    forward_maxnreg = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_FORWARD_MAXNREG', str(default_forward_maxnreg)))
+    if forward_maxnreg < 0:
+        raise ValueError('QSA packed forward maxnreg must be non-negative')
+    launch_options = {
+        'num_warps': num_warps,
+        'num_stages': num_stages,
+    }
+    if forward_maxnreg:
+        launch_options['maxnreg'] = forward_maxnreg
     _qsa_selected_kv_forward_packed_grouped_kernel[
         (total_q, num_kv_heads * num_head_tiles)
     ](
@@ -5502,8 +5927,7 @@ def qsa_selected_kv_forward_packed(
         CAUSAL=causal,
         ROUTE_SLOTS=route_slots,
         ROUTE_BLOCK_SIZE=route_block_size,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        **launch_options,
     )
     return output, lse
 
@@ -6566,7 +6990,9 @@ __all__ = [
     "qsa_expand_compact_route_triton",
     "qsa_indexer_fused_topk_with_ratio",
     "qsa_indexer_fused_topk_packed",
+    "qsa_indexer_score_slab_with_ratio",
     "qsa_indexer_score_tile_with_ratio",
+    "qsa_indexer_slab_topk_with_ratio",
     "qsa_prepare_segmented_metadata",
     "qsa_segmented_dkv_reduce",
     "qsa_selected_kv_backward",
