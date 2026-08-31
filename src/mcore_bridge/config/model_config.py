@@ -221,6 +221,9 @@ class ModelConfig(TransformerConfig):
     require_qsa_kernel: bool = False
     qsa_dkv_accum_dtype: Literal['bf16', 'fp32'] = 'bf16'
     qsa_dkv_reduction: Literal['atomic', 'segmented'] = 'atomic'
+    # Keep only complete-block IDs in the internal production route.  The
+    # public token-ID adapter remains available for compatibility/debugging.
+    qsa_compact_block_route: bool = True
     qsa_indexer_query_tile_size: int = 128
     qsa_indexer_key_tile_size: int = 512
     qsa_attention_query_tile_size: int = 16

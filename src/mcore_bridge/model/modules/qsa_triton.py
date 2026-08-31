@@ -466,6 +466,7 @@ if TRITON_AVAILABLE:
         INDEX_MASK: tl.constexpr,
         RATIO: tl.constexpr,
         USE_TOKEN_IDS: tl.constexpr,
+        OUTPUT_BLOCKS: tl.constexpr,
     ):
         """Single-launch packed indexer with segment-local block addressing."""
 
@@ -551,28 +552,35 @@ if TRITON_AVAILABLE:
         )
         local_block_ids = tl.where(valid_blocks, local_block_ids, -1)
         out_base = out_ptr + token * stride_os
-        for token_offset in tl.static_range(0, RATIO):
-            output_offsets = block_offsets * compress_ratio + token_offset
-            token_ids = local_block_ids * compress_ratio + token_offset
+        if OUTPUT_BLOCKS:
             tl.store(
-                out_base + output_offsets,
-                tl.where(valid_blocks, token_ids, -1),
-                mask=output_offsets < BLOCK_TOPK * RATIO,
+                out_base + block_offsets,
+                tl.where(valid_blocks, local_block_ids, -1),
+                mask=block_offsets < BLOCK_TOPK,
             )
-        tail_offsets = tl.arange(0, BLOCK_TAIL)
-        tail_output = block_count * compress_ratio + tail_offsets
-        tail_values = complete_blocks * compress_ratio + tail_offsets
-        tail_valid = tail_values <= query_position
-        tl.store(
-            out_base + tail_output,
-            tl.where(tail_valid, tail_values, -1),
-            mask=tail_offsets < RATIO - 1,
-        )
-        tl.store(
-            out_base + BLOCK_TOPK * compress_ratio + tail_offsets,
-            -1,
-            mask=(block_count < BLOCK_TOPK) & (tail_offsets < RATIO - 1),
-        )
+        else:
+            for token_offset in tl.static_range(0, RATIO):
+                output_offsets = block_offsets * compress_ratio + token_offset
+                token_ids = local_block_ids * compress_ratio + token_offset
+                tl.store(
+                    out_base + output_offsets,
+                    tl.where(valid_blocks, token_ids, -1),
+                    mask=output_offsets < BLOCK_TOPK * RATIO,
+                )
+            tail_offsets = tl.arange(0, BLOCK_TAIL)
+            tail_output = block_count * compress_ratio + tail_offsets
+            tail_values = complete_blocks * compress_ratio + tail_offsets
+            tail_valid = tail_values <= query_position
+            tl.store(
+                out_base + tail_output,
+                tl.where(tail_valid, tail_values, -1),
+                mask=tail_offsets < RATIO - 1,
+            )
+            tl.store(
+                out_base + BLOCK_TOPK * compress_ratio + tail_offsets,
+                -1,
+                mask=(block_count < BLOCK_TOPK) & (tail_offsets < RATIO - 1),
+            )
 
     @triton.jit
     def _qsa_indexer_packed_direct_fill_kernel(
@@ -589,6 +597,7 @@ if TRITON_AVAILABLE:
         BLOCK_TAIL: tl.constexpr,
         RATIO: tl.constexpr,
         USE_TOKEN_IDS: tl.constexpr,
+        OUTPUT_BLOCKS: tl.constexpr,
     ):
         """Fill packed indexer rows when every segment fits in the budget.
 
@@ -618,32 +627,39 @@ if TRITON_AVAILABLE:
         local_block_ids = tl.where(valid_blocks, block_offsets, -1)
         out_base = out_ptr + token * stride_os
 
-        for token_offset in tl.static_range(0, RATIO):
-            output_offsets = block_offsets * compress_ratio + token_offset
-            token_ids = local_block_ids * compress_ratio + token_offset
+        if OUTPUT_BLOCKS:
             tl.store(
-                out_base + output_offsets,
-                tl.where(valid_blocks, token_ids, -1),
-                mask=output_offsets < BLOCK_TOPK * RATIO,
+                out_base + block_offsets,
+                tl.where(valid_blocks, local_block_ids, -1),
+                mask=block_offsets < BLOCK_TOPK,
             )
+        else:
+            for token_offset in tl.static_range(0, RATIO):
+                output_offsets = block_offsets * compress_ratio + token_offset
+                token_ids = local_block_ids * compress_ratio + token_offset
+                tl.store(
+                    out_base + output_offsets,
+                    tl.where(valid_blocks, token_ids, -1),
+                    mask=output_offsets < BLOCK_TOPK * RATIO,
+                )
 
-        # The current causal block is not part of the complete-block list.
-        # Fill it immediately after the selected prefix and clear the fixed
-        # width padding so the output has no uninitialized entries.
-        tail_offsets = tl.arange(0, BLOCK_TAIL)
-        tail_output = block_count * compress_ratio + tail_offsets
-        tail_values = complete_blocks * compress_ratio + tail_offsets
-        tail_valid = tail_values <= query_position
-        tl.store(
-            out_base + tail_output,
-            tl.where(tail_valid, tail_values, -1),
-            mask=tail_offsets < RATIO - 1,
-        )
-        tl.store(
-            out_base + BLOCK_TOPK * compress_ratio + tail_offsets,
-            -1,
-            mask=(block_count < BLOCK_TOPK) & (tail_offsets < RATIO - 1),
-        )
+            # The current causal block is not part of the complete-block list.
+            # Fill it immediately after the selected prefix and clear the fixed
+            # width padding so the output has no uninitialized entries.
+            tail_offsets = tl.arange(0, BLOCK_TAIL)
+            tail_output = block_count * compress_ratio + tail_offsets
+            tail_values = complete_blocks * compress_ratio + tail_offsets
+            tail_valid = tail_values <= query_position
+            tl.store(
+                out_base + tail_output,
+                tl.where(tail_valid, tail_values, -1),
+                mask=tail_offsets < RATIO - 1,
+            )
+            tl.store(
+                out_base + BLOCK_TOPK * compress_ratio + tail_offsets,
+                -1,
+                mask=(block_count < BLOCK_TOPK) & (tail_offsets < RATIO - 1),
+            )
 
     @triton.jit
     def _qsa_indexer_direct_fill_kernel(
@@ -658,6 +674,7 @@ if TRITON_AVAILABLE:
         BLOCK_TOPK: tl.constexpr,
         BLOCK_TAIL: tl.constexpr,
         RATIO: tl.constexpr,
+        OUTPUT_BLOCKS: tl.constexpr,
     ):
         """Fill standard-BSHD rows whose causal prefix fits in block Top-K.
 
@@ -684,29 +701,36 @@ if TRITON_AVAILABLE:
         block_ids = tl.where(valid_blocks, block_offsets, -1)
         out_base = out_ptr + row * stride_os
 
-        for token_offset in tl.static_range(0, RATIO):
-            output_offsets = block_offsets * compress_ratio + token_offset
-            token_ids = block_ids * compress_ratio + token_offset
+        if OUTPUT_BLOCKS:
             tl.store(
-                out_base + output_offsets,
-                tl.where(valid_blocks, token_ids, -1),
-                mask=output_offsets < BLOCK_TOPK * RATIO,
+                out_base + block_offsets,
+                tl.where(valid_blocks, block_ids, -1),
+                mask=block_offsets < BLOCK_TOPK,
             )
+        else:
+            for token_offset in tl.static_range(0, RATIO):
+                output_offsets = block_offsets * compress_ratio + token_offset
+                token_ids = block_ids * compress_ratio + token_offset
+                tl.store(
+                    out_base + output_offsets,
+                    tl.where(valid_blocks, token_ids, -1),
+                    mask=output_offsets < BLOCK_TOPK * RATIO,
+                )
 
-        tail_offsets = tl.arange(0, BLOCK_TAIL)
-        tail_output = block_count * compress_ratio + tail_offsets
-        tail_values = complete_blocks * compress_ratio + tail_offsets
-        tail_valid = tail_values <= query_position
-        tl.store(
-            out_base + tail_output,
-            tl.where(tail_valid, tail_values, -1),
-            mask=tail_offsets < RATIO - 1,
-        )
-        tl.store(
-            out_base + BLOCK_TOPK * compress_ratio + tail_offsets,
-            -1,
-            mask=(block_count < BLOCK_TOPK) & (tail_offsets < RATIO - 1),
-        )
+            tail_offsets = tl.arange(0, BLOCK_TAIL)
+            tail_output = block_count * compress_ratio + tail_offsets
+            tail_values = complete_blocks * compress_ratio + tail_offsets
+            tail_valid = tail_values <= query_position
+            tl.store(
+                out_base + tail_output,
+                tl.where(tail_valid, tail_values, -1),
+                mask=tail_offsets < RATIO - 1,
+            )
+            tl.store(
+                out_base + BLOCK_TOPK * compress_ratio + tail_offsets,
+                -1,
+                mask=(block_count < BLOCK_TOPK) & (tail_offsets < RATIO - 1),
+            )
 
     @triton.jit
     def _qsa_indexer_radix_topk_kernel(
@@ -1303,6 +1327,7 @@ if TRITON_AVAILABLE:
         BLOCK_TAIL: tl.constexpr,
         INDEX_MASK: tl.constexpr,
         RATIO: tl.constexpr,
+        OUTPUT_BLOCKS: tl.constexpr,
     ):
         """Merge packed split Top-K rows and expand them to selected tokens."""
 
@@ -1331,28 +1356,35 @@ if TRITON_AVAILABLE:
         valid_blocks = (acc != 0) & (block_offsets < block_count)
         block_ids = tl.where(valid_blocks, INDEX_MASK - packed_ids, -1)
         out_base = out_ptr + batch * stride_ob + query * stride_os
-        for token_offset in tl.static_range(0, RATIO):
-            output_offsets = block_offsets * compress_ratio + token_offset
-            token_ids = block_ids * compress_ratio + token_offset
+        if OUTPUT_BLOCKS:
             tl.store(
-                out_base + output_offsets,
-                tl.where(valid_blocks, token_ids, -1),
-                mask=output_offsets < BLOCK_TOPK * RATIO,
+                out_base + block_offsets,
+                tl.where(valid_blocks, block_ids, -1),
+                mask=block_offsets < BLOCK_TOPK,
             )
-        tail_offsets = tl.arange(0, BLOCK_TAIL)
-        tail_output = block_count * compress_ratio + tail_offsets
-        tail_values = complete_blocks * compress_ratio + tail_offsets
-        tail_valid = tail_values <= query_position
-        tl.store(
-            out_base + tail_output,
-            tl.where(tail_valid, tail_values, -1),
-            mask=tail_offsets < RATIO - 1,
-        )
-        tl.store(
-            out_base + BLOCK_TOPK * compress_ratio + tail_offsets,
-            -1,
-            mask=(block_count < BLOCK_TOPK) & (tail_offsets < RATIO - 1),
-        )
+        else:
+            for token_offset in tl.static_range(0, RATIO):
+                output_offsets = block_offsets * compress_ratio + token_offset
+                token_ids = block_ids * compress_ratio + token_offset
+                tl.store(
+                    out_base + output_offsets,
+                    tl.where(valid_blocks, token_ids, -1),
+                    mask=output_offsets < BLOCK_TOPK * RATIO,
+                )
+            tail_offsets = tl.arange(0, BLOCK_TAIL)
+            tail_output = block_count * compress_ratio + tail_offsets
+            tail_values = complete_blocks * compress_ratio + tail_offsets
+            tail_valid = tail_values <= query_position
+            tl.store(
+                out_base + tail_output,
+                tl.where(tail_valid, tail_values, -1),
+                mask=tail_offsets < RATIO - 1,
+            )
+            tl.store(
+                out_base + BLOCK_TOPK * compress_ratio + tail_offsets,
+                -1,
+                mask=(block_count < BLOCK_TOPK) & (tail_offsets < RATIO - 1),
+            )
 
     @triton.jit
     def _qsa_selected_kv_forward_kernel(
@@ -1619,6 +1651,90 @@ if TRITON_AVAILABLE:
         tl.store(grad_q_base + d_offsets * stride_dqd, grad_q, mask=d_offsets < head_dim)
 
     @triton.jit
+    def _qsa_load_route_tokens(
+        route_base,
+        key_start,
+        key_offsets,
+        length,
+        query_position,
+        stride_route,
+        ROUTE_SLOTS: tl.constexpr,
+        ROUTE_BLOCK_SIZE: tl.constexpr,
+        KEY_TILE: tl.constexpr,
+    ):
+        """Map compact block IDs or public token IDs to physical KV tokens.
+
+        A compact row stores only complete-block IDs.  ``length`` remains the
+        public token count, so its quotient/remainder encode the selected
+        block count and causal-tail length.  The incomplete causal block is
+        derived from ``query_position`` and never materialized in metadata.
+        """
+
+        if ROUTE_BLOCK_SIZE == 1:
+            selected = tl.load(
+                route_base + key_offsets * stride_route,
+                mask=key_offsets < ROUTE_SLOTS,
+                other=-1,
+            ).to(tl.int32)
+            route_valid = key_offsets < length
+        else:
+            selected_block_count = length // ROUTE_BLOCK_SIZE
+            block_token_count = selected_block_count * ROUTE_BLOCK_SIZE
+            from_complete_block = key_offsets < block_token_count
+            if KEY_TILE % ROUTE_BLOCK_SIZE == 0:
+                # Load each block ID once, then broadcast its R token lanes in
+                # registers.  Loading through ``key_offsets // R`` issues R
+                # redundant scalar route loads and was measurable in both
+                # forward and backward on SM90.
+                route_offsets = (
+                    key_start // ROUTE_BLOCK_SIZE
+                    + tl.arange(0, KEY_TILE // ROUTE_BLOCK_SIZE)
+                )
+                compact_block_ids = tl.load(
+                    route_base + route_offsets * stride_route,
+                    mask=(route_offsets < selected_block_count)
+                    & (route_offsets < ROUTE_SLOTS),
+                    other=-1,
+                ).to(tl.int32)
+                token_lanes = tl.arange(0, ROUTE_BLOCK_SIZE)
+                block_tokens = tl.reshape(
+                    compact_block_ids[:, None] * ROUTE_BLOCK_SIZE
+                    + token_lanes[None, :],
+                    (KEY_TILE,),
+                )
+                block_ids = tl.reshape(
+                    compact_block_ids[:, None]
+                    + tl.zeros(
+                        (KEY_TILE // ROUTE_BLOCK_SIZE, ROUTE_BLOCK_SIZE),
+                        tl.int32,
+                    ),
+                    (KEY_TILE,),
+                )
+            else:
+                block_offsets = key_offsets // ROUTE_BLOCK_SIZE
+                block_ids = tl.load(
+                    route_base + block_offsets * stride_route,
+                    mask=from_complete_block & (block_offsets < ROUTE_SLOTS),
+                    other=-1,
+                ).to(tl.int32)
+                block_tokens = (
+                    block_ids * ROUTE_BLOCK_SIZE
+                    + key_offsets % ROUTE_BLOCK_SIZE
+                )
+            tail_start = (
+                (query_position + 1) // ROUTE_BLOCK_SIZE
+            ) * ROUTE_BLOCK_SIZE
+            tail_tokens = tail_start + key_offsets - block_token_count
+            selected = tl.where(
+                from_complete_block, block_tokens, tail_tokens
+            )
+            route_valid = (
+                (key_offsets < length)
+                & tl.where(from_complete_block, block_ids >= 0, True)
+            )
+        return selected, route_valid
+
+    @triton.jit
     def _qsa_selected_kv_forward_grouped_kernel(
         q_ptr,
         k_ptr,
@@ -1667,6 +1783,8 @@ if TRITON_AVAILABLE:
         BLOCK_K: tl.constexpr,
         BLOCK_D: tl.constexpr,
         CAUSAL: tl.constexpr,
+        ROUTE_SLOTS: tl.constexpr,
+        ROUTE_BLOCK_SIZE: tl.constexpr,
     ):
         """Grouped forward: one program reuses K/V for a small GQA head tile."""
 
@@ -1692,12 +1810,18 @@ if TRITON_AVAILABLE:
 
         for key_start in tl.range(0, K, BLOCK_K):
             key_offsets = key_start + tl.arange(0, BLOCK_K)
-            selected = tl.load(
-                index_ptr + batch * stride_ib + query * stride_is + key_offsets * stride_ik,
-                mask=key_offsets < K,
-                other=-1,
-            ).to(tl.int32)
-            valid = (key_offsets < length) & (selected >= 0) & (selected < seq_len_k)
+            selected, route_valid = _qsa_load_route_tokens(
+                index_ptr + batch * stride_ib + query * stride_is,
+                key_start,
+                key_offsets,
+                length,
+                query_position,
+                stride_ik,
+                ROUTE_SLOTS,
+                ROUTE_BLOCK_SIZE,
+                BLOCK_K,
+            )
+            valid = route_valid & (selected >= 0) & (selected < seq_len_k)
             if CAUSAL:
                 valid = valid & (selected + key_position_offset <= query_position)
             safe_selected = tl.where(valid, selected, 0)
@@ -1793,6 +1917,8 @@ if TRITON_AVAILABLE:
         BLOCK_K: tl.constexpr,
         BLOCK_D: tl.constexpr,
         CAUSAL: tl.constexpr,
+        ROUTE_SLOTS: tl.constexpr,
+        ROUTE_BLOCK_SIZE: tl.constexpr,
     ):
         """Packed-THD selected-KV forward with one launch for all segments."""
 
@@ -1828,13 +1954,19 @@ if TRITON_AVAILABLE:
 
         for key_offset_start in tl.range(0, K, BLOCK_K):
             key_offsets = key_offset_start + tl.arange(0, BLOCK_K)
-            selected = tl.load(
-                index_ptr + token * stride_it + key_offsets * stride_ik,
-                mask=key_offsets < K,
-                other=-1,
-            ).to(tl.int32)
+            selected, route_valid = _qsa_load_route_tokens(
+                index_ptr + token * stride_it,
+                key_offset_start,
+                key_offsets,
+                length,
+                query_position,
+                stride_ik,
+                ROUTE_SLOTS,
+                ROUTE_BLOCK_SIZE,
+                BLOCK_K,
+            )
             valid = (
-                (key_offsets < length)
+                route_valid
                 & (selected >= 0)
                 & (selected < key_length)
             )
@@ -1990,6 +2122,8 @@ if TRITON_AVAILABLE:
         USE_OUTPUT_DELTA: tl.constexpr,
         DKV_ACCUM_BF16: tl.constexpr,
         TENSORIZE_DERIVATIVES: tl.constexpr,
+        ROUTE_SLOTS: tl.constexpr,
+        ROUTE_BLOCK_SIZE: tl.constexpr,
         SEGMENT_BLOCK_TOPK: tl.constexpr,
         RATIO: tl.constexpr,
         STORE_CORRECTION: tl.constexpr,
@@ -2054,12 +2188,18 @@ if TRITON_AVAILABLE:
             correction = tl.zeros((HEADS_PER_KV,), dtype=tl.float32)
             for key_start in tl.range(0, K, CORRECTION_BLOCK_K):
                 key_offsets = key_start + tl.arange(0, CORRECTION_BLOCK_K)
-                selected = tl.load(
-                    index_ptr + batch * stride_ib + query * stride_is + key_offsets * stride_ik,
-                    mask=key_offsets < K,
-                    other=-1,
-                ).to(tl.int32)
-                valid = (key_offsets < length) & (selected >= 0) & (selected < seq_len_k)
+                selected, route_valid = _qsa_load_route_tokens(
+                    index_ptr + batch * stride_ib + query * stride_is,
+                    key_start,
+                    key_offsets,
+                    length,
+                    query_position,
+                    stride_ik,
+                    ROUTE_SLOTS,
+                    ROUTE_BLOCK_SIZE,
+                    CORRECTION_BLOCK_K,
+                )
+                valid = route_valid & (selected >= 0) & (selected < seq_len_k)
                 if CAUSAL:
                     valid = valid & (selected + key_position_offset <= query_position)
                 safe_selected = tl.where(valid, selected, 0)
@@ -2102,12 +2242,18 @@ if TRITON_AVAILABLE:
         grad_q = tl.zeros((HEADS_PER_KV, BLOCK_D), dtype=tl.float32)
         for key_start in tl.range(0, K, BLOCK_K):
             key_offsets = key_start + tl.arange(0, BLOCK_K)
-            selected = tl.load(
-                index_ptr + batch * stride_ib + query * stride_is + key_offsets * stride_ik,
-                mask=key_offsets < K,
-                other=-1,
-            ).to(tl.int32)
-            valid = (key_offsets < length) & (selected >= 0) & (selected < seq_len_k)
+            selected, route_valid = _qsa_load_route_tokens(
+                index_ptr + batch * stride_ib + query * stride_is,
+                key_start,
+                key_offsets,
+                length,
+                query_position,
+                stride_ik,
+                ROUTE_SLOTS,
+                ROUTE_BLOCK_SIZE,
+                BLOCK_K,
+            )
+            valid = route_valid & (selected >= 0) & (selected < seq_len_k)
             if CAUSAL:
                 valid = valid & (selected + key_position_offset <= query_position)
             safe_selected = tl.where(valid, selected, 0)
@@ -2286,6 +2432,8 @@ if TRITON_AVAILABLE:
         USE_OUTPUT_DELTA: tl.constexpr,
         DKV_ACCUM_BF16: tl.constexpr,
         TENSORIZE_DERIVATIVES: tl.constexpr,
+        ROUTE_SLOTS: tl.constexpr,
+        ROUTE_BLOCK_SIZE: tl.constexpr,
     ):
         """Packed-THD backward with recompute and relaxed dK/dV atomics."""
 
@@ -2356,13 +2504,19 @@ if TRITON_AVAILABLE:
             correction = tl.zeros((HEADS_PER_KV,), dtype=tl.float32)
             for key_offset_start in tl.range(0, K, CORRECTION_BLOCK_K):
                 key_offsets = key_offset_start + tl.arange(0, CORRECTION_BLOCK_K)
-                selected = tl.load(
-                    index_ptr + token * stride_it + key_offsets * stride_ik,
-                    mask=key_offsets < K,
-                    other=-1,
-                ).to(tl.int32)
+                selected, route_valid = _qsa_load_route_tokens(
+                    index_ptr + token * stride_it,
+                    key_offset_start,
+                    key_offsets,
+                    length,
+                    query_position,
+                    stride_ik,
+                    ROUTE_SLOTS,
+                    ROUTE_BLOCK_SIZE,
+                    CORRECTION_BLOCK_K,
+                )
                 valid = (
-                    (key_offsets < length)
+                    route_valid
                     & (selected >= 0)
                     & (selected < key_length)
                 )
@@ -2409,13 +2563,19 @@ if TRITON_AVAILABLE:
         grad_q = tl.zeros((HEADS_PER_KV, BLOCK_D), dtype=tl.float32)
         for key_offset_start in tl.range(0, K, BLOCK_K):
             key_offsets = key_offset_start + tl.arange(0, BLOCK_K)
-            selected = tl.load(
-                index_ptr + token * stride_it + key_offsets * stride_ik,
-                mask=key_offsets < K,
-                other=-1,
-            ).to(tl.int32)
+            selected, route_valid = _qsa_load_route_tokens(
+                index_ptr + token * stride_it,
+                key_offset_start,
+                key_offsets,
+                length,
+                query_position,
+                stride_ik,
+                ROUTE_SLOTS,
+                ROUTE_BLOCK_SIZE,
+                BLOCK_K,
+            )
             valid = (
-                (key_offsets < length)
+                route_valid
                 & (selected >= 0)
                 & (selected < key_length)
             )
@@ -3572,14 +3732,18 @@ def qsa_indexer_fused_topk_with_ratio(
     compress_ratio: int,
     block_topk: int,
     max_partial_bytes: int = 64 * 1024 * 1024,
+    return_block_ids: bool = False,
 ) -> torch.Tensor:
     """Fuse QSA indexer scoring and streaming block/token Top-K.
 
     The kernel is deliberately restricted to the production BF16 QSA shape
     family.  The existing tiled scorer remains available for FP32/debug and
     non-power-of-two diagnostic configurations.  ``q`` is ``[B,S,H,D]`` and
-    ``block_keys`` is ``[B,N,D]``; the returned token IDs are ``[B,S,K]`` with
-    the same block-first plus causal-tail layout as :class:`QSAIndexer`.
+    ``block_keys`` is ``[B,N,D]``.  By default the returned token IDs are
+    ``[B,S,K]`` with the same block-first plus causal-tail layout as
+    :class:`QSAIndexer`.  ``return_block_ids=True`` retains only the compact
+    ``[B,S,block_topk]`` complete-block route; attention derives token lanes
+    and the causal tail directly from that representation.
     """
 
     if not TRITON_AVAILABLE:
@@ -3609,8 +3773,13 @@ def qsa_indexer_fused_topk_with_ratio(
         raise ValueError(
             f"QSA fused indexer query_positions must have shape [{seq_len}], "
             f"got {tuple(query_positions.shape)}")
+    output_width = (
+        block_topk
+        if return_block_ids
+        else block_topk * compress_ratio + compress_ratio - 1
+    )
     output = torch.empty(
-        (batch, seq_len, block_topk * compress_ratio + compress_ratio - 1),
+        (batch, seq_len, output_width),
         device=q.device,
         dtype=torch.int32,
     )
@@ -3656,6 +3825,9 @@ def qsa_indexer_fused_topk_with_ratio(
         and (block_topk & (block_topk - 1)) == 0
         and os.environ.get('MCORE_BRIDGE_QSA_INDEXER_STREAMING', '1') != '0'
     )
+    if return_block_ids and not streaming_enabled:
+        raise RuntimeError(
+            'QSA compact block route requires the streaming fused indexer')
     stream_block_n = int(os.environ.get(
         'MCORE_BRIDGE_QSA_INDEXER_STREAM_BLOCK_N', str(block_topk)))
     if (stream_block_n < 1 or (stream_block_n & (stream_block_n - 1))
@@ -3675,8 +3847,15 @@ def qsa_indexer_fused_topk_with_ratio(
         # stores.  This is an A/B route for compiler register allocation; it
         # uses one compact int32 block-id buffer and a bandwidth-only second
         # launch, while preserving the public token-list contract exactly.
-        selected_blocks = torch.empty(
-            (batch, seq_len, block_topk), device=q.device, dtype=torch.int32)
+        selected_blocks = (
+            output
+            if return_block_ids
+            else torch.empty(
+                (batch, seq_len, block_topk),
+                device=q.device,
+                dtype=torch.int32,
+            )
+        )
         _qsa_indexer_fused_topk_kernel[(batch * seq_len,)](
             q,
             block_keys,
@@ -3712,6 +3891,8 @@ def qsa_indexer_fused_topk_with_ratio(
             num_warps=indexer_num_warps,
             num_stages=indexer_num_stages,
         )
+        if return_block_ids:
+            return selected_blocks
         _qsa_indexer_expand_block_topk_kernel[(batch * seq_len,)](
             selected_blocks,
             output,
@@ -3794,6 +3975,7 @@ def qsa_indexer_fused_topk_with_ratio(
             BLOCK_TAIL=max(1, triton.next_power_of_2(compress_ratio - 1)),
             INDEX_MASK=index_mask,
             RATIO=compress_ratio,
+            OUTPUT_BLOCKS=return_block_ids,
             num_warps=8,
             num_stages=1,
         )
@@ -3837,6 +4019,7 @@ def qsa_indexer_fused_topk_with_ratio(
                 BLOCK_TOPK=block_topk,
                 BLOCK_TAIL=max(1, triton.next_power_of_2(compress_ratio - 1)),
                 RATIO=compress_ratio,
+                OUTPUT_BLOCKS=return_block_ids,
                 num_warps=1,
                 num_stages=1,
             )
@@ -3872,7 +4055,7 @@ def qsa_indexer_fused_topk_with_ratio(
                     RATIO=compress_ratio,
                     USE_TOKEN_IDS=True,
                     BATCH_ONE=batch_one,
-                    OUTPUT_BLOCKS=False,
+                    OUTPUT_BLOCKS=return_block_ids,
                     num_warps=indexer_num_warps,
                     num_stages=indexer_num_stages,
                 )
@@ -3909,7 +4092,7 @@ def qsa_indexer_fused_topk_with_ratio(
             RATIO=compress_ratio,
             USE_TOKEN_IDS=False,
             BATCH_ONE=batch_one,
-            OUTPUT_BLOCKS=False,
+            OUTPUT_BLOCKS=return_block_ids,
             num_warps=indexer_num_warps,
             num_stages=indexer_num_stages,
         )
@@ -3982,6 +4165,7 @@ def qsa_indexer_fused_topk_with_ratio(
             BLOCK_TAIL=max(1, triton.next_power_of_2(compress_ratio - 1)),
             INDEX_MASK=index_mask,
             RATIO=compress_ratio,
+            OUTPUT_BLOCKS=return_block_ids,
             num_warps=8,
             num_stages=1,
         )
@@ -4118,6 +4302,7 @@ def qsa_indexer_fused_topk_with_ratio(
         BLOCK_TAIL=max(1, triton.next_power_of_2(compress_ratio - 1)),
         INDEX_MASK=index_mask,
         RATIO=compress_ratio,
+        OUTPUT_BLOCKS=False,
         num_warps=8,
         num_stages=1,
     )
@@ -4132,8 +4317,13 @@ def qsa_indexer_fused_topk_packed(
     query_positions: torch.Tensor,
     compress_ratio: int,
     block_topk: int,
+    return_block_ids: bool = False,
 ) -> torch.Tensor:
-    """Run TokenSpeed-style indexer Top-K once over packed query segments."""
+    """Run TokenSpeed-style indexer Top-K once over packed query segments.
+
+    ``return_block_ids`` keeps segment-local complete-block IDs and omits the
+    expanded token lanes/tail from persistent metadata.
+    """
 
     if not TRITON_AVAILABLE:
         raise RuntimeError("QSA Triton kernels require triton to be installed")
@@ -4158,7 +4348,11 @@ def qsa_indexer_fused_topk_packed(
             raise ValueError(f"QSA packed indexer {name} must be [{total_tokens}]")
     if total_tokens == 0:
         return torch.empty(
-            (0, block_topk * compress_ratio + compress_ratio - 1),
+            (
+                0,
+                block_topk if return_block_ids
+                else block_topk * compress_ratio + compress_ratio - 1,
+            ),
             device=query.device,
             dtype=torch.int32,
         )
@@ -4168,8 +4362,13 @@ def qsa_indexer_fused_topk_packed(
     query_positions = query_positions.to(device=query.device, dtype=torch.int32).contiguous()
     query = query.contiguous()
     block_keys = block_keys.contiguous()
+    output_width = (
+        block_topk
+        if return_block_ids
+        else block_topk * compress_ratio + compress_ratio - 1
+    )
     output = torch.empty(
-        (total_tokens, block_topk * compress_ratio + compress_ratio - 1),
+        (total_tokens, output_width),
         device=query.device,
         dtype=torch.int32,
     )
@@ -4194,6 +4393,7 @@ def qsa_indexer_fused_topk_packed(
             BLOCK_TAIL=max(1, triton.next_power_of_2(compress_ratio - 1)),
             RATIO=compress_ratio,
             USE_TOKEN_IDS=False,
+            OUTPUT_BLOCKS=return_block_ids,
             num_warps=1,
             num_stages=1,
         )
@@ -4222,6 +4422,7 @@ def qsa_indexer_fused_topk_packed(
             BLOCK_TAIL=max(1, triton.next_power_of_2(compress_ratio - 1)),
             RATIO=compress_ratio,
             USE_TOKEN_IDS=True,
+            OUTPUT_BLOCKS=return_block_ids,
             num_warps=1,
             num_stages=1,
         )
@@ -4274,6 +4475,7 @@ def qsa_indexer_fused_topk_packed(
                 INDEX_MASK=index_mask,
                 RATIO=compress_ratio,
                 USE_TOKEN_IDS=True,
+                OUTPUT_BLOCKS=return_block_ids,
                 num_warps=num_warps,
                 num_stages=num_stages,
             )
@@ -4326,6 +4528,7 @@ def qsa_indexer_fused_topk_packed(
         INDEX_MASK=index_mask,
         RATIO=compress_ratio,
         USE_TOKEN_IDS=False,
+        OUTPUT_BLOCKS=return_block_ids,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -4335,7 +4538,8 @@ def qsa_indexer_fused_topk_packed(
 def qsa_selected_kv_forward(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                             topk_indices: torch.Tensor, topk_length: torch.Tensor,
                             softmax_scale: float, causal: bool = True,
-                            query_positions: torch.Tensor = None, key_position_offset: int = 0) -> tuple:
+                            query_positions: torch.Tensor = None, key_position_offset: int = 0,
+                            route_block_size: int = 1) -> tuple:
     """Launch the Triton selected-KV forward kernel.
 
     The public attention wrapper validates and makes all tensors contiguous
@@ -4357,9 +4561,20 @@ def qsa_selected_kv_forward(query: torch.Tensor, key: torch.Tensor, value: torch
         raise ValueError(
             f"QSA selected-KV index shape mismatch: query={tuple(query.shape)}, "
             f"indices={tuple(topk_indices.shape)}, length={tuple(topk_length.shape)}")
-    k_slots = topk_indices.shape[-1]
-    if k_slots <= 0:
+    route_slots = topk_indices.shape[-1]
+    route_block_size = int(route_block_size)
+    if route_slots <= 0:
         raise ValueError("QSA selected-KV requires at least one index slot")
+    if route_block_size <= 0:
+        raise ValueError("QSA selected-KV route_block_size must be positive")
+    if route_block_size > 1 and (not causal or int(key_position_offset) != 0):
+        raise ValueError(
+            "QSA compact block route requires causal attention and key_position_offset=0")
+    k_slots = (
+        route_slots
+        if route_block_size == 1
+        else route_slots * route_block_size + route_block_size - 1
+    )
 
     output = torch.empty_like(query)
     lse = torch.empty((batch, num_q_heads, sq), device=query.device, dtype=torch.float32)
@@ -4440,6 +4655,8 @@ def qsa_selected_kv_forward(query: torch.Tensor, key: torch.Tensor, value: torch
         BLOCK_K=block_k,
         BLOCK_D=block_d,
         CAUSAL=causal,
+        ROUTE_SLOTS=route_slots,
+        ROUTE_BLOCK_SIZE=route_block_size,
         num_warps=forward_num_warps,
         num_stages=forward_num_stages,
     )
@@ -4458,6 +4675,7 @@ def qsa_selected_kv_forward_packed(
     softmax_scale: float,
     causal: bool = True,
     key_position_offset: int = 0,
+    route_block_size: int = 1,
 ) -> tuple:
     """Launch one selected-KV forward kernel over all packed THD segments."""
 
@@ -4475,6 +4693,18 @@ def qsa_selected_kv_forward_packed(
         raise ValueError("QSA packed Triton indices must be [T,K]")
     if topk_length.shape != (total_q,):
         raise ValueError("QSA packed Triton lengths must be [T]")
+    route_slots = topk_indices.shape[1]
+    route_block_size = int(route_block_size)
+    if route_slots <= 0 or route_block_size <= 0:
+        raise ValueError("QSA packed Triton route slots/block size must be positive")
+    if route_block_size > 1 and (not causal or int(key_position_offset) != 0):
+        raise ValueError(
+            "QSA packed compact block route requires causal attention and key_position_offset=0")
+    logical_k = (
+        route_slots
+        if route_block_size == 1
+        else route_slots * route_block_size + route_block_size - 1
+    )
     for name, tensor in (
         ('key_starts', key_starts),
         ('key_lengths', key_lengths),
@@ -4549,13 +4779,15 @@ def qsa_selected_kv_forward_packed(
         output.stride(2),
         lse.stride(0),
         lse.stride(1),
-        K=topk_indices.shape[1],
+        K=logical_k,
         HEADS_PER_KV=head_tile_size,
         GROUP_SIZE=group_size,
         NUM_HEAD_TILES=num_head_tiles,
         BLOCK_K=block_k,
         BLOCK_D=block_d,
         CAUSAL=causal,
+        ROUTE_SLOTS=route_slots,
+        ROUTE_BLOCK_SIZE=route_block_size,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -5057,6 +5289,7 @@ def qsa_selected_kv_backward(
     segmented_metadata=None,
     dkv_reduction: str = 'atomic',
     output: torch.Tensor = None,
+    route_block_size: int = 1,
 ) -> tuple:
     """Launch the Triton selected-KV backward kernel.
 
@@ -5088,6 +5321,18 @@ def qsa_selected_kv_backward(
         raise ValueError(
             f"QSA selected-KV backward index shape mismatch: indices={tuple(topk_indices.shape)}, "
             f"length={tuple(topk_length.shape)}, query={tuple(query.shape)}")
+    route_slots = topk_indices.shape[-1]
+    route_block_size = int(route_block_size)
+    if route_slots <= 0 or route_block_size <= 0:
+        raise ValueError("QSA backward route slots/block size must be positive")
+    if route_block_size > 1 and (not causal or int(key_position_offset) != 0):
+        raise ValueError(
+            "QSA compact block route backward requires causal attention and key_position_offset=0")
+    logical_k = (
+        route_slots
+        if route_block_size == 1
+        else route_slots * route_block_size + route_block_size - 1
+    )
     if lse.shape != (batch, num_q_heads, sq):
         raise ValueError(f"QSA LSE shape must be {(batch, num_q_heads, sq)}, got {tuple(lse.shape)}")
     if query_positions is None:
@@ -5109,7 +5354,7 @@ def qsa_selected_kv_backward(
     # Keep native Triton as the production default; opt in explicitly when
     # profiling a FlashAttention-enabled training image.
     use_flash_backward = os.environ.get("MCORE_BRIDGE_QSA_FLASH_BACKWARD", "0") == "1"
-    if (use_flash_backward and FLASH_ATTN_AVAILABLE and dkv_accum_dtype == 'bf16'
+    if (use_flash_backward and route_block_size == 1 and FLASH_ATTN_AVAILABLE and dkv_accum_dtype == 'bf16'
             and grad_output is not None and grad_lse is None):
         return _flash_selected_kv_backward(
             query,
@@ -5141,6 +5386,9 @@ def qsa_selected_kv_backward(
     segment_reduction_requested = os.environ.get(
         "MCORE_BRIDGE_QSA_DKV_REDUCTION", dkv_reduction
     ).lower() == "segmented"
+    if route_block_size > 1 and segment_reduction_requested:
+        raise RuntimeError(
+            'QSA compact block route currently requires atomic dK/dV reduction')
     segment_ratio = None
     use_segmented_reduction = False
     if segment_reduction_requested and selected_token_group_size is not None:
@@ -5204,7 +5452,10 @@ def qsa_selected_kv_backward(
     num_head_tiles = triton.cdiv(group_size, head_tile_size)
     grid = (batch * sq, num_kv_heads * num_head_tiles)
     block_d = max(16, triton.next_power_of_2(head_dim))
-    default_block_k = 16 if tensorized_default else 8
+    # A 32-token tensor tile amortizes route decode and loop overhead without
+    # reducing occupancy on the production H100 GQA shape.  The previous
+    # 16-token default left ~15% backward throughput on the table at 4K.
+    default_block_k = 32 if tensorized_default else 8
     block_k = int(os.environ.get(
         'MCORE_BRIDGE_QSA_BACKWARD_BLOCK_K', str(default_block_k)))
     if block_k not in {4, 8, 16, 32, 64, 128}:
@@ -5290,7 +5541,7 @@ def qsa_selected_kv_backward(
         correction.stride(0),
         correction.stride(1),
         correction.stride(2),
-        K=topk_indices.shape[-1],
+        K=logical_k,
         HEADS_PER_KV=head_tile_size,
         GROUP_SIZE=group_size,
         NUM_HEAD_TILES=num_head_tiles,
@@ -5320,6 +5571,8 @@ def qsa_selected_kv_backward(
             and dkv_accum_dtype == 'bf16'
             and not use_segmented_reduction
         ),
+        ROUTE_SLOTS=route_slots,
+        ROUTE_BLOCK_SIZE=route_block_size,
         num_warps=backward_num_warps,
         num_stages=backward_num_stages,
     )
@@ -5379,6 +5632,7 @@ def qsa_selected_kv_backward_packed(
     dkv_accum_dtype: str = 'bf16',
     dkv_reduction: str = 'atomic',
     output: torch.Tensor = None,
+    route_block_size: int = 1,
 ) -> tuple:
     """Launch one packed-THD selected-KV backward with relaxed dK/dV atomics.
 
@@ -5400,6 +5654,19 @@ def qsa_selected_kv_backward_packed(
         raise ValueError("QSA packed Triton backward indices must be [T,K]")
     if topk_length.shape != (total_q,):
         raise ValueError("QSA packed Triton backward lengths must be [T]")
+    route_slots = topk_indices.shape[1]
+    route_block_size = int(route_block_size)
+    if route_slots <= 0 or route_block_size <= 0:
+        raise ValueError(
+            "QSA packed backward route slots/block size must be positive")
+    if route_block_size > 1 and (not causal or int(key_position_offset) != 0):
+        raise ValueError(
+            "QSA packed compact route backward requires causal attention and key_position_offset=0")
+    logical_k = (
+        route_slots
+        if route_block_size == 1
+        else route_slots * route_block_size + route_block_size - 1
+    )
     if lse.shape != (num_q_heads, total_q):
         raise ValueError("QSA packed Triton backward LSE must be [H,T]")
     for name, tensor in (
@@ -5471,7 +5738,7 @@ def qsa_selected_kv_backward_packed(
         raise ValueError('QSA packed backward head tile expects one of {1,2,4,8,16}')
     num_head_tiles = triton.cdiv(group_size, head_tile_size)
     block_d = max(16, triton.next_power_of_2(head_dim))
-    default_block_k = 16 if tensorized_default else 8
+    default_block_k = 32 if tensorized_default else 8
     block_k = int(os.environ.get(
         'MCORE_BRIDGE_QSA_BACKWARD_BLOCK_K', str(default_block_k)))
     if block_k not in {4, 8, 16, 32, 64, 128}:
@@ -5546,7 +5813,7 @@ def qsa_selected_kv_backward_packed(
         key_starts.stride(0),
         key_lengths.stride(0),
         query_positions.stride(0),
-        K=topk_indices.shape[1],
+        K=logical_k,
         HEADS_PER_KV=head_tile_size,
         GROUP_SIZE=group_size,
         NUM_HEAD_TILES=num_head_tiles,
@@ -5563,6 +5830,8 @@ def qsa_selected_kv_backward_packed(
             and block_k >= 16
             and dkv_accum_dtype == 'bf16'
         ),
+        ROUTE_SLOTS=route_slots,
+        ROUTE_BLOCK_SIZE=route_block_size,
         num_warps=num_warps,
         num_stages=num_stages,
     )

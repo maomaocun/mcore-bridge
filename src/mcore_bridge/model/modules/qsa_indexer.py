@@ -269,8 +269,14 @@ class QSAIndexer(nn.Module):
         backend: str,
         query_tile_size: int,
         key_tile_size: int,
+        return_block_ids: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Top-k merge for projected queries and globally indexed block keys."""
+        """Top-k merge for projected queries and globally indexed block keys.
+
+        The compatibility result contains expanded token IDs.  Production
+        callers can request only complete-block IDs; token lanes and the
+        incomplete causal tail are then reconstructed inside attention.
+        """
 
         if backend not in {'torch', 'triton'}:
             raise ValueError(f'unsupported QSA indexer backend={backend!r}; choose torch or triton')
@@ -296,6 +302,19 @@ class QSAIndexer(nn.Module):
         tail_lengths = query_positions + 1 - complete_blocks * ratio
         topk_length = (block_counts * ratio + tail_lengths).to(torch.int32).expand(batch, -1).clone()
         if num_blocks <= self.block_topk:
+            if return_block_ids:
+                block_slots = torch.arange(
+                    self.block_topk, device=q.device, dtype=torch.int32)
+                valid_blocks = (
+                    block_slots[None, None, :]
+                    < block_counts[None, :, None]
+                )
+                selected_blocks = torch.where(
+                    valid_blocks,
+                    block_slots[None, None, :],
+                    -torch.ones_like(block_slots)[None, None, :],
+                ).expand(batch, -1, -1).clone()
+                return selected_blocks, topk_length
             selected = torch.full(
                 (batch, sequence_length, self.selected_k), -1,
                 dtype=torch.int32, device=q.device)
@@ -306,10 +325,10 @@ class QSAIndexer(nn.Module):
             return selected, topk_length
 
         # Production BF16 QSA uses a single device-side streaming kernel for
-        # score -> causal filter -> block Top-K -> token expansion.  Besides
+        # score -> causal filter -> block Top-K -> optional token expansion.  Besides
         # removing the Python ``query_tile x key_tile`` launch/merge loop, the
-        # kernel writes the final token list directly and therefore does not
-        # need a temporary ``[B,S,block_topk]`` tensor.  Keep the tiled path
+        # kernel writes the final route directly and therefore does not need
+        # a second temporary ``[B,S,block_topk]`` tensor.  Keep the tiled path
         # below for FP32 and deliberately irregular diagnostic shapes.
         if (backend == 'triton' and q.dtype == torch.bfloat16 and
                 block_topk == self.block_topk and
@@ -330,6 +349,7 @@ class QSAIndexer(nn.Module):
                 ratio,
                 block_topk,
                 max_partial_bytes=max_partial_mb * 2**20,
+                return_block_ids=return_block_ids,
             )
             return fused_selected, topk_length
 
@@ -337,7 +357,11 @@ class QSAIndexer(nn.Module):
         # fallback workspace only after that route is ruled out; otherwise a
         # 256K run transiently holds two full [B,S,K] int32 buffers.
         selected = torch.full(
-            (batch, sequence_length, self.selected_k), -1,
+            (
+                batch,
+                sequence_length,
+                self.block_topk if return_block_ids else self.selected_k,
+            ), -1,
             dtype=torch.int32, device=q.device)
         for query_start in range(0, sequence_length, query_tile_size):
             query_end = min(sequence_length, query_start + query_tile_size)
@@ -359,6 +383,18 @@ class QSAIndexer(nn.Module):
                 candidate_blocks = candidate_blocks[None, None, :].expand(batch, query_end - query_start, -1)
                 best_scores, best_blocks = self._stable_merge_topk(
                     best_scores, best_blocks, candidate_scores, candidate_blocks, block_topk)
+
+            if return_block_ids:
+                valid_selected_blocks = (
+                    torch.arange(block_topk, device=q.device)[None, None, :]
+                    < query_block_counts[None, :, None]
+                )
+                selected[:, query_start:query_end, :block_topk] = torch.where(
+                    valid_selected_blocks,
+                    best_blocks,
+                    torch.full_like(best_blocks, -1),
+                ).to(torch.int32)
+                continue
 
             tile_queries = query_end - query_start
             scratch = torch.full(
@@ -398,8 +434,14 @@ class QSAIndexer(nn.Module):
         backend: str = 'torch',
         query_tile_size: Optional[int] = None,
         key_tile_size: Optional[int] = None,
+        return_block_ids: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return ``(topk_indices, topk_length)`` for selected-KV attention."""
+        """Return route IDs and token lengths for selected-KV attention.
+
+        ``return_block_ids=False`` preserves the public token-ID contract.
+        The compact production form uses ``return_block_ids=True`` and has
+        shape ``[B,S,block_topk]``.
+        """
 
         if hidden_states.ndim != 3:
             raise ValueError(f'QSA indexer expects hidden_states [S,B,H], got {tuple(hidden_states.shape)}')
@@ -409,7 +451,8 @@ class QSAIndexer(nn.Module):
         return self._select_from_projected(
             q, block_keys, query_positions, backend,
             query_tile_size or getattr(self.config, 'qsa_indexer_query_tile_size', 128),
-            key_tile_size or getattr(self.config, 'qsa_indexer_key_tile_size', 512))
+            key_tile_size or getattr(self.config, 'qsa_indexer_key_tile_size', 512),
+            return_block_ids=return_block_ids)
 
     @staticmethod
     def _slice_packed_freqs(freqs, start: int, end: int, length: int, total_length: int):
@@ -440,6 +483,7 @@ class QSAIndexer(nn.Module):
         backend: str = 'torch',
         query_tile_size: Optional[int] = None,
         key_tile_size: Optional[int] = None,
+        return_block_ids: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Select QSA tokens independently for each packed/THD segment.
 
@@ -466,7 +510,11 @@ class QSAIndexer(nn.Module):
         if total_length == 0:
             return (
                 torch.empty(
-                    (1, 0, self.selected_k),
+                    (
+                        1,
+                        0,
+                        self.block_topk if return_block_ids else self.selected_k,
+                    ),
                     device=hidden_states.device,
                     dtype=torch.int32,
                 ),
@@ -492,6 +540,7 @@ class QSAIndexer(nn.Module):
                 local_positions,
                 self.compress_ratio,
                 self.block_topk,
+                return_block_ids=return_block_ids,
             )
             complete_blocks = torch.minimum(
                 block_counts.to(torch.long),
@@ -508,7 +557,11 @@ class QSAIndexer(nn.Module):
             return selected.unsqueeze(0), topk_lengths.unsqueeze(0)
 
         selected = torch.full(
-            (1, total_length, self.selected_k),
+            (
+                1,
+                total_length,
+                self.block_topk if return_block_ids else self.selected_k,
+            ),
             -1,
             device=hidden_states.device,
             dtype=torch.int32,
@@ -528,6 +581,7 @@ class QSAIndexer(nn.Module):
                 backend=backend,
                 query_tile_size=query_tile_size,
                 key_tile_size=key_tile_size,
+                return_block_ids=return_block_ids,
             )
             selected[:, start:end] = segment_selected
             lengths[:, start:end] = segment_lengths
@@ -544,6 +598,7 @@ class QSAIndexer(nn.Module):
         backend: str = 'torch',
         query_tile_size: Optional[int] = None,
         key_tile_size: Optional[int] = None,
+        return_block_ids: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """CP indexer path: all-gather block keys, never full hidden states.
 
@@ -556,7 +611,14 @@ class QSAIndexer(nn.Module):
             raise ValueError('QSA CP indexer expects hidden_states=[S_local,B,H] and query_positions=[S_local]')
         cp_size = cp_group.size()
         if cp_size <= 1:
-            return self.select_topk(hidden_states, freqs, backend, query_tile_size, key_tile_size)
+            return self.select_topk(
+                hidden_states,
+                freqs,
+                backend,
+                query_tile_size,
+                key_tile_size,
+                return_block_ids,
+            )
         local_sequence, batch, _ = hidden_states.shape
         if query_positions.shape[0] != local_sequence:
             raise ValueError('QSA CP query position length must equal local hidden sequence length')
@@ -628,6 +690,7 @@ class QSAIndexer(nn.Module):
             backend,
             query_tile_size or getattr(self.config, 'qsa_indexer_query_tile_size', 128),
             key_tile_size or getattr(self.config, 'qsa_indexer_key_tile_size', 512),
+            return_block_ids=return_block_ids,
         )
 
     @torch.no_grad()

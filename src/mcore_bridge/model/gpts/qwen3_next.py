@@ -157,6 +157,7 @@ class Qwen3NextSelfAttention(SelfAttention):
         qsa_global_kv: bool = False,
         qsa_cp_exchange: bool = False,
         qsa_global_seq_len: Optional[int] = None,
+        qsa_route_block_size: int = 1,
         qsa_tp_sp_hidden_states: Optional[torch.Tensor] = None,
         qsa_tp_sp_rotary_pos_emb: Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None,
         *,
@@ -426,6 +427,7 @@ class Qwen3NextSelfAttention(SelfAttention):
                     dkv_accum_dtype=getattr(self.config, 'qsa_dkv_accum_dtype', 'bf16'),
                     dkv_reduction=getattr(self.config, 'qsa_dkv_reduction', 'atomic'),
                     selected_token_group_size=getattr(self.config, 'indexer_compress_ratio', None),
+                    route_block_size=qsa_route_block_size,
                 )
             else:
                 if qsa_global_kv:
@@ -471,6 +473,7 @@ class Qwen3NextSelfAttention(SelfAttention):
                     selected_token_group_size=(
                         None if qsa_cp_exchange else getattr(self.config, 'indexer_compress_ratio', None)
                     ),
+                    route_block_size=qsa_route_block_size,
                 )
         elif self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(

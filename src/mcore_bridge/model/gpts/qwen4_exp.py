@@ -90,7 +90,7 @@ class Qwen4ExpLayer(TransformerLayer):
         qsa_mask = None
         if qsa_selection is not None:
             (topk_indices, topk_length, qsa_backend, qsa_query_positions, qsa_global_kv, qsa_cp_exchange,
-             qsa_global_seq_len) = qsa_selection
+             qsa_global_seq_len, qsa_route_block_size) = qsa_selection
             # The selected-KV backend owns causal validity.  Dropping the
             # caller's dense causal mask here is intentional: retaining it
             # would make the supported path pay the S-by-S allocation that the
@@ -105,6 +105,7 @@ class Qwen4ExpLayer(TransformerLayer):
                 qsa_global_kv=qsa_global_kv,
                 qsa_cp_exchange=qsa_cp_exchange,
                 qsa_global_seq_len=qsa_global_seq_len,
+                qsa_route_block_size=qsa_route_block_size,
             )
         elif getattr(self.config, 'qsa_kernel_backend', 'none') == 'none':
             qsa_mask = self._qsa_select_mask(hidden_states, attn_kwargs)
@@ -453,6 +454,20 @@ class Qwen4ExpLayer(TransformerLayer):
                     'unpacked QSA indexer', sequence_length)
                 return None
 
+        effective_dkv_reduction = os.environ.get(
+            'MCORE_BRIDGE_QSA_DKV_REDUCTION',
+            getattr(self.config, 'qsa_dkv_reduction', 'atomic'),
+        ).lower()
+        use_compact_block_route = (
+            bool(getattr(self.config, 'qsa_compact_block_route', True))
+            and resolved.actual == 'triton'
+            and effective_dkv_reduction == 'atomic'
+            and not qsa_cp_exchange
+            and indexer.compress_ratio > 1
+        )
+        qsa_route_block_size = (
+            indexer.compress_ratio if use_compact_block_route else 1)
+
         def run_indexer(backend):
             if packed_seq_params is not None:
                 return indexer.select_topk_packed(
@@ -462,6 +477,7 @@ class Qwen4ExpLayer(TransformerLayer):
                     backend=backend,
                     query_tile_size=getattr(self.config, 'qsa_indexer_query_tile_size', 128),
                     key_tile_size=getattr(self.config, 'qsa_indexer_key_tile_size', 512),
+                    return_block_ids=use_compact_block_route,
                 )
             if cp_size > 1:
                 return indexer.select_topk_cp(
@@ -473,6 +489,7 @@ class Qwen4ExpLayer(TransformerLayer):
                     backend=backend,
                     query_tile_size=getattr(self.config, 'qsa_indexer_query_tile_size', 128),
                     key_tile_size=getattr(self.config, 'qsa_indexer_key_tile_size', 512),
+                    return_block_ids=use_compact_block_route,
                 )
             return indexer.select_topk(
                 indexer_hidden_states,
@@ -480,6 +497,7 @@ class Qwen4ExpLayer(TransformerLayer):
                 backend=backend,
                 query_tile_size=getattr(self.config, 'qsa_indexer_query_tile_size', 128),
                 key_tile_size=getattr(self.config, 'qsa_indexer_key_tile_size', 512),
+                return_block_ids=use_compact_block_route,
             )
 
         try:
@@ -516,6 +534,7 @@ class Qwen4ExpLayer(TransformerLayer):
             f'requested_backend={resolved.requested} actual_backend={resolved.actual} '
             f'indexer_backend={resolved.actual} attention_backend={resolved.actual} '
             f'topk_shape={tuple(topk_indices.shape)} topk_length=[{effective_min},{effective_max}] '
+            f'route_block_size={qsa_route_block_size} '
             f'shape={tuple(hidden_states.shape)} dtype={hidden_states.dtype} capability={capability} '
             f'tp_size={tp_size} cp_mode={cp_mode} '
             f'dkv_reduction={getattr(self.config, "qsa_dkv_reduction", "atomic")}',
@@ -525,7 +544,7 @@ class Qwen4ExpLayer(TransformerLayer):
                 f'requested_backend={resolved.requested}, actual_backend={resolved.actual}: '
                 f'{resolved.fallback_reason}')
         return (topk_indices, topk_length, resolved.actual, qsa_query_positions, qsa_global_kv, qsa_cp_exchange,
-                global_sequence_length)
+                global_sequence_length, qsa_route_block_size)
 
     def _qsa_select_mask(self, hidden_states, attn_kwargs):
         # return None means full attention

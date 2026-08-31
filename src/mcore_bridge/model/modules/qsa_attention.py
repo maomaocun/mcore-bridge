@@ -6,7 +6,8 @@ backend dispatch.  It gives the Triton kernel a small, auditable contract:
 
 * query/key/value use Megatron's ``[sequence, batch, heads, head_dim]`` layout;
 * ``topk_indices`` is ``[batch, query_sequence, K]`` and contains token
-  positions, not block positions;
+  positions for the compatibility ABI, or complete-block IDs when
+  ``route_block_size > 1``;
 * ``topk_length`` is ``[batch, query_sequence]`` and invalid index slots are
   ``-1``;
 * optional ``query_positions`` carries global positions when CP uses a
@@ -220,6 +221,99 @@ def _normalise_scale(softmax_scale: Optional[float], head_dim: int) -> float:
     if not math.isfinite(scale) or scale <= 0:
         raise ValueError(f"softmax_scale must be finite and positive, got {softmax_scale}")
     return scale
+
+
+@torch.no_grad()
+def qsa_expand_block_route(
+    block_indices: torch.Tensor,
+    topk_length: torch.Tensor,
+    query_positions: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Materialize the compatibility token route from compact block IDs.
+
+    Production Triton attention performs this mapping in registers.  This
+    adapter exists for the torch/reference backend, external token-ID callers,
+    and parity tests; using it at long context intentionally gives up the
+    compact route's memory saving.
+    """
+
+    block_size = int(block_size)
+    if block_size <= 1:
+        raise ValueError(
+            f'QSA block route requires block_size > 1, got {block_size}')
+    if block_indices.ndim != 3:
+        raise ValueError(
+            'QSA compact block route expects block_indices=[B,S,block_topk]')
+    batch, sequence_length, block_slots = block_indices.shape
+    if topk_length.shape != (batch, sequence_length):
+        raise ValueError(
+            'QSA compact block route length must have shape '
+            f'{(batch, sequence_length)}, got {tuple(topk_length.shape)}')
+    query_positions = query_positions.to(
+        device=block_indices.device, dtype=torch.long).reshape(-1)
+    if query_positions.shape != (sequence_length,):
+        raise ValueError(
+            'QSA compact block route query_positions must have shape '
+            f'[{sequence_length}], got {tuple(query_positions.shape)}')
+
+    lengths = topk_length.to(device=block_indices.device, dtype=torch.long)
+    selected_block_counts = torch.div(
+        lengths.clamp_min(0), block_size, rounding_mode='floor'
+    ).clamp_max(block_slots)
+    tail_lengths = lengths.clamp_min(0).remainder(block_size)
+    block_offsets = torch.arange(
+        block_slots, device=block_indices.device, dtype=torch.long)
+    lane_offsets = torch.arange(
+        block_size, device=block_indices.device, dtype=torch.long)
+    valid_blocks = (
+        block_offsets[None, None, :]
+        < selected_block_counts[..., None]
+    )
+    block_tokens = (
+        block_indices.to(torch.long)[..., None] * block_size
+        + lane_offsets
+    ).reshape(batch, sequence_length, block_slots * block_size)
+    valid_block_tokens = valid_blocks[..., None].expand(
+        -1, -1, -1, block_size).reshape(
+            batch, sequence_length, block_slots * block_size)
+
+    token_slots = block_slots * block_size + block_size - 1
+    scratch = torch.full(
+        (batch, sequence_length, token_slots + 1),
+        -1,
+        device=block_indices.device,
+        dtype=torch.int32,
+    )
+    scratch[..., :block_slots * block_size] = torch.where(
+        valid_block_tokens,
+        block_tokens.to(torch.int32),
+        torch.full_like(block_tokens, -1, dtype=torch.int32),
+    )
+
+    tail_offsets = torch.arange(
+        block_size - 1, device=block_indices.device, dtype=torch.long)
+    tail_valid = tail_offsets[None, None, :] < tail_lengths[..., None]
+    tail_destinations = (
+        selected_block_counts[..., None] * block_size + tail_offsets
+    )
+    tail_start = (
+        torch.div(
+            query_positions + 1, block_size, rounding_mode='floor'
+        ) * block_size
+    )
+    tail_tokens = tail_start[None, :, None] + tail_offsets
+    invalid_destination = torch.full_like(tail_destinations, token_slots)
+    scratch.scatter_(
+        -1,
+        torch.where(tail_valid, tail_destinations, invalid_destination),
+        torch.where(
+            tail_valid,
+            tail_tokens.expand(batch, -1, -1).to(torch.int32),
+            torch.full_like(tail_destinations, -1, dtype=torch.int32),
+        ),
+    )
+    return scratch[..., :token_slots].contiguous()
 
 
 def _valid_selected_indices(
@@ -442,6 +536,7 @@ class _QSASelectedKVFunction(Function):
         dkv_accum_dtype: str,
         selected_token_group_size: Optional[int],
         dkv_reduction: str,
+        route_block_size: int,
     ):
         resolved = backend
         if resolved == "triton":
@@ -449,7 +544,7 @@ class _QSASelectedKVFunction(Function):
 
             output, lse = qsa_selected_kv_forward(
                 query, key, value, topk_indices, topk_length, softmax_scale, causal, query_positions,
-                key_position_offset)
+                key_position_offset, route_block_size=route_block_size)
         else:
             output, lse = _torch_selected_kv_forward(
                 query, key, value, topk_indices, topk_length, softmax_scale, causal, query_position_offset,
@@ -487,6 +582,7 @@ class _QSASelectedKVFunction(Function):
         ctx.dkv_accum_dtype = dkv_accum_dtype
         ctx.selected_token_group_size = selected_token_group_size
         ctx.dkv_reduction = effective_dkv_reduction
+        ctx.route_block_size = route_block_size
         return output, lse
 
     @staticmethod
@@ -513,6 +609,7 @@ class _QSASelectedKVFunction(Function):
                 selected_token_group_size=ctx.selected_token_group_size,
                 segmented_metadata=ctx.segmented_metadata,
                 dkv_reduction=ctx.dkv_reduction,
+                route_block_size=ctx.route_block_size,
             )
         else:
             grad_query, grad_key, grad_value = _torch_selected_kv_backward(
@@ -535,7 +632,7 @@ class _QSASelectedKVFunction(Function):
                 ctx.needs_input_grad[2],
             )
         return (grad_query, grad_key, grad_value, None, None, None, None, None, None, None, None, None, None,
-                None, None)
+                None, None, None)
 
 
 class _QSASelectedKVPackedFunction(Function):
@@ -558,6 +655,7 @@ class _QSASelectedKVPackedFunction(Function):
         key_position_offset: int,
         dkv_accum_dtype: str,
         dkv_reduction: str,
+        route_block_size: int,
     ):
         if backend != 'triton':
             raise RuntimeError('packed selected-KV autograd requires the Triton backend')
@@ -575,6 +673,7 @@ class _QSASelectedKVPackedFunction(Function):
             softmax_scale,
             causal=causal,
             key_position_offset=key_position_offset,
+            route_block_size=route_block_size,
         )
         ctx.save_for_backward(
             query,
@@ -594,6 +693,7 @@ class _QSASelectedKVPackedFunction(Function):
         ctx.key_position_offset = key_position_offset
         ctx.dkv_accum_dtype = dkv_accum_dtype
         ctx.dkv_reduction = dkv_reduction
+        ctx.route_block_size = route_block_size
         return output, lse
 
     @staticmethod
@@ -630,11 +730,13 @@ class _QSASelectedKVPackedFunction(Function):
             key_position_offset=ctx.key_position_offset,
             dkv_accum_dtype=ctx.dkv_accum_dtype,
             dkv_reduction=ctx.dkv_reduction,
+            route_block_size=ctx.route_block_size,
         )
         return (
             grad_query,
             grad_key,
             grad_value,
+            None,
             None,
             None,
             None,
@@ -666,6 +768,7 @@ def qsa_sparse_forward(
     dkv_accum_dtype: str = 'bf16',
     selected_token_group_size: Optional[int] = None,
     dkv_reduction: str = 'atomic',
+    route_block_size: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run QSA selected-KV attention.
 
@@ -674,6 +777,7 @@ def qsa_sparse_forward(
     parity tests and explicit fallback.  The function never constructs a
     dense attention mask or a full score matrix.  ``dkv_reduction='segmented'``
     is an experimental inverse-CSR path; ``atomic`` is the tuned default.
+    ``route_block_size > 1`` selects the compact complete-block metadata ABI.
     """
 
     sq, sk, batch, num_q_heads, num_kv_heads, head_dim, topk_indices, topk_length = _validate_inputs(
@@ -692,10 +796,26 @@ def qsa_sparse_forward(
     dkv_accum_dtype = str(dkv_accum_dtype).lower()
     if dkv_accum_dtype not in {'bf16', 'fp32'}:
         raise ValueError(f"unsupported QSA dkv_accum_dtype={dkv_accum_dtype!r}; choose 'bf16' or 'fp32'")
-    dkv_reduction = str(dkv_reduction).lower()
-    if dkv_reduction not in {'atomic', 'segmented'}:
+    effective_dkv_reduction = os.environ.get(
+        'MCORE_BRIDGE_QSA_DKV_REDUCTION', dkv_reduction).lower()
+    if effective_dkv_reduction not in {'atomic', 'segmented'}:
         raise ValueError(
-            f"unsupported QSA dkv_reduction={dkv_reduction!r}; choose 'atomic' or 'segmented'")
+            f"unsupported QSA dkv_reduction={effective_dkv_reduction!r}; "
+            "choose 'atomic' or 'segmented'")
+    route_block_size = int(route_block_size)
+    if route_block_size <= 0:
+        raise ValueError('QSA route_block_size must be positive')
+    if (route_block_size > 1 and selected_token_group_size is not None
+            and int(selected_token_group_size) != route_block_size):
+        raise ValueError(
+            'QSA compact route block size must match selected_token_group_size')
+    if route_block_size > 1 and effective_dkv_reduction == 'segmented':
+        raise ValueError(
+            'QSA compact block route currently requires atomic dK/dV reduction')
+    if route_block_size > 1 and (not causal or int(key_position_offset) != 0):
+        raise ValueError(
+            'QSA compact block route currently requires causal attention and '
+            'key_position_offset=0')
     if topk_indices.dtype != torch.int32:
         topk_indices = topk_indices.to(torch.int32)
     if topk_length.dtype != torch.int32:
@@ -709,6 +829,14 @@ def qsa_sparse_forward(
         raise ValueError(
             f"QSA query_positions must have shape [{query.shape[0]}], got {tuple(query_positions.shape)}")
     query_positions = query_positions.contiguous()
+    if route_block_size > 1 and actual != 'triton':
+        topk_indices = qsa_expand_block_route(
+            topk_indices,
+            topk_length,
+            query_positions,
+            route_block_size,
+        )
+        route_block_size = 1
     # Triton and the gather path both benefit from compact metadata.  The
     # conversion does not touch Q/K/V and remains outside the autograd graph.
     topk_indices = topk_indices.contiguous()
@@ -732,7 +860,8 @@ def qsa_sparse_forward(
         int(query_tile_size),
         dkv_accum_dtype,
         selected_token_group_size,
-        dkv_reduction,
+        effective_dkv_reduction,
+        route_block_size,
     )
 
 
@@ -752,10 +881,12 @@ def qsa_sparse_forward_packed(
     selected_token_group_size: Optional[int] = None,
     dkv_reduction: str = 'atomic',
     causal: bool = True,
+    route_block_size: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run selected-KV attention over packed THD segments.
 
-    ``topk_indices`` contains segment-local token IDs, as produced by
+    ``topk_indices`` contains segment-local token IDs, or compact complete-
+    block IDs when ``route_block_size > 1``, as produced by
     ``QSAIndexer.select_topk_packed``.  The Triton/atomic path uses one varlen
     launch for all segments; the torch and segmented-reduction paths retain the
     auditable per-segment fallback until their metadata contracts are fused.
@@ -812,6 +943,19 @@ def qsa_sparse_forward_packed(
         raise ValueError(
             f'unsupported QSA packed dkv_reduction={effective_dkv_reduction!r}; '
             "choose 'atomic' or 'segmented'")
+    route_block_size = int(route_block_size)
+    if route_block_size <= 0:
+        raise ValueError('QSA packed route_block_size must be positive')
+    if (route_block_size > 1 and selected_token_group_size is not None
+            and int(selected_token_group_size) != route_block_size):
+        raise ValueError(
+            'QSA packed compact route block size must match selected_token_group_size')
+    if route_block_size > 1 and effective_dkv_reduction != 'atomic':
+        raise ValueError(
+            'QSA packed compact block route currently requires atomic dK/dV reduction')
+    if route_block_size > 1 and not causal:
+        raise ValueError(
+            'QSA packed compact block route currently requires causal attention')
 
     # Build compact device metadata once.  repeat_interleave is O(T) and
     # replaces the previous Python launch loop; all selected IDs remain local
@@ -830,6 +974,14 @@ def qsa_sparse_forward_packed(
     key_lengths = (cu_kv[1:] - cu_kv[:-1]).to(torch.long).index_select(0, segment_ids)
     local_positions = torch.arange(
         total_q, device=query_thd.device, dtype=torch.long) - q_segment_starts
+    if route_block_size > 1 and resolved.actual != 'triton':
+        topk_indices = qsa_expand_block_route(
+            topk_indices,
+            topk_length,
+            local_positions,
+            route_block_size,
+        )
+        route_block_size = 1
     packed_indices = topk_indices[0].to(
         device=query_thd.device, dtype=torch.int32).contiguous()
     packed_lengths = topk_length[0].to(
@@ -855,6 +1007,7 @@ def qsa_sparse_forward_packed(
             0,
             dkv_accum_dtype,
             effective_dkv_reduction,
+            route_block_size,
         )
         packed_lse = packed_lse.unsqueeze(0)
         output = packed_output.unsqueeze(1)
@@ -890,7 +1043,8 @@ def qsa_sparse_forward_packed(
             require_backend=require_backend,
             dkv_accum_dtype=dkv_accum_dtype,
             selected_token_group_size=selected_token_group_size,
-            dkv_reduction=dkv_reduction,
+            dkv_reduction=effective_dkv_reduction,
+            route_block_size=route_block_size,
         )
         outputs.append(segment_output)
         lses.append(segment_lse)
@@ -933,6 +1087,7 @@ __all__ = [
     "QSAKernelError",
     "QSAKernelUnavailable",
     "QSAResolvedBackend",
+    "qsa_expand_block_route",
     "qsa_sparse_forward",
     "qsa_sparse_forward_packed",
     "qsa_sparse_forward_reference",

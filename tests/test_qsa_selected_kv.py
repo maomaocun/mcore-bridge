@@ -12,8 +12,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from mcore_bridge.model.modules.qsa_attention import (qsa_sparse_forward, qsa_sparse_forward_packed,
-                                                      qsa_sparse_forward_reference, resolve_qsa_backend)
+from mcore_bridge.model.modules.qsa_attention import (qsa_expand_block_route, qsa_sparse_forward,
+                                                      qsa_sparse_forward_packed, qsa_sparse_forward_reference,
+                                                      resolve_qsa_backend)
 from mcore_bridge.model.modules.qsa_cp_exchange import _build_owner_plan
 from mcore_bridge.model.modules.qsa_indexer import QSAIndexer
 from mcore_bridge.model.modules.qsa_triton import (
@@ -255,6 +256,30 @@ def test_triton_packed_indexer_direct_fill_matches_segment_contract_on_sm90():
         ratio,
         block_topk,
     )
+    compact = qsa_indexer_fused_topk_packed(
+        query,
+        block_keys,
+        block_starts,
+        block_counts,
+        query_positions,
+        ratio,
+        block_topk,
+        return_block_ids=True,
+    )
+    complete = torch.minimum(
+        block_counts.to(torch.long),
+        (query_positions.to(torch.long) + 1) // ratio,
+    )
+    lengths = (
+        complete.clamp_max(block_topk) * ratio
+        + query_positions.to(torch.long) + 1
+        - complete * ratio
+    ).to(torch.int32).unsqueeze(0)
+    assert torch.equal(
+        qsa_expand_block_route(
+            compact.unsqueeze(0), lengths, query_positions, ratio)[0],
+        actual,
+    )
     expected = torch.full_like(actual, -1)
     for row in range(total):
         position = int(query_positions[row].item())
@@ -308,6 +333,30 @@ def test_triton_packed_indexer_mixed_short_long_dispatch_matches_sm90():
         query_positions,
         ratio,
         block_topk,
+    )
+    compact = qsa_indexer_fused_topk_packed(
+        query,
+        block_keys,
+        block_starts,
+        block_counts,
+        query_positions,
+        ratio,
+        block_topk,
+        return_block_ids=True,
+    )
+    complete = torch.minimum(
+        block_counts.to(torch.long),
+        (query_positions.to(torch.long) + 1) // ratio,
+    )
+    lengths = (
+        complete.clamp_max(block_topk) * ratio
+        + query_positions.to(torch.long) + 1
+        - complete * ratio
+    ).to(torch.int32).unsqueeze(0)
+    assert torch.equal(
+        qsa_expand_block_route(
+            compact.unsqueeze(0), lengths, query_positions, ratio)[0],
+        actual,
     )
     expected = torch.full_like(actual, -1)
     short_length = segments[0]
@@ -546,6 +595,94 @@ def test_indexer_returns_causal_int32_indices_and_tail_without_s_square_mask():
     assert 10 in indices[0, 10, :int(lengths[0, 10])]
 
 
+def test_compact_block_route_expands_to_public_token_contract():
+    config = _indexer_config()
+    indexer = QSAIndexer(config)
+    hidden = torch.randn(23, 2, config.hidden_size)
+    freqs = torch.zeros(23, 1, 1, config.indexer_head_dim)
+    token_indices, token_lengths = indexer.select_topk(
+        hidden, freqs, backend='torch')
+    block_indices, block_lengths = indexer.select_topk(
+        hidden, freqs, backend='torch', return_block_ids=True)
+    expanded = qsa_expand_block_route(
+        block_indices,
+        block_lengths,
+        torch.arange(hidden.shape[0]),
+        config.indexer_compress_ratio,
+    )
+    assert block_indices.shape == (2, 23, indexer.block_topk)
+    assert torch.equal(block_lengths, token_lengths)
+    assert torch.equal(expanded, token_indices)
+
+    query = torch.randn(23, 2, 4, 8)
+    key = torch.randn(23, 2, 2, 8)
+    value = torch.randn_like(key)
+    expected = qsa_sparse_forward(
+        query, key, value, token_indices, token_lengths, backend='torch')
+    actual = qsa_sparse_forward(
+        query,
+        key,
+        value,
+        block_indices,
+        block_lengths,
+        backend='torch',
+        selected_token_group_size=config.indexer_compress_ratio,
+        route_block_size=config.indexer_compress_ratio,
+    )
+    assert torch.equal(actual[0], expected[0])
+    assert torch.equal(actual[1], expected[1])
+
+
+def test_compact_block_route_rejects_effective_segmented_override(monkeypatch):
+    query = torch.randn(5, 1, 4, 8)
+    key = torch.randn(5, 1, 2, 8)
+    value = torch.randn_like(key)
+    blocks = torch.tensor([
+        [[-1], [-1], [-1], [0], [0]],
+    ], dtype=torch.int32)
+    lengths = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int32)
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_DKV_REDUCTION', 'segmented')
+    with pytest.raises(ValueError, match='compact block route.*atomic'):
+        qsa_sparse_forward(
+            query,
+            key,
+            value,
+            blocks,
+            lengths,
+            backend='torch',
+            selected_token_group_size=4,
+            route_block_size=4,
+        )
+
+
+@pytest.mark.parametrize(
+    ('causal', 'key_position_offset'),
+    ((False, 0), (True, 4)),
+)
+def test_compact_block_route_rejects_unreconstructable_tail(
+        causal, key_position_offset):
+    query = torch.randn(5, 1, 4, 8)
+    key = torch.randn(5, 1, 2, 8)
+    value = torch.randn_like(key)
+    blocks = torch.tensor([
+        [[-1], [-1], [-1], [0], [0]],
+    ], dtype=torch.int32)
+    lengths = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int32)
+    with pytest.raises(ValueError, match='causal attention.*key_position_offset=0'):
+        qsa_sparse_forward(
+            query,
+            key,
+            value,
+            blocks,
+            lengths,
+            backend='torch',
+            causal=causal,
+            key_position_offset=key_position_offset,
+            selected_token_group_size=4,
+            route_block_size=4,
+        )
+
+
 def test_indexer_route_lengths_cover_non_aligned_remainders():
     config = _indexer_config()
     indexer = QSAIndexer(config)
@@ -676,6 +813,51 @@ def test_qsa_selection_zeroes_packed_alignment_tail_without_labels():
     assert torch.equal(indices[0, 12:], torch.full((4, 5), -1, dtype=torch.int32))
 
 
+def test_qwen4_exp_selection_uses_compact_route_for_triton_atomic(monkeypatch):
+    class FakeIndexer:
+        compress_ratio = 4
+        return_block_ids = None
+
+        @torch.no_grad()
+        def select_topk(self, hidden_states, freqs, **kwargs):
+            self.return_block_ids = kwargs['return_block_ids']
+            slots = 2 if self.return_block_ids else 11
+            indices = torch.zeros(
+                (1, hidden_states.shape[0], slots), dtype=torch.int32)
+            lengths = torch.ones(
+                (1, hidden_states.shape[0]), dtype=torch.int32)
+            return indices, lengths
+
+    monkeypatch.setattr(
+        'mcore_bridge.model.gpts.qwen4_exp.resolve_qsa_backend',
+        lambda requested, device, require: SimpleNamespace(
+            requested=requested,
+            actual='triton',
+            fallback_reason=None,
+        ),
+    )
+    indexer = FakeIndexer()
+    layer = object.__new__(Qwen4ExpLayer)
+    layer.self_attention = SimpleNamespace(indexer=indexer)
+    layer.config = SimpleNamespace(
+        qsa_kernel_backend='triton', csa_dense_mode=False,
+        require_qsa_kernel=True, qsa_dense_fallback_max_seq_len=4096,
+        tensor_model_parallel_size=1, sequence_parallel=False,
+        hidden_size=4, context_parallel_size=1, qsa_cp_mode='disabled',
+        cp_partition_mode='zigzag', qsa_indexer_query_tile_size=8,
+        qsa_indexer_key_tile_size=8, qsa_dkv_reduction='atomic',
+        qsa_compact_block_route=True)
+    hidden = torch.randn(16, 1, 4)
+    selected = layer._qsa_select_topk(
+        hidden,
+        {'packed_seq_params': None, 'rotary_pos_emb': torch.zeros(16, 1, 1, 1),
+         'attention_mask': None, 'inference_context': None,
+         'attention_bias': None})
+    assert indexer.return_block_ids is True
+    assert selected[0].shape == (1, 16, 2)
+    assert selected[-1] == 4
+
+
 def test_selected_kv_empty_route_rows_are_zero_and_do_not_backpropagate():
     torch.manual_seed(241)
     query = torch.randn(5, 2, 4, 3, requires_grad=True)
@@ -758,6 +940,13 @@ def test_triton_fused_indexer_topk_matches_torch_sets_on_sm90():
     expected, expected_lengths = indexer._select_from_projected(
         q, block_keys, positions, backend='torch', query_tile_size=8, key_tile_size=16)
     actual = qsa_indexer_fused_topk_with_ratio(q, block_keys, positions, 2, 8)
+    compact = qsa_indexer_fused_topk_with_ratio(
+        q, block_keys, positions, 2, 8, return_block_ids=True)
+    assert compact.shape == (2, 64, 8)
+    assert torch.equal(
+        qsa_expand_block_route(compact, expected_lengths, positions, 2),
+        actual,
+    )
     assert torch.equal(expected_lengths, (
         ((positions + 1) // 2).clamp_max(8) * 2 + (positions + 1) % 2
     ).to(torch.int32).expand(2, -1))
@@ -986,3 +1175,123 @@ def test_triton_selected_kv_production_shape_default_dispatch_matches_torch(monk
         assert difference.abs().mean().item() < 2e-2
         assert difference.norm().item() / reference_grad.float().norm().item() < 2e-2
         assert difference.abs().max().item() <= 0.5
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_triton_compact_block_route_forward_backward_matches_token_route():
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('requires H100/SM90')
+    torch.manual_seed(2718)
+    device = 'cuda'
+    sq, hq, hkv, dim, ratio, block_topk = 35, 12, 2, 64, 4, 8
+    positions = torch.arange(sq, device=device, dtype=torch.int32)
+    blocks = torch.full(
+        (1, sq, block_topk), -1, device=device, dtype=torch.int32)
+    lengths = torch.zeros((1, sq), device=device, dtype=torch.int32)
+    for position in range(sq):
+        complete = (position + 1) // ratio
+        selected_count = min(complete, block_topk)
+        if selected_count:
+            blocks[0, position, :selected_count] = torch.arange(
+                selected_count - 1, -1, -1,
+                device=device,
+                dtype=torch.int32,
+            )
+        lengths[0, position] = (
+            selected_count * ratio + (position + 1 - complete * ratio))
+    tokens = qsa_expand_block_route(blocks, lengths, positions, ratio)
+    assert blocks.shape[-1] * ratio + ratio - 1 == tokens.shape[-1]
+    assert blocks.numel() < tokens.numel()
+
+    query_base = torch.randn(
+        sq, 1, hq, dim, device=device, dtype=torch.bfloat16)
+    key_base = torch.randn(
+        sq, 1, hkv, dim, device=device, dtype=torch.bfloat16)
+    value_base = torch.randn_like(key_base)
+    grad_output = torch.randn_like(query_base)
+    grad_lse = torch.randn(
+        1, hq, sq, device=device, dtype=torch.float32) * 0.01
+
+    def run(route, backend, block_size):
+        query = query_base.detach().clone().requires_grad_()
+        key = key_base.detach().clone().requires_grad_()
+        value = value_base.detach().clone().requires_grad_()
+        output, lse = qsa_sparse_forward(
+            query,
+            key,
+            value,
+            route,
+            lengths,
+            backend=backend,
+            require_backend=backend == 'triton',
+            query_positions=positions,
+            dkv_accum_dtype='bf16',
+            selected_token_group_size=ratio,
+            route_block_size=block_size,
+        )
+        ((output.float() * grad_output.float()).sum()
+         + (lse * grad_lse).sum()).backward()
+        return output.detach(), lse.detach(), query.grad, key.grad, value.grad
+
+    reference = run(tokens, 'torch', 1)
+    actual = run(blocks, 'triton', ratio)
+    assert torch.allclose(actual[0].float(), reference[0].float(), atol=2e-2, rtol=2e-2)
+    assert torch.allclose(actual[1], reference[1], atol=2e-5, rtol=2e-5)
+    assert torch.allclose(actual[2].float(), reference[2].float(), atol=5e-2, rtol=5e-2)
+    for actual_grad, reference_grad in zip(actual[3:], reference[3:]):
+        difference = actual_grad.float() - reference_grad.float()
+        assert difference.abs().mean().item() < 2e-2
+        assert difference.norm().item() / reference_grad.float().norm().item() < 2e-2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_triton_packed_compact_block_route_matches_token_route():
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('requires H100/SM90')
+    torch.manual_seed(3141)
+    device = 'cuda'
+    segments = (19, 13)
+    total = sum(segments)
+    hq, hkv, dim, ratio, block_topk = 12, 2, 64, 4, 4
+    cu = torch.tensor(
+        [0, segments[0], total], device=device, dtype=torch.int32)
+    local_positions = torch.cat(tuple(
+        torch.arange(length, device=device, dtype=torch.int32)
+        for length in segments
+    ))
+    blocks = torch.full(
+        (1, total, block_topk), -1, device=device, dtype=torch.int32)
+    lengths = torch.zeros((1, total), device=device, dtype=torch.int32)
+    for token, position in enumerate(local_positions.tolist()):
+        complete = (position + 1) // ratio
+        selected_count = min(complete, block_topk)
+        if selected_count:
+            blocks[0, token, :selected_count] = torch.arange(
+                selected_count, device=device, dtype=torch.int32)
+        lengths[0, token] = (
+            selected_count * ratio + (position + 1 - complete * ratio))
+    tokens = qsa_expand_block_route(
+        blocks, lengths, local_positions, ratio)
+
+    query = torch.randn(
+        total, hq, dim, device=device, dtype=torch.bfloat16)
+    key = torch.randn(
+        total, hkv, dim, device=device, dtype=torch.bfloat16)
+    value = torch.randn_like(key)
+    reference = qsa_sparse_forward_packed(
+        query, key, value, tokens, lengths, cu, cu, backend='torch')
+    actual = qsa_sparse_forward_packed(
+        query,
+        key,
+        value,
+        blocks,
+        lengths,
+        cu,
+        cu,
+        backend='triton',
+        require_backend=True,
+        selected_token_group_size=ratio,
+        route_block_size=ratio,
+    )
+    assert torch.allclose(actual[0].float(), reference[0].float(), atol=2e-2, rtol=2e-2)
+    assert torch.allclose(actual[1], reference[1], atol=2e-5, rtol=2e-5)
