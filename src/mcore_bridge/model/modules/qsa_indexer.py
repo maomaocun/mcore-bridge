@@ -34,15 +34,17 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 class QSAIndexer(nn.Module):
-    """Produce canonical QSA token lists without constructing an S-by-S mask.
+    """Produce QSA selected-KV routes without constructing an S-by-S mask.
 
     ``select_topk`` is the supported selected-KV API.  On the production BF16
     path it dispatches to a device-side packed-key Top-K kernel; ``select_mask`` remains
     as an intentionally expensive compatibility adapter for
     ``qsa_kernel_backend=none`` and old callers.  Both methods share the same
     block score and tie-breaking convention: descending score, then ascending
-    block id.  The stable ordering matters for reproducible index dumps and
-    does not change attention mathematically.
+    block id.  The public token route preserves that canonical order for
+    reproducible index dumps.  The compact production route guarantees the
+    same exact block set but may retain a deterministic kernel-internal
+    permutation because selected-KV attention is invariant to route order.
     """
 
     def __init__(self, config):
@@ -438,9 +440,10 @@ class QSAIndexer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return route IDs and token lengths for selected-KV attention.
 
-        ``return_block_ids=False`` preserves the public token-ID contract.
-        The compact production form uses ``return_block_ids=True`` and has
-        shape ``[B,S,block_topk]``.
+        ``return_block_ids=False`` preserves the public, score-ordered token-ID
+        contract.  The compact production form uses ``return_block_ids=True``,
+        has shape ``[B,S,block_topk]``, and guarantees the exact selected set;
+        its block order is deliberately not part of the public ABI.
         """
 
         if hidden_states.ndim != 3:

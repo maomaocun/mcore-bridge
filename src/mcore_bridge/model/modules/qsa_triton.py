@@ -203,7 +203,7 @@ if TRITON_AVAILABLE:
         BATCH_ONE: tl.constexpr,
         OUTPUT_BLOCKS: tl.constexpr,
     ):
-        """Fuse indexer score, causal filtering, streaming Top-K and token expansion.
+        """Fuse indexer score, causal filtering, streaming Top-K and route output.
 
         One program owns one ``(batch, query)`` row.  It walks compressed blocks
         in device memory and keeps only ``BLOCK_TOPK`` packed score/id keys in
@@ -229,6 +229,30 @@ if TRITON_AVAILABLE:
             num_blocks, (query_position + 1) // compress_ratio
         ).to(tl.int32)
         block_count = tl.minimum(complete_blocks, BLOCK_TOPK).to(tl.int32)
+
+        if OUTPUT_BLOCKS:
+            # Compact rows whose full causal prefix fits in the budget need no
+            # scores at all.  Handle them in the same launch so production no
+            # longer builds O(S) short/long row lists or synchronizes the host
+            # merely to dispatch a second direct-fill kernel.
+            if complete_blocks <= BLOCK_TOPK:
+                block_offsets = tl.arange(0, BLOCK_TOPK)
+                if BATCH_ONE:
+                    out_base = out_ptr + row * stride_os
+                elif USE_TOKEN_IDS:
+                    out_base = out_ptr + row * stride_os
+                else:
+                    out_base = (
+                        out_ptr
+                        + batch * stride_ob
+                        + query * stride_os
+                    )
+                tl.store(
+                    out_base + block_offsets,
+                    tl.where(block_offsets < block_count, block_offsets, -1),
+                    mask=block_offsets < BLOCK_TOPK,
+                )
+                return
 
         head_offsets = tl.arange(0, BLOCK_H)
         dim_offsets = tl.arange(0, BLOCK_D)
@@ -303,7 +327,14 @@ if TRITON_AVAILABLE:
                 )
                 acc = tl.maximum(acc, tl.sort(candidates, descending=True))
 
-        acc = tl.sort(acc, descending=True)
+        # The compact internal ABI consumes a set of complete-block IDs; it
+        # does not require score order.  Short rows returned above, while the
+        # remaining saturated rows already hold the exact Top-K in bitonic
+        # layout.  Avoiding one more 512-wide sort shortens the long-row hot
+        # path.  The public token route keeps canonical descending-score order
+        # for compatibility/debugging.
+        if not OUTPUT_BLOCKS:
+            acc = tl.sort(acc, descending=True)
         block_offsets = tl.arange(0, BLOCK_TOPK)
         packed_ids = (acc & INDEX_MASK).to(tl.int32)
         block_ids = INDEX_MASK - packed_ids
@@ -485,6 +516,20 @@ if TRITON_AVAILABLE:
         ).to(tl.int32)
         block_count = tl.minimum(complete_blocks, BLOCK_TOPK).to(tl.int32)
 
+        if OUTPUT_BLOCKS:
+            # A long packed document still has an early prefix for which all
+            # complete blocks fit in the budget.  The segment-level dispatcher
+            # cannot identify those rows, so bypass QK/Top-K directly here.
+            if complete_blocks <= BLOCK_TOPK:
+                block_offsets = tl.arange(0, BLOCK_TOPK)
+                out_base = out_ptr + token * stride_os
+                tl.store(
+                    out_base + block_offsets,
+                    tl.where(block_offsets < block_count, block_offsets, -1),
+                    mask=block_offsets < BLOCK_TOPK,
+                )
+                return
+
         head_offsets = tl.arange(0, BLOCK_H)
         dim_offsets = tl.arange(0, BLOCK_D)
         head_mask = head_offsets < num_heads
@@ -540,7 +585,12 @@ if TRITON_AVAILABLE:
             if tl.max(packed, axis=0) > tl.min(acc, axis=0):
                 acc = tl.maximum(acc, tl.sort(packed, descending=True))
 
-        acc = tl.sort(acc, descending=True)
+        # Short compact rows returned above.  Compact attention treats every
+        # remaining saturated route as a set, so retain its exact bitonic
+        # Top-K layout.  Token-ID compatibility output retains canonical score
+        # ordering.
+        if not OUTPUT_BLOCKS:
+            acc = tl.sort(acc, descending=True)
         block_offsets = tl.arange(0, BLOCK_TOPK)
         packed_ids = (acc & INDEX_MASK).to(tl.int32)
         valid_blocks = (acc != 0) & (block_offsets < block_count)
@@ -3743,7 +3793,9 @@ def qsa_indexer_fused_topk_with_ratio(
     ``[B,S,K]`` with the same block-first plus causal-tail layout as
     :class:`QSAIndexer`.  ``return_block_ids=True`` retains only the compact
     ``[B,S,block_topk]`` complete-block route; attention derives token lanes
-    and the causal tail directly from that representation.
+    and the causal tail directly from that representation.  Compact output is
+    an exact deterministic Top-K set, but its block order is kernel-internal;
+    only the public token-ID output promises canonical score order.
     """
 
     if not TRITON_AVAILABLE:
@@ -3986,6 +4038,7 @@ def qsa_indexer_fused_topk_with_ratio(
         raise ValueError(
             'QSA fused indexer direct-fill max multiple must be positive')
     if (streaming_enabled and splits == 1
+            and not return_block_ids
             and num_blocks <= direct_max_multiple * block_topk
             and os.environ.get('MCORE_BRIDGE_QSA_INDEXER_MIXED_DIRECT', '1') != '0'
             and os.environ.get('MCORE_BRIDGE_QSA_INDEXER_PARTIAL', '0') != '1'):

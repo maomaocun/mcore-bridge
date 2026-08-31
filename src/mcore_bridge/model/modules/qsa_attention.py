@@ -230,12 +230,14 @@ def qsa_expand_block_route(
     query_positions: torch.Tensor,
     block_size: int,
 ) -> torch.Tensor:
-    """Materialize the compatibility token route from compact block IDs.
+    """Materialize a compatibility token route from compact block IDs.
 
     Production Triton attention performs this mapping in registers.  This
     adapter exists for the torch/reference backend, external token-ID callers,
     and parity tests; using it at long context intentionally gives up the
-    compact route's memory saving.
+    compact route's memory saving.  Token ordering follows ``block_indices``:
+    compact routes guarantee the exact selected set, not the public indexer's
+    canonical descending-score order.
     """
 
     block_size = int(block_size)

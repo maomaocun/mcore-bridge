@@ -48,6 +48,14 @@ def _dense_selected_attention(query, key, value, indices, lengths, scale):
     return output, lse
 
 
+def _sorted_valid_route(indices, lengths):
+    """Canonicalize route sets without treating compact order as an ABI."""
+
+    slots = torch.arange(indices.shape[-1], device=indices.device)
+    valid = slots.reshape(*([1] * (indices.ndim - 1)), -1) < lengths.long().unsqueeze(-1)
+    return torch.where(valid, indices, torch.full_like(indices, -1)).sort(dim=-1).values
+
+
 def test_selected_kv_forward_matches_independent_gqa2_reference():
     torch.manual_seed(7)
     sq, batch, hq, hkv, dim, slots = 6, 2, 4, 2, 5, 5
@@ -275,10 +283,11 @@ def test_triton_packed_indexer_direct_fill_matches_segment_contract_on_sm90():
         + query_positions.to(torch.long) + 1
         - complete * ratio
     ).to(torch.int32).unsqueeze(0)
+    expanded = qsa_expand_block_route(
+        compact.unsqueeze(0), lengths, query_positions, ratio)[0]
     assert torch.equal(
-        qsa_expand_block_route(
-            compact.unsqueeze(0), lengths, query_positions, ratio)[0],
-        actual,
+        _sorted_valid_route(expanded, lengths[0]),
+        _sorted_valid_route(actual, lengths[0]),
     )
     expected = torch.full_like(actual, -1)
     for row in range(total):
@@ -353,10 +362,11 @@ def test_triton_packed_indexer_mixed_short_long_dispatch_matches_sm90():
         + query_positions.to(torch.long) + 1
         - complete * ratio
     ).to(torch.int32).unsqueeze(0)
+    expanded = qsa_expand_block_route(
+        compact.unsqueeze(0), lengths, query_positions, ratio)[0]
     assert torch.equal(
-        qsa_expand_block_route(
-            compact.unsqueeze(0), lengths, query_positions, ratio)[0],
-        actual,
+        _sorted_valid_route(expanded, lengths[0]),
+        _sorted_valid_route(actual, lengths[0]),
     )
     expected = torch.full_like(actual, -1)
     short_length = segments[0]
@@ -943,9 +953,10 @@ def test_triton_fused_indexer_topk_matches_torch_sets_on_sm90():
     compact = qsa_indexer_fused_topk_with_ratio(
         q, block_keys, positions, 2, 8, return_block_ids=True)
     assert compact.shape == (2, 64, 8)
+    expanded = qsa_expand_block_route(compact, expected_lengths, positions, 2)
     assert torch.equal(
-        qsa_expand_block_route(compact, expected_lengths, positions, 2),
-        actual,
+        _sorted_valid_route(expanded, expected_lengths),
+        _sorted_valid_route(actual, expected_lengths),
     )
     assert torch.equal(expected_lengths, (
         ((positions + 1) // 2).clamp_max(8) * 2 + (positions + 1) % 2
@@ -958,6 +969,40 @@ def test_triton_fused_indexer_topk_matches_torch_sets_on_sm90():
                 actual_row[actual_row >= 0].sort().values,
                 expected_row[expected_row >= 0].sort().values,
             )
+
+    # The compact route can retain the fused kernel's bitonic permutation.
+    # Exercise that representation through attention so set equivalence is
+    # also guarded at the operator boundary, not only in index metadata.
+    attention_q = torch.randn(
+        64, 2, 4, 16, device='cuda', dtype=torch.bfloat16)
+    attention_k = torch.randn(
+        64, 2, 2, 16, device='cuda', dtype=torch.bfloat16)
+    attention_v = torch.randn_like(attention_k)
+    token_output, token_lse = qsa_sparse_forward(
+        attention_q,
+        attention_k,
+        attention_v,
+        actual,
+        expected_lengths,
+        backend='triton',
+        require_backend=True,
+        query_positions=positions,
+    )
+    compact_output, compact_lse = qsa_sparse_forward(
+        attention_q,
+        attention_k,
+        attention_v,
+        compact,
+        expected_lengths,
+        backend='triton',
+        require_backend=True,
+        query_positions=positions,
+        selected_token_group_size=2,
+        route_block_size=2,
+    )
+    assert torch.allclose(
+        compact_output.float(), token_output.float(), atol=2e-2, rtol=2e-2)
+    assert torch.allclose(compact_lse, token_lse, atol=2e-5, rtol=2e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
