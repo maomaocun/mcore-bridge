@@ -1328,11 +1328,21 @@ def test_triton_fused_indexer_split_partial_matches_torch_on_sm90(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
-def test_triton_segmented_dkv_matches_relaxed_atomic_on_sm90():
+def test_triton_segmented_dkv_matches_relaxed_atomic_on_sm90(monkeypatch):
     if torch.cuda.get_device_capability() != (9, 0):
         pytest.skip('requires H100/SM90')
+    # Exercise the actual SM90 D=256 default independently from the grouped
+    # fallback test above; inherited tuning variables must not select it.
+    for name in (
+        'MCORE_BRIDGE_QSA_SEGMENT_FLATTEN_HEADS',
+        'MCORE_BRIDGE_QSA_SEGMENT_HEAD_TILE',
+        'MCORE_BRIDGE_QSA_SEGMENT_WARPS',
+    ):
+        monkeypatch.delenv(name, raising=False)
     torch.manual_seed(74)
-    sq, batch, hq, hkv, dim, ratio, block_topk = 64, 1, 4, 2, 16, 4, 4
+    # group_size=3 also exercises the masked final two-head tile used by
+    # narrow TP-local shapes.
+    sq, batch, hq, hkv, dim, ratio, block_topk = 64, 2, 6, 2, 256, 4, 4
     slots = block_topk * ratio + ratio - 1
     positions = torch.arange(sq, device='cuda', dtype=torch.int32)
     indices = torch.full((batch, sq, slots), -1, device='cuda', dtype=torch.int32)
@@ -1345,8 +1355,10 @@ def test_triton_segmented_dkv_matches_relaxed_atomic_on_sm90():
                       for block in range(selected_blocks)), [])
         values.extend(range(complete * ratio, complete * ratio + tail))
         if values:
-            indices[0, query, :len(values)] = torch.tensor(values, device='cuda', dtype=torch.int32)
-        lengths[0, query] = len(values)
+            selected = torch.tensor(
+                values, device='cuda', dtype=torch.int32)
+            indices[:, query, :len(values)] = selected
+        lengths[:, query] = len(values)
     q0 = torch.randn(sq, batch, hq, dim, device='cuda', dtype=torch.bfloat16)
     k0 = torch.randn(sq, batch, hkv, dim, device='cuda', dtype=torch.bfloat16)
     v0 = torch.randn_like(k0)

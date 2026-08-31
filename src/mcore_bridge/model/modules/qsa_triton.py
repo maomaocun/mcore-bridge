@@ -3758,14 +3758,17 @@ if TRITON_AVAILABLE:
         RATIO: tl.constexpr,
         GROUP_SIZE: tl.constexpr,
         BLOCK_H: tl.constexpr,
+        HEAD_TILE: tl.constexpr,
+        NUM_HEAD_TILES: tl.constexpr,
         BLOCK_OCC: tl.constexpr,
         BLOCK_D: tl.constexpr,
         HAS_GRAD_OUTPUT: tl.constexpr,
         HAS_GRAD_LSE: tl.constexpr,
         DKV_ACCUM_BF16: tl.constexpr,
         BATCH_ONE: tl.constexpr,
+        SPLIT_HEADS: tl.constexpr,
     ):
-        """Matrix-tiled inverse-CSR dK/dV reduction without atomics.
+        """Matrix-tiled inverse-CSR reduction with one owner CTA per head tile.
 
         The previous reducer traversed ``token -> occurrence -> head`` and
         reloaded each occurrence's Q/grad-output once per token in the
@@ -3778,8 +3781,10 @@ if TRITON_AVAILABLE:
         """
 
         program = tl.program_id(0)
-        kv_head = program % num_kv_heads
-        key_group = program // num_kv_heads
+        head_work = program % (num_kv_heads * NUM_HEAD_TILES)
+        kv_head = head_work // NUM_HEAD_TILES
+        head_tile = head_work - kv_head * NUM_HEAD_TILES
+        key_group = program // (num_kv_heads * NUM_HEAD_TILES)
         batch = key_group // num_blocks
         block = key_group - batch * num_blocks
         segment_start = tl.load(segment_start_ptr + key_group).to(tl.int32)
@@ -3798,6 +3803,11 @@ if TRITON_AVAILABLE:
             + kv_head * stride_kh
             + d_offsets[None, :] * stride_kd
         )
+        key_value_raw = tl.load(
+            key_ptrs,
+            mask=key_mask[:, None] & (d_offsets[None, :] < head_dim),
+            other=0.0,
+        )
         value_ptrs = (
             value_ptr
             + batch * stride_vb
@@ -3805,18 +3815,11 @@ if TRITON_AVAILABLE:
             + kv_head * stride_vh
             + d_offsets[None, :] * stride_vd
         )
-        key_value_raw = tl.load(
-            key_ptrs,
-            mask=key_mask[:, None] & (d_offsets[None, :] < head_dim),
-            other=0.0,
-        )
         value_value_raw = tl.load(
             value_ptrs,
             mask=key_mask[:, None] & (d_offsets[None, :] < head_dim),
             other=0.0,
         )
-        key_value = key_value_raw.to(tl.float32)
-        value_value = value_value_raw.to(tl.float32)
         grad_key_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
         grad_value_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
 
@@ -3843,8 +3846,12 @@ if TRITON_AVAILABLE:
                 same_batch = occurrence < segment_end
             else:
                 same_batch = (query_batch == batch) & (occurrence < segment_end)
-            for head_offset in tl.static_range(0, GROUP_SIZE):
+            for head_lane in tl.static_range(0, HEAD_TILE):
+                head_offset = head_tile * HEAD_TILE + head_lane
                 head = kv_head * GROUP_SIZE + head_offset
+                head_valid = (
+                    (head_offset < GROUP_SIZE) & (head < num_q_heads)
+                )
                 if BATCH_ONE:
                     q_ptrs = (
                         query_ptr
@@ -3909,31 +3916,21 @@ if TRITON_AVAILABLE:
                 q_value_raw = tl.load(
                     q_ptrs,
                     mask=same_batch[:, None]
-                    & (head < num_q_heads)
+                    & head_valid
                     & (d_offsets[None, :] < head_dim),
                     other=0.0,
                 )
                 grad_output_raw = tl.load(
                     grad_out_ptrs,
                     mask=same_batch[:, None]
-                    & (head < num_q_heads)
+                    & head_valid
                     & (d_offsets[None, :] < head_dim)
                     & HAS_GRAD_OUTPUT,
                     other=0.0,
                 )
                 lse = tl.load(
                     lse_ptrs,
-                    mask=same_batch,
-                    other=0.0,
-                ).to(tl.float32)
-                correction = tl.load(
-                    correction_ptrs,
-                    mask=same_batch,
-                    other=0.0,
-                ).to(tl.float32)
-                grad_lse = tl.load(
-                    grad_lse_ptrs,
-                    mask=same_batch & HAS_GRAD_LSE,
+                    mask=same_batch & head_valid,
                     other=0.0,
                 ).to(tl.float32)
                 score = tl.dot(
@@ -3943,11 +3940,21 @@ if TRITON_AVAILABLE:
                 ) * softmax_scale
                 probability = tl.exp2(
                     tl.where(
-                        same_batch[:, None] & key_mask[None, :],
+                        same_batch[:, None] & head_valid & key_mask[None, :],
                         (score - lse[:, None]) * 1.4426950408889634,
                         -float("inf"),
                     )
                 )
+                correction = tl.load(
+                    correction_ptrs,
+                    mask=same_batch & head_valid,
+                    other=0.0,
+                ).to(tl.float32)
+                grad_lse = tl.load(
+                    grad_lse_ptrs,
+                    mask=same_batch & head_valid & HAS_GRAD_LSE,
+                    other=0.0,
+                ).to(tl.float32)
                 d_probability = tl.dot(
                     grad_output_raw,
                     tl.trans(value_value_raw),
@@ -3959,7 +3966,7 @@ if TRITON_AVAILABLE:
                 )
                 grad_score = tl.where(
                     same_batch[:, None]
-                    & (head < num_q_heads)
+                    & head_valid
                     & key_mask[None, :],
                     grad_score,
                     0.0,
@@ -4004,31 +4011,373 @@ if TRITON_AVAILABLE:
             + d_offsets[None, :] * stride_dvd
         )
         output_mask = key_mask[:, None] & (d_offsets[None, :] < head_dim)
-        # The tail atomic launch runs before this kernel. Add its contribution
-        # before storing so a tail token shared with a later complete block is
-        # not overwritten by the segmented result.
-        existing_key = tl.load(
-            key_output_ptrs, mask=output_mask, other=0.0
-        ).to(tl.float32)
-        existing_value = tl.load(
-            value_output_ptrs, mask=output_mask, other=0.0
-        ).to(tl.float32)
-        grad_key_acc += existing_key
-        grad_value_acc += existing_value
-        if DKV_ACCUM_BF16:
-            tl.store(
-                key_output_ptrs,
-                grad_key_acc.to(tl.bfloat16),
-                mask=output_mask,
-            )
-            tl.store(
-                value_output_ptrs,
-                grad_value_acc.to(tl.bfloat16),
-                mask=output_mask,
-            )
+        if SPLIT_HEADS:
+            if DKV_ACCUM_BF16:
+                tl.atomic_add(
+                    key_output_ptrs,
+                    grad_key_acc.to(tl.bfloat16),
+                    mask=output_mask,
+                    sem="relaxed",
+                )
+                tl.atomic_add(
+                    value_output_ptrs,
+                    grad_value_acc.to(tl.bfloat16),
+                    mask=output_mask,
+                    sem="relaxed",
+                )
+            else:
+                tl.atomic_add(
+                    key_output_ptrs,
+                    grad_key_acc,
+                    mask=output_mask,
+                    sem="relaxed",
+                )
+                tl.atomic_add(
+                    value_output_ptrs,
+                    grad_value_acc,
+                    mask=output_mask,
+                    sem="relaxed",
+                )
         else:
-            tl.store(key_output_ptrs, grad_key_acc, mask=output_mask)
-            tl.store(value_output_ptrs, grad_value_acc, mask=output_mask)
+            # The tail atomic launch runs before this kernel. Add its
+            # contribution before storing so a tail token shared with a later
+            # complete block is not overwritten by the segmented result.
+            existing_key = tl.load(
+                key_output_ptrs, mask=output_mask, other=0.0
+            ).to(tl.float32)
+            existing_value = tl.load(
+                value_output_ptrs, mask=output_mask, other=0.0
+            ).to(tl.float32)
+            grad_key_acc += existing_key
+            grad_value_acc += existing_value
+            if DKV_ACCUM_BF16:
+                tl.store(
+                    key_output_ptrs,
+                    grad_key_acc.to(tl.bfloat16),
+                    mask=output_mask,
+                )
+                tl.store(
+                    value_output_ptrs,
+                    grad_value_acc.to(tl.bfloat16),
+                    mask=output_mask,
+                )
+            else:
+                tl.store(key_output_ptrs, grad_key_acc, mask=output_mask)
+                tl.store(value_output_ptrs, grad_value_acc, mask=output_mask)
+
+    @triton.jit
+    def _qsa_segmented_dkv_reduce_flattened_kernel(
+        query_ptr,
+        key_ptr,
+        value_ptr,
+        lse_ptr,
+        grad_out_ptr,
+        grad_lse_ptr,
+        correction_ptr,
+        occurrence_query_ptr,
+        segment_start_ptr,
+        grad_key_ptr,
+        grad_value_ptr,
+        seq_len_q,
+        seq_len_k,
+        num_blocks,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        softmax_scale,
+        stride_qb,
+        stride_qs,
+        stride_qh,
+        stride_qd,
+        stride_kb,
+        stride_ks,
+        stride_kh,
+        stride_kd,
+        stride_vb,
+        stride_vs,
+        stride_vh,
+        stride_vd,
+        stride_lseb,
+        stride_lseh,
+        stride_lses,
+        stride_gob,
+        stride_gos,
+        stride_goh,
+        stride_god,
+        stride_glseb,
+        stride_glseh,
+        stride_glses,
+        stride_cb,
+        stride_ch,
+        stride_cs,
+        stride_dkb,
+        stride_dks,
+        stride_dkh,
+        stride_dkd,
+        stride_dvb,
+        stride_dvs,
+        stride_dvh,
+        stride_dvd,
+        RATIO: tl.constexpr,
+        GROUP_SIZE: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        HEAD_TILE: tl.constexpr,
+        NUM_HEAD_TILES: tl.constexpr,
+        BLOCK_OCC: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        HAS_GRAD_OUTPUT: tl.constexpr,
+        HAS_GRAD_LSE: tl.constexpr,
+        DKV_ACCUM_BF16: tl.constexpr,
+        BATCH_ONE: tl.constexpr,
+        SPLIT_HEADS: tl.constexpr,
+    ):
+        """Reduce a block with occurrence and GQA-head rows fused into one MMA tile.
+
+        ``RATIO`` is only four for the production route, so treating each head
+        as an independent ``BLOCK_OCC x RATIO`` matrix leaves most of a Hopper
+        MMA instruction empty.  Flattening ``occurrence x head`` gives QK/dP a
+        wide M dimension and gives dK/dV a wide reduction dimension.  It also
+        makes adjacent GQA heads of one query contiguous in the gather stream.
+        """
+
+        program = tl.program_id(0)
+        head_work = program % (num_kv_heads * NUM_HEAD_TILES)
+        kv_head = head_work // NUM_HEAD_TILES
+        head_tile = head_work - kv_head * NUM_HEAD_TILES
+        key_group = program // (num_kv_heads * NUM_HEAD_TILES)
+        batch = key_group // num_blocks
+        block = key_group - batch * num_blocks
+        segment_start = tl.load(segment_start_ptr + key_group).to(tl.int32)
+        segment_end = tl.load(segment_start_ptr + key_group + 1).to(tl.int32)
+        if segment_start >= segment_end:
+            return
+
+        d_offsets = tl.arange(0, BLOCK_D)
+        token_offsets = tl.arange(0, RATIO)
+        key_positions = block * RATIO + token_offsets
+        key_mask = key_positions < seq_len_k
+        key_ptrs = (
+            key_ptr
+            + batch * stride_kb
+            + key_positions[:, None] * stride_ks
+            + kv_head * stride_kh
+            + d_offsets[None, :] * stride_kd
+        )
+        value_ptrs = (
+            value_ptr
+            + batch * stride_vb
+            + key_positions[:, None] * stride_vs
+            + kv_head * stride_vh
+            + d_offsets[None, :] * stride_vd
+        )
+        key_value_raw = tl.load(
+            key_ptrs,
+            mask=key_mask[:, None] & (d_offsets[None, :] < head_dim),
+            other=0.0,
+        )
+        value_value_raw = tl.load(
+            value_ptrs,
+            mask=key_mask[:, None] & (d_offsets[None, :] < head_dim),
+            other=0.0,
+        )
+        grad_key_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
+        grad_value_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
+        flat_offsets = tl.arange(0, BLOCK_M)
+        occurrence_lanes = flat_offsets // HEAD_TILE
+        head_lanes = flat_offsets - occurrence_lanes * HEAD_TILE
+        head_offsets = head_tile * HEAD_TILE + head_lanes
+        heads = kv_head * GROUP_SIZE + head_offsets
+        head_valid = (head_offsets < GROUP_SIZE) & (heads < num_q_heads)
+
+        for occurrence_offset in tl.range(
+            0, segment_end - segment_start, BLOCK_OCC
+        ):
+            occurrence = segment_start + occurrence_offset + occurrence_lanes
+            row = tl.load(
+                occurrence_query_ptr + occurrence,
+                mask=occurrence < segment_end,
+                other=0,
+            ).to(tl.int32)
+            if BATCH_ONE:
+                query_batch = tl.zeros((BLOCK_M,), dtype=tl.int32)
+                query = row
+                same_batch = occurrence < segment_end
+            else:
+                query_batch = row // seq_len_q
+                query = row - query_batch * seq_len_q
+                same_batch = (
+                    (query_batch == batch) & (occurrence < segment_end)
+                )
+            row_valid = same_batch & head_valid
+            q_ptrs = (
+                query_ptr
+                + query_batch[:, None] * stride_qb
+                + query[:, None] * stride_qs
+                + heads[:, None] * stride_qh
+                + d_offsets[None, :] * stride_qd
+            )
+            grad_out_ptrs = (
+                grad_out_ptr
+                + query_batch[:, None] * stride_gob
+                + query[:, None] * stride_gos
+                + heads[:, None] * stride_goh
+                + d_offsets[None, :] * stride_god
+            )
+            q_value_raw = tl.load(
+                q_ptrs,
+                mask=row_valid[:, None]
+                & (d_offsets[None, :] < head_dim),
+                other=0.0,
+            )
+            grad_output_raw = tl.load(
+                grad_out_ptrs,
+                mask=row_valid[:, None]
+                & (d_offsets[None, :] < head_dim)
+                & HAS_GRAD_OUTPUT,
+                other=0.0,
+            )
+            lse = tl.load(
+                lse_ptr
+                + query_batch * stride_lseb
+                + heads * stride_lseh
+                + query * stride_lses,
+                mask=row_valid,
+                other=0.0,
+            ).to(tl.float32)
+            correction = tl.load(
+                correction_ptr
+                + query_batch * stride_cb
+                + heads * stride_ch
+                + query * stride_cs,
+                mask=row_valid,
+                other=0.0,
+            ).to(tl.float32)
+            grad_lse = tl.load(
+                grad_lse_ptr
+                + query_batch * stride_glseb
+                + heads * stride_glseh
+                + query * stride_glses,
+                mask=row_valid & HAS_GRAD_LSE,
+                other=0.0,
+            ).to(tl.float32)
+            score = tl.dot(
+                q_value_raw,
+                tl.trans(key_value_raw),
+                out_dtype=tl.float32,
+            ) * softmax_scale
+            probability = tl.exp2(
+                tl.where(
+                    row_valid[:, None] & key_mask[None, :],
+                    (score - lse[:, None]) * 1.4426950408889634,
+                    -float("inf"),
+                )
+            )
+            d_probability = tl.dot(
+                grad_output_raw,
+                tl.trans(value_value_raw),
+                out_dtype=tl.float32,
+            )
+            grad_score = (
+                probability * (d_probability - correction[:, None])
+                + grad_lse[:, None] * probability
+            )
+            grad_score = tl.where(
+                row_valid[:, None] & key_mask[None, :],
+                grad_score,
+                0.0,
+            )
+            if DKV_ACCUM_BF16:
+                grad_key_acc += tl.dot(
+                    tl.trans(grad_score.to(tl.bfloat16)),
+                    q_value_raw,
+                    out_dtype=tl.float32,
+                ) * softmax_scale
+                grad_value_acc += tl.dot(
+                    tl.trans(probability.to(tl.bfloat16)),
+                    grad_output_raw,
+                    out_dtype=tl.float32,
+                )
+            else:
+                q_value = q_value_raw.to(tl.float32)
+                grad_output = grad_output_raw.to(tl.float32)
+                grad_key_acc += tl.sum(
+                    tl.trans(grad_score)[:, :, None]
+                    * q_value[None, :, :],
+                    axis=1,
+                ) * softmax_scale
+                grad_value_acc += tl.sum(
+                    tl.trans(probability)[:, :, None]
+                    * grad_output[None, :, :],
+                    axis=1,
+                )
+
+        key_output_ptrs = (
+            grad_key_ptr
+            + batch * stride_dkb
+            + key_positions[:, None] * stride_dks
+            + kv_head * stride_dkh
+            + d_offsets[None, :] * stride_dkd
+        )
+        value_output_ptrs = (
+            grad_value_ptr
+            + batch * stride_dvb
+            + key_positions[:, None] * stride_dvs
+            + kv_head * stride_dvh
+            + d_offsets[None, :] * stride_dvd
+        )
+        output_mask = key_mask[:, None] & (d_offsets[None, :] < head_dim)
+        if SPLIT_HEADS:
+            if DKV_ACCUM_BF16:
+                tl.atomic_add(
+                    key_output_ptrs,
+                    grad_key_acc.to(tl.bfloat16),
+                    mask=output_mask,
+                    sem="relaxed",
+                )
+                tl.atomic_add(
+                    value_output_ptrs,
+                    grad_value_acc.to(tl.bfloat16),
+                    mask=output_mask,
+                    sem="relaxed",
+                )
+            else:
+                tl.atomic_add(
+                    key_output_ptrs,
+                    grad_key_acc,
+                    mask=output_mask,
+                    sem="relaxed",
+                )
+                tl.atomic_add(
+                    value_output_ptrs,
+                    grad_value_acc,
+                    mask=output_mask,
+                    sem="relaxed",
+                )
+        else:
+            # Preserve the causal-tail contribution written before this launch.
+            existing_key = tl.load(
+                key_output_ptrs, mask=output_mask, other=0.0
+            ).to(tl.float32)
+            existing_value = tl.load(
+                value_output_ptrs, mask=output_mask, other=0.0
+            ).to(tl.float32)
+            grad_key_acc += existing_key
+            grad_value_acc += existing_value
+            if DKV_ACCUM_BF16:
+                tl.store(
+                    key_output_ptrs,
+                    grad_key_acc.to(tl.bfloat16),
+                    mask=output_mask,
+                )
+                tl.store(
+                    value_output_ptrs,
+                    grad_value_acc.to(tl.bfloat16),
+                    mask=output_mask,
+                )
+            else:
+                tl.store(key_output_ptrs, grad_key_acc, mask=output_mask)
+                tl.store(value_output_ptrs, grad_value_acc, mask=output_mask)
 
     @triton.jit
     def _qsa_segment_count_blocks_kernel(
@@ -6597,13 +6946,38 @@ def qsa_segmented_dkv_reduce(
     block_occ = int(os.environ.get('MCORE_BRIDGE_QSA_SEGMENT_BLOCK_OCC', '16'))
     if block_occ not in {16, 32, 64}:
         raise ValueError('QSA segmented BLOCK_OCC expects one of {16,32,64}')
+    flatten_default = (
+        is_sm90(query.device)
+        and grad_key.dtype == torch.bfloat16
+        and ratio == 4
+        and head_dim == 256
+        and group_size >= 2
+    )
+    flatten_heads = os.environ.get(
+        'MCORE_BRIDGE_QSA_SEGMENT_FLATTEN_HEADS',
+        '1' if flatten_default else '0',
+    ) != '0'
+    default_segment_warps = 2 if flatten_heads else 4
     segmented_num_warps = int(
-        os.environ.get('MCORE_BRIDGE_QSA_SEGMENT_WARPS', '4'))
+        os.environ.get(
+            'MCORE_BRIDGE_QSA_SEGMENT_WARPS', str(default_segment_warps)))
     if segmented_num_warps not in {1, 2, 4, 8}:
         raise ValueError('QSA segmented reducer warps expects one of {1,2,4,8}')
-    _qsa_segmented_dkv_reduce_grouped_kernel[
-        (batch * num_blocks * num_kv_heads,)
-    ](
+    default_segment_head_tile = 2 if flatten_heads else group_size
+    segment_head_tile = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_SEGMENT_HEAD_TILE', str(default_segment_head_tile)))
+    if segment_head_tile not in {1, 2, 3, 4, 6, 8, 12, 16}:
+        raise ValueError(
+            'QSA segmented head tile expects one of {1,2,3,4,6,8,12,16}')
+    num_segment_head_tiles = triton.cdiv(group_size, segment_head_tile)
+    if flatten_heads and segment_head_tile not in {1, 2, 4, 8, 16}:
+        raise ValueError(
+            'QSA flattened segmented reducer requires a power-of-two head tile')
+    if flatten_heads and grad_key.dtype != torch.bfloat16:
+        raise ValueError(
+            'QSA flattened segmented reducer currently requires BF16 dK/dV accumulation')
+    grid = (batch * num_blocks * num_kv_heads * num_segment_head_tiles,)
+    kernel_args = (
         query,
         key,
         value,
@@ -6655,18 +7029,34 @@ def qsa_segmented_dkv_reduce(
         grad_value.stride(0),
         grad_value.stride(2),
         grad_value.stride(3),
-        RATIO=ratio,
-        GROUP_SIZE=group_size,
-        BLOCK_H=max(1, triton.next_power_of_2(group_size)),
-        BLOCK_OCC=block_occ,
-        BLOCK_D=block_d,
-        HAS_GRAD_OUTPUT=True,
-        HAS_GRAD_LSE=grad_lse is not lse,
-        DKV_ACCUM_BF16=grad_key.dtype == torch.bfloat16,
-        BATCH_ONE=batch == 1,
-        num_warps=segmented_num_warps,
-        num_stages=1,
     )
+    kernel_options = {
+        'RATIO': ratio,
+        'GROUP_SIZE': group_size,
+        'BLOCK_H': max(1, triton.next_power_of_2(group_size)),
+        'HEAD_TILE': segment_head_tile,
+        'NUM_HEAD_TILES': num_segment_head_tiles,
+        'BLOCK_OCC': block_occ,
+        'BLOCK_D': block_d,
+        'HAS_GRAD_OUTPUT': True,
+        'HAS_GRAD_LSE': grad_lse is not lse,
+        'DKV_ACCUM_BF16': grad_key.dtype == torch.bfloat16,
+        'BATCH_ONE': batch == 1,
+        'SPLIT_HEADS': num_segment_head_tiles > 1,
+        'num_warps': segmented_num_warps,
+        'num_stages': 1,
+    }
+    if flatten_heads:
+        _qsa_segmented_dkv_reduce_flattened_kernel[grid](
+            *kernel_args,
+            BLOCK_M=block_occ * segment_head_tile,
+            **kernel_options,
+        )
+    else:
+        _qsa_segmented_dkv_reduce_grouped_kernel[grid](
+            *kernel_args,
+            **kernel_options,
+        )
 
 
 def qsa_selected_kv_backward(
