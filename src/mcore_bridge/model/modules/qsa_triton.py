@@ -1725,7 +1725,13 @@ if TRITON_AVAILABLE:
             )
             tile_sum = tl.sum(probabilities, axis=1)
             denominator = denominator * old_scale + tile_sum
-            accumulator = accumulator * old_scale[:, None] + tl.sum(probabilities[:, :, None] * v[None, :, :], axis=1)
+            # Express P @ V as a matrix product so SM90 can use the same
+            # tensor-core path as Q @ K.  The previous broadcasted multiply
+            # materialized a [HEADS_PER_KV, BLOCK_K, BLOCK_D] temporary and
+            # reduced it elementwise, which inflated the live register set.
+            accumulator = accumulator * old_scale[:, None] + tl.dot(
+                probabilities.to(tl.bfloat16), v, out_dtype=tl.float32
+            )
             max_value = new_max
 
         has_value = denominator > 0.0
@@ -1875,8 +1881,8 @@ if TRITON_AVAILABLE:
             )
             tile_sum = tl.sum(probabilities, axis=1)
             denominator = denominator * old_scale + tile_sum
-            accumulator = accumulator * old_scale[:, None] + tl.sum(
-                probabilities[:, :, None] * v[None, :, :], axis=1
+            accumulator = accumulator * old_scale[:, None] + tl.dot(
+                probabilities.to(tl.bfloat16), v, out_dtype=tl.float32
             )
             max_value = new_max
 
@@ -1983,6 +1989,7 @@ if TRITON_AVAILABLE:
         HAS_GRAD_LSE: tl.constexpr,
         USE_OUTPUT_DELTA: tl.constexpr,
         DKV_ACCUM_BF16: tl.constexpr,
+        TENSORIZE_DERIVATIVES: tl.constexpr,
         SEGMENT_BLOCK_TOPK: tl.constexpr,
         RATIO: tl.constexpr,
         STORE_CORRECTION: tl.constexpr,
@@ -2076,7 +2083,11 @@ if TRITON_AVAILABLE:
                     (scores - lse[:, None]) * 1.4426950408889634,
                     -float("inf"),
                 ))
-                d_probability = tl.sum(v[None, :, :] * grad_output[:, None, :], axis=2)
+                d_probability = tl.dot(
+                    grad_output.to(tl.bfloat16),
+                    tl.trans(v),
+                    out_dtype=tl.float32,
+                )
                 correction += tl.sum(probabilities * d_probability, axis=1)
 
         if STORE_CORRECTION:
@@ -2112,13 +2123,22 @@ if TRITON_AVAILABLE:
                 (scores - lse[:, None]) * 1.4426950408889634,
                 -float("inf"),
             ))
-            d_probability = tl.sum(v[None, :, :] * grad_output[:, None, :], axis=2)
+            d_probability = tl.dot(
+                grad_output.to(tl.bfloat16),
+                tl.trans(v),
+                out_dtype=tl.float32,
+            )
             d_score = probabilities * (d_probability - correction[:, None]) + grad_lse[:, None] * probabilities
             d_score = tl.where(
                 valid[None, :] & head_valid[:, None], d_score, 0.0)
-            grad_q += tl.sum(
-                d_score[:, :, None] * k[None, :, :], axis=1
-            ) * softmax_scale
+            if TENSORIZE_DERIVATIVES:
+                grad_q += tl.dot(
+                    d_score.to(tl.bfloat16), k, out_dtype=tl.float32
+                ) * softmax_scale
+            else:
+                grad_q += tl.sum(
+                    d_score[:, :, None] * k[None, :, :], axis=1
+                ) * softmax_scale
 
             if EMIT_DKV:
                 emit_mask = valid
@@ -2132,12 +2152,24 @@ if TRITON_AVAILABLE:
                 # this dQ/correction kernel.  The small causal tail has a
                 # dedicated kernel below; otherwise the segmented reducer is
                 # the sole producer of complete-block dK/dV.
-                grad_k = tl.sum(
-                    d_score[:, :, None] * q[:, None, :], axis=0
-                ) * softmax_scale
-                grad_v = tl.sum(
-                    probabilities[:, :, None] * grad_output[:, None, :], axis=0
-                )
+                if TENSORIZE_DERIVATIVES:
+                    grad_k = tl.dot(
+                        tl.trans(d_score.to(tl.bfloat16)),
+                        q,
+                        out_dtype=tl.float32,
+                    ) * softmax_scale
+                    grad_v = tl.dot(
+                        tl.trans(probabilities.to(tl.bfloat16)),
+                        grad_output.to(tl.bfloat16),
+                        out_dtype=tl.float32,
+                    )
+                else:
+                    grad_k = tl.sum(
+                        d_score[:, :, None] * q[:, None, :], axis=0
+                    ) * softmax_scale
+                    grad_v = tl.sum(
+                        probabilities[:, :, None] * grad_output[:, None, :], axis=0
+                    )
                 grad_k_ptrs = (
                     grad_k_ptr
                     + batch * stride_dkb
@@ -2253,6 +2285,7 @@ if TRITON_AVAILABLE:
         HAS_GRAD_LSE: tl.constexpr,
         USE_OUTPUT_DELTA: tl.constexpr,
         DKV_ACCUM_BF16: tl.constexpr,
+        TENSORIZE_DERIVATIVES: tl.constexpr,
     ):
         """Packed-THD backward with recompute and relaxed dK/dV atomics."""
 
@@ -2366,8 +2399,10 @@ if TRITON_AVAILABLE:
                         -float("inf"),
                     )
                 )
-                d_probability = tl.sum(
-                    v[None, :, :] * grad_output[:, None, :], axis=2
+                d_probability = tl.dot(
+                    grad_output.to(tl.bfloat16),
+                    tl.trans(v),
+                    out_dtype=tl.float32,
                 )
                 correction += tl.sum(probabilities * d_probability, axis=1)
 
@@ -2417,8 +2452,10 @@ if TRITON_AVAILABLE:
                     -float("inf"),
                 )
             )
-            d_probability = tl.sum(
-                v[None, :, :] * grad_output[:, None, :], axis=2
+            d_probability = tl.dot(
+                grad_output.to(tl.bfloat16),
+                tl.trans(v),
+                out_dtype=tl.float32,
             )
             d_score = (
                 probabilities * (d_probability - correction[:, None])
@@ -2426,15 +2463,30 @@ if TRITON_AVAILABLE:
             )
             d_score = tl.where(
                 valid[None, :] & head_valid[:, None], d_score, 0.0)
-            grad_q += tl.sum(
-                d_score[:, :, None] * k[None, :, :], axis=1
-            ) * softmax_scale
-            grad_k = tl.sum(
-                d_score[:, :, None] * q[:, None, :], axis=0
-            ) * softmax_scale
-            grad_v = tl.sum(
-                probabilities[:, :, None] * grad_output[:, None, :], axis=0
-            )
+            if TENSORIZE_DERIVATIVES:
+                grad_q += tl.dot(
+                    d_score.to(tl.bfloat16), k, out_dtype=tl.float32
+                ) * softmax_scale
+                grad_k = tl.dot(
+                    tl.trans(d_score.to(tl.bfloat16)),
+                    q,
+                    out_dtype=tl.float32,
+                ) * softmax_scale
+                grad_v = tl.dot(
+                    tl.trans(probabilities.to(tl.bfloat16)),
+                    grad_output.to(tl.bfloat16),
+                    out_dtype=tl.float32,
+                )
+            else:
+                grad_q += tl.sum(
+                    d_score[:, :, None] * k[None, :, :], axis=1
+                ) * softmax_scale
+                grad_k = tl.sum(
+                    d_score[:, :, None] * q[:, None, :], axis=0
+                ) * softmax_scale
+                grad_v = tl.sum(
+                    probabilities[:, :, None] * grad_output[:, None, :], axis=0
+                )
             grad_k_ptrs = (
                 grad_k_ptr
                 + safe_selected[:, None] * stride_dkt
@@ -4316,10 +4368,13 @@ def qsa_selected_kv_forward(query: torch.Tensor, key: torch.Tensor, value: torch
     query_positions = query_positions.to(device=query.device, dtype=torch.int32).contiguous()
     if query_positions.shape != (sq, ):
         raise ValueError(f"QSA query_positions must have shape [{sq}], got {tuple(query_positions.shape)}")
-    # A small head tile reuses K/V without creating the register footprint of
-    # one program carrying all 12 Qwen4-Exp query heads for a KV head.
     group_size = num_q_heads // num_kv_heads
-    head_tile_size = int(os.environ.get('MCORE_BRIDGE_QSA_FORWARD_HEAD_TILE', '4'))
+    # Cover one complete GQA group with one power-of-two tile.  On the
+    # production Hq/Hkv=24/2 shape this removes two duplicate K/V scans per
+    # KV head; TP2/4/8 naturally dispatch to 16/8/4 heads respectively.
+    default_head_tile = min(16, 1 << max(0, group_size - 1).bit_length())
+    head_tile_size = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_FORWARD_HEAD_TILE', str(default_head_tile)))
     if head_tile_size not in {1, 2, 4, 8, 16}:
         raise ValueError('QSA forward head tile expects one of {1,2,4,8,16}')
     num_head_tiles = triton.cdiv(group_size, head_tile_size)
@@ -4330,7 +4385,9 @@ def qsa_selected_kv_forward(query: torch.Tensor, key: torch.Tensor, value: torch
     block_k = int(os.environ.get('MCORE_BRIDGE_QSA_FORWARD_BLOCK_K', '16'))
     if block_k not in {8, 16, 32, 64, 128}:
         raise ValueError('QSA forward BLOCK_K expects one of {8,16,32,64,128}')
-    forward_num_warps = int(os.environ.get('MCORE_BRIDGE_QSA_FORWARD_WARPS', '1'))
+    default_num_warps = min(4, max(1, head_tile_size // 4))
+    forward_num_warps = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_FORWARD_WARPS', str(default_num_warps)))
     forward_num_stages = int(os.environ.get('MCORE_BRIDGE_QSA_FORWARD_STAGES', '2'))
     if forward_num_warps not in {1, 2, 4, 8} or forward_num_stages not in {1, 2, 3, 4}:
         raise ValueError(
@@ -4436,7 +4493,9 @@ def qsa_selected_kv_forward_packed(
     output = torch.empty_like(query)
     lse = torch.empty((num_q_heads, total_q), device=query.device, dtype=torch.float32)
     group_size = num_q_heads // num_kv_heads
-    head_tile_size = int(os.environ.get('MCORE_BRIDGE_QSA_FORWARD_HEAD_TILE', '4'))
+    default_head_tile = min(16, 1 << max(0, group_size - 1).bit_length())
+    head_tile_size = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_FORWARD_HEAD_TILE', str(default_head_tile)))
     if head_tile_size not in {1, 2, 4, 8, 16}:
         raise ValueError('QSA packed forward head tile expects one of {1,2,4,8,16}')
     num_head_tiles = triton.cdiv(group_size, head_tile_size)
@@ -4444,7 +4503,9 @@ def qsa_selected_kv_forward_packed(
     block_k = int(os.environ.get('MCORE_BRIDGE_QSA_FORWARD_BLOCK_K', '16'))
     if block_k not in {8, 16, 32, 64, 128}:
         raise ValueError('QSA packed forward BLOCK_K expects one of {8,16,32,64,128}')
-    num_warps = int(os.environ.get('MCORE_BRIDGE_QSA_FORWARD_WARPS', '1'))
+    default_num_warps = min(4, max(1, head_tile_size // 4))
+    num_warps = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_FORWARD_WARPS', str(default_num_warps)))
     num_stages = int(os.environ.get('MCORE_BRIDGE_QSA_FORWARD_STAGES', '2'))
     if num_warps not in {1, 2, 4, 8} or num_stages not in {1, 2, 3, 4}:
         raise ValueError('QSA packed forward tuning has invalid warps/stages')
@@ -5128,13 +5189,24 @@ def qsa_selected_kv_backward(
         if use_segmented_reduction else lse
     )
     group_size = num_q_heads // num_kv_heads
-    head_tile_size = int(os.environ.get('MCORE_BRIDGE_QSA_BACKWARD_HEAD_TILE', '4'))
+    tensorized_default = (
+        group_size >= 5
+        and head_dim >= 64
+        and dkv_accum_dtype == 'bf16'
+        and not use_segmented_reduction
+    )
+    default_head_tile = 16 if tensorized_default else min(
+        4, 1 << max(0, group_size - 1).bit_length())
+    head_tile_size = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_BACKWARD_HEAD_TILE', str(default_head_tile)))
     if head_tile_size not in {1, 2, 4, 8, 16}:
         raise ValueError('QSA backward head tile expects one of {1,2,4,8,16}')
     num_head_tiles = triton.cdiv(group_size, head_tile_size)
     grid = (batch * sq, num_kv_heads * num_head_tiles)
     block_d = max(16, triton.next_power_of_2(head_dim))
-    block_k = int(os.environ.get('MCORE_BRIDGE_QSA_BACKWARD_BLOCK_K', '8'))
+    default_block_k = 16 if tensorized_default else 8
+    block_k = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_BACKWARD_BLOCK_K', str(default_block_k)))
     if block_k not in {4, 8, 16, 32, 64, 128}:
         raise ValueError('QSA backward BLOCK_K expects one of {4,8,16,32,64,128}')
     correction_block_k = int(os.environ.get(
@@ -5142,7 +5214,9 @@ def qsa_selected_kv_backward(
     if correction_block_k not in {4, 8, 16, 32, 64, 128}:
         raise ValueError(
             'QSA backward correction BLOCK_K expects one of {4,8,16,32,64,128}')
-    backward_num_warps = int(os.environ.get('MCORE_BRIDGE_QSA_BACKWARD_WARPS', '1'))
+    default_num_warps = 4 if tensorized_default else 1
+    backward_num_warps = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_BACKWARD_WARPS', str(default_num_warps)))
     backward_num_stages = int(os.environ.get('MCORE_BRIDGE_QSA_BACKWARD_STAGES', '1'))
     if backward_num_warps not in {1, 2, 4, 8} or backward_num_stages not in {1, 2, 3, 4}:
         raise ValueError(
@@ -5240,6 +5314,12 @@ def qsa_selected_kv_backward(
         # dedicated tail launch below; keeping EMIT_DKV false here removes
         # the otherwise duplicated complete-block reductions.
         EMIT_DKV=not use_segmented_reduction,
+        TENSORIZE_DERIVATIVES=(
+            head_tile_size >= 16
+            and block_k >= 16
+            and dkv_accum_dtype == 'bf16'
+            and not use_segmented_reduction
+        ),
         num_warps=backward_num_warps,
         num_stages=backward_num_stages,
     )
@@ -5380,12 +5460,20 @@ def qsa_selected_kv_backward_packed(
         else torch.zeros_like(value, dtype=torch.float32)
     )
     group_size = num_q_heads // num_kv_heads
-    head_tile_size = int(os.environ.get('MCORE_BRIDGE_QSA_BACKWARD_HEAD_TILE', '4'))
+    tensorized_default = (
+        group_size >= 5 and head_dim >= 64 and dkv_accum_dtype == 'bf16'
+    )
+    default_head_tile = 16 if tensorized_default else min(
+        4, 1 << max(0, group_size - 1).bit_length())
+    head_tile_size = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_BACKWARD_HEAD_TILE', str(default_head_tile)))
     if head_tile_size not in {1, 2, 4, 8, 16}:
         raise ValueError('QSA packed backward head tile expects one of {1,2,4,8,16}')
     num_head_tiles = triton.cdiv(group_size, head_tile_size)
     block_d = max(16, triton.next_power_of_2(head_dim))
-    block_k = int(os.environ.get('MCORE_BRIDGE_QSA_BACKWARD_BLOCK_K', '8'))
+    default_block_k = 16 if tensorized_default else 8
+    block_k = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_BACKWARD_BLOCK_K', str(default_block_k)))
     if block_k not in {4, 8, 16, 32, 64, 128}:
         raise ValueError('QSA packed backward BLOCK_K expects one of {4,8,16,32,64,128}')
     correction_block_k = int(os.environ.get(
@@ -5393,7 +5481,9 @@ def qsa_selected_kv_backward_packed(
     if correction_block_k not in {4, 8, 16, 32, 64, 128}:
         raise ValueError(
             'QSA packed backward correction BLOCK_K expects one of {4,8,16,32,64,128}')
-    num_warps = int(os.environ.get('MCORE_BRIDGE_QSA_BACKWARD_WARPS', '1'))
+    default_num_warps = 4 if tensorized_default else 1
+    num_warps = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_BACKWARD_WARPS', str(default_num_warps)))
     num_stages = int(os.environ.get('MCORE_BRIDGE_QSA_BACKWARD_STAGES', '1'))
     if num_warps not in {1, 2, 4, 8} or num_stages not in {1, 2, 3, 4}:
         raise ValueError('QSA packed backward tuning has invalid warps/stages')
@@ -5468,6 +5558,11 @@ def qsa_selected_kv_backward_packed(
         HAS_GRAD_LSE=grad_lse_present,
         USE_OUTPUT_DELTA=use_output_delta,
         DKV_ACCUM_BF16=dkv_accum_dtype == 'bf16',
+        TENSORIZE_DERIVATIVES=(
+            head_tile_size >= 16
+            and block_k >= 16
+            and dkv_accum_dtype == 'bf16'
+        ),
         num_warps=num_warps,
         num_stages=num_stages,
     )

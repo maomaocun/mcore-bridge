@@ -923,3 +923,66 @@ def test_triton_selected_kv_backward_matches_torch_on_sm90(monkeypatch, output_d
     assert torch.allclose(triton_result[1], torch_result[1], atol=2e-2, rtol=2e-2)
     for triton_grad, torch_grad in zip(triton_result[2:], torch_result[2:]):
         assert torch.allclose(triton_grad.float(), torch_grad.float(), atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_triton_selected_kv_production_shape_default_dispatch_matches_torch(monkeypatch):
+    """Guard the D=256/K=2051 tensor-core production dispatch."""
+
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('requires H100/SM90')
+    for name in (
+        'MCORE_BRIDGE_QSA_FORWARD_HEAD_TILE',
+        'MCORE_BRIDGE_QSA_FORWARD_BLOCK_K',
+        'MCORE_BRIDGE_QSA_FORWARD_WARPS',
+        'MCORE_BRIDGE_QSA_BACKWARD_HEAD_TILE',
+        'MCORE_BRIDGE_QSA_BACKWARD_BLOCK_K',
+        'MCORE_BRIDGE_QSA_BACKWARD_WARPS',
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    torch.manual_seed(314159)
+    sq, hq, hkv, dim, slots = 32, 24, 2, 256, 2051
+    device = 'cuda'
+    query_base = torch.randn(sq, 1, hq, dim, device=device, dtype=torch.bfloat16)
+    key_base = torch.randn(sq, 1, hkv, dim, device=device, dtype=torch.bfloat16)
+    value_base = torch.randn_like(key_base)
+    positions = torch.arange(sq, device=device, dtype=torch.int32)
+    indices = torch.full((1, sq, slots), -1, device=device, dtype=torch.int32)
+    lengths = torch.empty((1, sq), device=device, dtype=torch.int32)
+    for position in range(sq):
+        # Vary row lengths and retain duplicate KV IDs to exercise atomic
+        # accumulation without reducing the compile-time production K.
+        count = (position * 17) % (position + 1) + 1
+        indices[0, position, :count] = torch.randint(
+            0, position + 1, (count,), device=device, dtype=torch.int32)
+        lengths[0, position] = count
+    grad_out = torch.randn_like(query_base)
+
+    def run(backend):
+        query = query_base.detach().clone().requires_grad_()
+        key = key_base.detach().clone().requires_grad_()
+        value = value_base.detach().clone().requires_grad_()
+        output, lse = qsa_sparse_forward(
+            query,
+            key,
+            value,
+            indices,
+            lengths,
+            backend=backend,
+            require_backend=backend == 'triton',
+            query_positions=positions,
+        )
+        (output.float() * grad_out.float()).sum().backward()
+        return output.detach(), lse.detach(), query.grad, key.grad, value.grad
+
+    reference = run('torch')
+    actual = run('triton')
+    assert torch.allclose(actual[0].float(), reference[0].float(), atol=2e-2, rtol=2e-2)
+    assert torch.allclose(actual[1], reference[1], atol=2e-5, rtol=2e-5)
+    assert torch.allclose(actual[2].float(), reference[2].float(), atol=5e-2, rtol=5e-2)
+    for actual_grad, reference_grad in zip(actual[3:], reference[3:]):
+        difference = actual_grad.float() - reference_grad.float()
+        assert difference.abs().mean().item() < 2e-2
+        assert difference.norm().item() / reference_grad.float().norm().item() < 2e-2
+        assert difference.abs().max().item() <= 0.5
