@@ -474,7 +474,10 @@ class _QSASelectedKVFunction(Function):
                 key.shape[0],
                 int(selected_token_group_size),
             )
-        ctx.save_for_backward(query, key, value, topk_indices, topk_length, lse, query_positions)
+        # Backward can recover the softmax correction as ``sum(output *
+        # grad_output)``.  Saving the already-materialized output avoids a
+        # second full selected-K/V scan without allocating another tensor.
+        ctx.save_for_backward(query, key, value, topk_indices, topk_length, output, lse, query_positions)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.backend = resolved
@@ -488,7 +491,7 @@ class _QSASelectedKVFunction(Function):
 
     @staticmethod
     def backward(ctx, grad_output, grad_lse):
-        query, key, value, topk_indices, topk_length, lse, query_positions = ctx.saved_tensors
+        query, key, value, topk_indices, topk_length, output, lse, query_positions = ctx.saved_tensors
         if ctx.backend == 'triton':
             from .qsa_triton import qsa_selected_kv_backward
 
@@ -499,6 +502,7 @@ class _QSASelectedKVFunction(Function):
                 topk_indices,
                 topk_length,
                 lse,
+                output=output,
                 grad_output=grad_output,
                 grad_lse=grad_lse,
                 softmax_scale=ctx.softmax_scale,
@@ -581,6 +585,7 @@ class _QSASelectedKVPackedFunction(Function):
             key_starts,
             key_lengths,
             query_positions,
+            output,
             lse,
         )
         ctx.softmax_scale = softmax_scale
@@ -602,6 +607,7 @@ class _QSASelectedKVPackedFunction(Function):
             key_starts,
             key_lengths,
             query_positions,
+            output,
             lse,
         ) = ctx.saved_tensors
         from .qsa_triton import qsa_selected_kv_backward_packed
@@ -616,6 +622,7 @@ class _QSASelectedKVPackedFunction(Function):
             key_starts,
             key_lengths,
             query_positions,
+            output=output,
             grad_output=grad_output,
             grad_lse=grad_lse,
             softmax_scale=ctx.softmax_scale,

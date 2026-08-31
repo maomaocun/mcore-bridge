@@ -1467,6 +1467,7 @@ if TRITON_AVAILABLE:
         length_ptr,
         lse_ptr,
         grad_out_ptr,
+        out_ptr,
         grad_lse_ptr,
         grad_q_ptr,
         grad_k_ptr,
@@ -1909,6 +1910,7 @@ if TRITON_AVAILABLE:
         length_ptr,
         lse_ptr,
         grad_out_ptr,
+        out_ptr,
         grad_lse_ptr,
         grad_q_ptr,
         grad_k_ptr,
@@ -1946,6 +1948,10 @@ if TRITON_AVAILABLE:
         stride_gos,
         stride_goh,
         stride_god,
+        stride_ob,
+        stride_os,
+        stride_oh,
+        stride_od,
         stride_glseb,
         stride_glseh,
         stride_glses,
@@ -1975,6 +1981,7 @@ if TRITON_AVAILABLE:
         CAUSAL: tl.constexpr,
         HAS_GRAD_OUTPUT: tl.constexpr,
         HAS_GRAD_LSE: tl.constexpr,
+        USE_OUTPUT_DELTA: tl.constexpr,
         DKV_ACCUM_BF16: tl.constexpr,
         SEGMENT_BLOCK_TOPK: tl.constexpr,
         RATIO: tl.constexpr,
@@ -2018,32 +2025,59 @@ if TRITON_AVAILABLE:
             other=0.0,
         ).to(tl.float32)
 
-        correction = tl.zeros((HEADS_PER_KV,), dtype=tl.float32)
-        for key_start in tl.range(0, K, CORRECTION_BLOCK_K):
-            key_offsets = key_start + tl.arange(0, CORRECTION_BLOCK_K)
-            selected = tl.load(
-                index_ptr + batch * stride_ib + query * stride_is + key_offsets * stride_ik,
-                mask=key_offsets < K,
-                other=-1,
-            ).to(tl.int32)
-            valid = (key_offsets < length) & (selected >= 0) & (selected < seq_len_k)
-            if CAUSAL:
-                valid = valid & (selected + key_position_offset <= query_position)
-            safe_selected = tl.where(valid, selected, 0)
-            k_ptrs = (k_ptr + batch * stride_kb + safe_selected[:, None] * stride_ks + kv_head * stride_kh +
-                      d_offsets[None, :] * stride_kd)
-            v_ptrs = (v_ptr + batch * stride_vb + safe_selected[:, None] * stride_vs + kv_head * stride_vh +
-                      d_offsets[None, :] * stride_vd)
-            k = tl.load(k_ptrs, mask=valid[:, None] & (d_offsets[None, :] < head_dim), other=0.0).to(tl.bfloat16)
-            v = tl.load(v_ptrs, mask=valid[:, None] & (d_offsets[None, :] < head_dim), other=0.0).to(tl.bfloat16)
-            scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * softmax_scale
-            probabilities = tl.exp2(tl.where(
-                valid[None, :],
-                (scores - lse[:, None]) * 1.4426950408889634,
-                -float("inf"),
-            ))
-            d_probability = tl.sum(v[None, :, :] * grad_output[:, None, :], axis=2)
-            correction += tl.sum(probabilities * d_probability, axis=1)
+        if USE_OUTPUT_DELTA:
+            # For O = sum_j(P_j V_j), the softmax correction
+            # sum_j(P_j * dot(dO, V_j)) is exactly dot(dO, O).  FlashAttention
+            # calls this quantity delta.  Reading the BF16 forward output once
+            # removes the former full K/V rescan and keeps workspace O(1).
+            out_ptrs = (
+                out_ptr
+                + batch * stride_ob
+                + query * stride_os
+                + heads[:, None] * stride_oh
+                + d_offsets[None, :] * stride_od
+            )
+            output = tl.load(
+                out_ptrs,
+                mask=head_valid[:, None] & (d_offsets[None, :] < head_dim),
+                other=0.0,
+            ).to(tl.float32)
+            correction = tl.sum(output * grad_output, axis=1)
+        else:
+            correction = tl.zeros((HEADS_PER_KV,), dtype=tl.float32)
+            for key_start in tl.range(0, K, CORRECTION_BLOCK_K):
+                key_offsets = key_start + tl.arange(0, CORRECTION_BLOCK_K)
+                selected = tl.load(
+                    index_ptr + batch * stride_ib + query * stride_is + key_offsets * stride_ik,
+                    mask=key_offsets < K,
+                    other=-1,
+                ).to(tl.int32)
+                valid = (key_offsets < length) & (selected >= 0) & (selected < seq_len_k)
+                if CAUSAL:
+                    valid = valid & (selected + key_position_offset <= query_position)
+                safe_selected = tl.where(valid, selected, 0)
+                k_ptrs = (k_ptr + batch * stride_kb + safe_selected[:, None] * stride_ks + kv_head * stride_kh +
+                          d_offsets[None, :] * stride_kd)
+                v_ptrs = (v_ptr + batch * stride_vb + safe_selected[:, None] * stride_vs + kv_head * stride_vh +
+                          d_offsets[None, :] * stride_vd)
+                k = tl.load(
+                    k_ptrs,
+                    mask=valid[:, None] & (d_offsets[None, :] < head_dim),
+                    other=0.0,
+                ).to(tl.bfloat16)
+                v = tl.load(
+                    v_ptrs,
+                    mask=valid[:, None] & (d_offsets[None, :] < head_dim),
+                    other=0.0,
+                ).to(tl.bfloat16)
+                scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * softmax_scale
+                probabilities = tl.exp2(tl.where(
+                    valid[None, :],
+                    (scores - lse[:, None]) * 1.4426950408889634,
+                    -float("inf"),
+                ))
+                d_probability = tl.sum(v[None, :, :] * grad_output[:, None, :], axis=2)
+                correction += tl.sum(probabilities * d_probability, axis=1)
 
         if STORE_CORRECTION:
             correction_ptrs = (
@@ -2158,6 +2192,7 @@ if TRITON_AVAILABLE:
         length_ptr,
         lse_ptr,
         grad_out_ptr,
+        out_ptr,
         grad_lse_ptr,
         grad_q_ptr,
         grad_k_ptr,
@@ -2189,6 +2224,9 @@ if TRITON_AVAILABLE:
         stride_got,
         stride_goh,
         stride_god,
+        stride_ot,
+        stride_oh,
+        stride_od,
         stride_glseh,
         stride_glset,
         stride_dqt,
@@ -2213,6 +2251,7 @@ if TRITON_AVAILABLE:
         CAUSAL: tl.constexpr,
         HAS_GRAD_OUTPUT: tl.constexpr,
         HAS_GRAD_LSE: tl.constexpr,
+        USE_OUTPUT_DELTA: tl.constexpr,
         DKV_ACCUM_BF16: tl.constexpr,
     ):
         """Packed-THD backward with recompute and relaxed dK/dV atomics."""
@@ -2267,56 +2306,70 @@ if TRITON_AVAILABLE:
             other=0.0,
         ).to(tl.float32)
 
-        correction = tl.zeros((HEADS_PER_KV,), dtype=tl.float32)
-        for key_offset_start in tl.range(0, K, CORRECTION_BLOCK_K):
-            key_offsets = key_offset_start + tl.arange(0, CORRECTION_BLOCK_K)
-            selected = tl.load(
-                index_ptr + token * stride_it + key_offsets * stride_ik,
-                mask=key_offsets < K,
-                other=-1,
-            ).to(tl.int32)
-            valid = (
-                (key_offsets < length)
-                & (selected >= 0)
-                & (selected < key_length)
+        if USE_OUTPUT_DELTA:
+            out_ptrs = (
+                out_ptr
+                + token * stride_ot
+                + heads[:, None] * stride_oh
+                + d_offsets[None, :] * stride_od
             )
-            if CAUSAL:
-                valid = valid & (selected + key_position_offset <= query_position)
-            safe_selected = key_start + tl.where(valid, selected, 0)
-            k_ptrs = (
-                k_ptr
-                + safe_selected[:, None] * stride_kt
-                + kv_head * stride_kh
-                + d_offsets[None, :] * stride_kd
-            )
-            v_ptrs = (
-                v_ptr
-                + safe_selected[:, None] * stride_vt
-                + kv_head * stride_vh
-                + d_offsets[None, :] * stride_vd
-            )
-            k = tl.load(
-                k_ptrs,
-                mask=valid[:, None] & (d_offsets[None, :] < head_dim),
+            output = tl.load(
+                out_ptrs,
+                mask=head_valid[:, None] & (d_offsets[None, :] < head_dim),
                 other=0.0,
-            ).to(tl.bfloat16)
-            v = tl.load(
-                v_ptrs,
-                mask=valid[:, None] & (d_offsets[None, :] < head_dim),
-                other=0.0,
-            ).to(tl.bfloat16)
-            scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * softmax_scale
-            probabilities = tl.exp2(
-                tl.where(
-                    valid[None, :],
-                    (scores - lse[:, None]) * 1.4426950408889634,
-                    -float("inf"),
+            ).to(tl.float32)
+            correction = tl.sum(output * grad_output, axis=1)
+        else:
+            correction = tl.zeros((HEADS_PER_KV,), dtype=tl.float32)
+            for key_offset_start in tl.range(0, K, CORRECTION_BLOCK_K):
+                key_offsets = key_offset_start + tl.arange(0, CORRECTION_BLOCK_K)
+                selected = tl.load(
+                    index_ptr + token * stride_it + key_offsets * stride_ik,
+                    mask=key_offsets < K,
+                    other=-1,
+                ).to(tl.int32)
+                valid = (
+                    (key_offsets < length)
+                    & (selected >= 0)
+                    & (selected < key_length)
                 )
-            )
-            d_probability = tl.sum(
-                v[None, :, :] * grad_output[:, None, :], axis=2
-            )
-            correction += tl.sum(probabilities * d_probability, axis=1)
+                if CAUSAL:
+                    valid = valid & (selected + key_position_offset <= query_position)
+                safe_selected = key_start + tl.where(valid, selected, 0)
+                k_ptrs = (
+                    k_ptr
+                    + safe_selected[:, None] * stride_kt
+                    + kv_head * stride_kh
+                    + d_offsets[None, :] * stride_kd
+                )
+                v_ptrs = (
+                    v_ptr
+                    + safe_selected[:, None] * stride_vt
+                    + kv_head * stride_vh
+                    + d_offsets[None, :] * stride_vd
+                )
+                k = tl.load(
+                    k_ptrs,
+                    mask=valid[:, None] & (d_offsets[None, :] < head_dim),
+                    other=0.0,
+                ).to(tl.bfloat16)
+                v = tl.load(
+                    v_ptrs,
+                    mask=valid[:, None] & (d_offsets[None, :] < head_dim),
+                    other=0.0,
+                ).to(tl.bfloat16)
+                scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * softmax_scale
+                probabilities = tl.exp2(
+                    tl.where(
+                        valid[None, :],
+                        (scores - lse[:, None]) * 1.4426950408889634,
+                        -float("inf"),
+                    )
+                )
+                d_probability = tl.sum(
+                    v[None, :, :] * grad_output[:, None, :], axis=2
+                )
+                correction += tl.sum(probabilities * d_probability, axis=1)
 
         grad_q = tl.zeros((HEADS_PER_KV, BLOCK_D), dtype=tl.float32)
         for key_offset_start in tl.range(0, K, BLOCK_K):
@@ -4274,11 +4327,11 @@ def qsa_selected_kv_forward(query: torch.Tensor, key: torch.Tensor, value: torch
     # a 65,536-row sequence cannot be placed directly on grid.y (max 65,535).
     grid = (batch * sq, num_kv_heads * num_head_tiles)
     block_d = max(16, triton.next_power_of_2(head_dim))
-    block_k = int(os.environ.get('MCORE_BRIDGE_QSA_FORWARD_BLOCK_K', '32'))
+    block_k = int(os.environ.get('MCORE_BRIDGE_QSA_FORWARD_BLOCK_K', '16'))
     if block_k not in {8, 16, 32, 64, 128}:
         raise ValueError('QSA forward BLOCK_K expects one of {8,16,32,64,128}')
     forward_num_warps = int(os.environ.get('MCORE_BRIDGE_QSA_FORWARD_WARPS', '1'))
-    forward_num_stages = int(os.environ.get('MCORE_BRIDGE_QSA_FORWARD_STAGES', '1'))
+    forward_num_stages = int(os.environ.get('MCORE_BRIDGE_QSA_FORWARD_STAGES', '2'))
     if forward_num_warps not in {1, 2, 4, 8} or forward_num_stages not in {1, 2, 3, 4}:
         raise ValueError(
             'QSA forward tuning expects warps in {1,2,4,8} and stages in {1,2,3,4}')
@@ -4388,11 +4441,11 @@ def qsa_selected_kv_forward_packed(
         raise ValueError('QSA packed forward head tile expects one of {1,2,4,8,16}')
     num_head_tiles = triton.cdiv(group_size, head_tile_size)
     block_d = max(16, triton.next_power_of_2(head_dim))
-    block_k = int(os.environ.get('MCORE_BRIDGE_QSA_FORWARD_BLOCK_K', '32'))
+    block_k = int(os.environ.get('MCORE_BRIDGE_QSA_FORWARD_BLOCK_K', '16'))
     if block_k not in {8, 16, 32, 64, 128}:
         raise ValueError('QSA packed forward BLOCK_K expects one of {8,16,32,64,128}')
     num_warps = int(os.environ.get('MCORE_BRIDGE_QSA_FORWARD_WARPS', '1'))
-    num_stages = int(os.environ.get('MCORE_BRIDGE_QSA_FORWARD_STAGES', '1'))
+    num_stages = int(os.environ.get('MCORE_BRIDGE_QSA_FORWARD_STAGES', '2'))
     if num_warps not in {1, 2, 4, 8} or num_stages not in {1, 2, 3, 4}:
         raise ValueError('QSA packed forward tuning has invalid warps/stages')
     _qsa_selected_kv_forward_packed_grouped_kernel[
@@ -4942,11 +4995,15 @@ def qsa_selected_kv_backward(
     selected_token_group_size: Optional[int] = None,
     segmented_metadata=None,
     dkv_reduction: str = 'atomic',
+    output: torch.Tensor = None,
 ) -> tuple:
     """Launch the Triton selected-KV backward kernel.
 
     dK/dV accumulation is explicit: ``bf16`` reduces atomic traffic for the
     BF16 training path, while ``fp32`` retains the higher-precision reference.
+    When ``output`` is supplied, the default path obtains the softmax
+    correction from ``dot(grad_output, output)``; set
+    ``MCORE_BRIDGE_QSA_BACKWARD_OUTPUT_DELTA=0`` to recompute it from K/V.
     Additive dK/dV atomics use relaxed memory ordering because no consumer
     observes a partial gradient before the kernel completes.
     ``MCORE_BRIDGE_QSA_DKV_REDUCTION=segmented`` enables the QSA production
@@ -5008,6 +5065,18 @@ def qsa_selected_kv_backward(
         )
     grad_output_present = grad_output is not None
     grad_lse_present = grad_lse is not None
+    use_output_delta = (
+        output is not None
+        and os.environ.get('MCORE_BRIDGE_QSA_BACKWARD_OUTPUT_DELTA', '1') != '0'
+    )
+    if output is not None and output.shape != query.shape:
+        raise ValueError(
+            f'QSA backward output must match query shape {tuple(query.shape)}, got {tuple(output.shape)}')
+    if output is None:
+        # The pointer is never read when USE_OUTPUT_DELTA is false.
+        output = query
+    else:
+        output = output.contiguous()
     segment_reduction_requested = os.environ.get(
         "MCORE_BRIDGE_QSA_DKV_REDUCTION", dkv_reduction
     ).lower() == "segmented"
@@ -5086,6 +5155,7 @@ def qsa_selected_kv_backward(
         topk_length,
         lse,
         grad_output,
+        output,
         grad_lse,
         grad_query,
         grad_key,
@@ -5123,6 +5193,10 @@ def qsa_selected_kv_backward(
         grad_output.stride(0),
         grad_output.stride(2),
         grad_output.stride(3),
+        output.stride(1),
+        output.stride(0),
+        output.stride(2),
+        output.stride(3),
         grad_lse.stride(0),
         grad_lse.stride(1),
         grad_lse.stride(2),
@@ -5152,6 +5226,7 @@ def qsa_selected_kv_backward(
         CAUSAL=causal,
         HAS_GRAD_OUTPUT=grad_output_present,
         HAS_GRAD_LSE=grad_lse_present,
+        USE_OUTPUT_DELTA=use_output_delta,
         DKV_ACCUM_BF16=dkv_accum_dtype == 'bf16',
         SEGMENT_BLOCK_TOPK=(
             (topk_indices.shape[-1] - (segment_ratio - 1)) // segment_ratio
@@ -5223,8 +5298,13 @@ def qsa_selected_kv_backward_packed(
     key_position_offset: int = 0,
     dkv_accum_dtype: str = 'bf16',
     dkv_reduction: str = 'atomic',
+    output: torch.Tensor = None,
 ) -> tuple:
-    """Launch one packed-THD selected-KV backward with relaxed dK/dV atomics."""
+    """Launch one packed-THD selected-KV backward with relaxed dK/dV atomics.
+
+    ``output`` enables the same allocation-free output-delta correction used
+    by the unpacked launcher.
+    """
 
     if not TRITON_AVAILABLE:
         raise RuntimeError("QSA Triton kernels require triton to be installed")
@@ -5269,6 +5349,17 @@ def qsa_selected_kv_backward_packed(
     lse = lse.contiguous()
     grad_output_present = grad_output is not None
     grad_lse_present = grad_lse is not None
+    use_output_delta = (
+        output is not None
+        and os.environ.get('MCORE_BRIDGE_QSA_BACKWARD_OUTPUT_DELTA', '1') != '0'
+    )
+    if output is not None and output.shape != query.shape:
+        raise ValueError(
+            f'QSA packed backward output must match query shape {tuple(query.shape)}, got {tuple(output.shape)}')
+    if output is None:
+        output = query
+    else:
+        output = output.contiguous()
     if grad_output is None:
         grad_output = query
     else:
@@ -5316,6 +5407,7 @@ def qsa_selected_kv_backward_packed(
         topk_length,
         lse,
         grad_output,
+        output,
         grad_lse,
         grad_query,
         grad_key,
@@ -5347,6 +5439,9 @@ def qsa_selected_kv_backward_packed(
         grad_output.stride(0),
         grad_output.stride(1),
         grad_output.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
         grad_lse.stride(0),
         grad_lse.stride(1),
         grad_query.stride(0),
@@ -5371,6 +5466,7 @@ def qsa_selected_kv_backward_packed(
         CAUSAL=causal,
         HAS_GRAD_OUTPUT=grad_output_present,
         HAS_GRAD_LSE=grad_lse_present,
+        USE_OUTPUT_DELTA=use_output_delta,
         DKV_ACCUM_BF16=dkv_accum_dtype == 'bf16',
         num_warps=num_warps,
         num_stages=num_stages,
