@@ -6404,6 +6404,207 @@ if TRITON_AVAILABLE:
             tl.store(value_output_ptrs, grad_value_acc, mask=output_mask)
 
     @triton.jit
+    def _qsa_segmented_dkv_reduce_flat_heads_kernel(
+        query_ptr,
+        grad_out_ptr,
+        occurrence_query_ptr,
+        segment_start_ptr,
+        owner_block_list_ptr,
+        score_ptr,
+        d_score_ptr,
+        grad_key_ptr,
+        grad_value_ptr,
+        seq_len_q,
+        seq_len_k,
+        num_blocks,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        softmax_scale,
+        stride_qb,
+        stride_qs,
+        stride_qh,
+        stride_qd,
+        stride_gob,
+        stride_gos,
+        stride_goh,
+        stride_god,
+        stride_dkb,
+        stride_dks,
+        stride_dkh,
+        stride_dkd,
+        stride_dvb,
+        stride_dvs,
+        stride_dvh,
+        stride_dvd,
+        stride_scoreb,
+        stride_scoreh,
+        stride_scorek,
+        stride_dscoreb,
+        stride_dscoreh,
+        stride_dscorek,
+        RATIO: tl.constexpr,
+        GROUP_SIZE: tl.constexpr,
+        HEAD_GROUP: tl.constexpr,
+        USE_BLOCK_LIST: tl.constexpr,
+        BLOCK_OCC: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_TOPK: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        HAS_GRAD_OUTPUT: tl.constexpr,
+        DKV_ACCUM_BF16: tl.constexpr,
+        BATCH_ONE: tl.constexpr,
+    ):
+        """Flatten all GQA heads for one KV block into one owner MMA tile.
+
+        Compact derivatives provide the full-D probability and d-score values,
+        so the owner can combine all query-head rows without recomputing QK or
+        dP.  One CTA owns a physical block/KV-head pair and performs one
+        contiguous dK/dV store after folding in any preceding causal-tail
+        contribution.
+        """
+
+        program = tl.program_id(0)
+        kv_head = program % num_kv_heads
+        owner_group = program // num_kv_heads
+        if USE_BLOCK_LIST:
+            key_group = tl.load(
+                owner_block_list_ptr + owner_group).to(tl.int32)
+        else:
+            key_group = owner_group
+        batch = key_group // num_blocks
+        block = key_group - batch * num_blocks
+        segment_start = tl.load(segment_start_ptr + key_group).to(tl.int32)
+        segment_end = tl.load(segment_start_ptr + key_group + 1).to(tl.int32)
+        if segment_start >= segment_end:
+            return
+
+        token_offsets = tl.arange(0, RATIO)
+        d_offsets = tl.arange(0, BLOCK_D)
+        key_positions = block * RATIO + token_offsets
+        key_mask = key_positions < seq_len_k
+        grad_key_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
+        grad_value_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
+        flat_offsets = tl.arange(0, BLOCK_M)
+        occurrence_lanes = flat_offsets // HEAD_GROUP
+        head_lanes = flat_offsets - occurrence_lanes * HEAD_GROUP
+        heads = kv_head * GROUP_SIZE + head_lanes
+        head_valid = (head_lanes < GROUP_SIZE) & (heads < num_q_heads)
+
+        for occurrence_offset in tl.range(
+            0, segment_end - segment_start, BLOCK_OCC
+        ):
+            occurrence = segment_start + occurrence_offset + occurrence_lanes
+            encoded = tl.load(
+                occurrence_query_ptr + occurrence,
+                mask=occurrence < segment_end,
+                other=0,
+            ).to(tl.int32)
+            row = encoded // BLOCK_TOPK
+            if BATCH_ONE:
+                query_batch = tl.zeros((BLOCK_M,), dtype=tl.int32)
+                query = row
+                same_batch = occurrence < segment_end
+            else:
+                query_batch = row // seq_len_q
+                query = row - query_batch * seq_len_q
+                same_batch = (
+                    (query_batch == batch) & (occurrence < segment_end)
+                )
+            row_valid = same_batch & head_valid
+            q_ptrs = (
+                query_ptr
+                + query_batch[:, None] * stride_qb
+                + query[:, None] * stride_qs
+                + heads[:, None] * stride_qh
+                + d_offsets[None, :] * stride_qd
+            )
+            grad_out_ptrs = (
+                grad_out_ptr
+                + query_batch[:, None] * stride_gob
+                + query[:, None] * stride_gos
+                + heads[:, None] * stride_goh
+                + d_offsets[None, :] * stride_god
+            )
+            q_value = tl.load(
+                q_ptrs,
+                mask=row_valid[:, None]
+                & (d_offsets[None, :] < head_dim),
+                other=0.0,
+            ).to(tl.bfloat16)
+            grad_output = tl.load(
+                grad_out_ptrs,
+                mask=row_valid[:, None]
+                & (d_offsets[None, :] < head_dim)
+                & HAS_GRAD_OUTPUT,
+                other=0.0,
+            ).to(tl.bfloat16)
+            probability = tl.load(
+                score_ptr
+                + tl.cast(occurrence[:, None], tl.int64) * stride_scoreb
+                + heads[:, None] * stride_scoreh
+                + token_offsets[None, :] * stride_scorek,
+                mask=row_valid[:, None] & key_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            grad_score = tl.load(
+                d_score_ptr
+                + tl.cast(occurrence[:, None], tl.int64) * stride_dscoreb
+                + heads[:, None] * stride_dscoreh
+                + token_offsets[None, :] * stride_dscorek,
+                mask=row_valid[:, None] & key_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            grad_key_acc += tl.dot(
+                tl.trans(grad_score.to(tl.bfloat16)),
+                q_value,
+                out_dtype=tl.float32,
+            ) * softmax_scale
+            grad_value_acc += tl.dot(
+                tl.trans(probability.to(tl.bfloat16)),
+                grad_output,
+                out_dtype=tl.float32,
+            )
+
+        key_output_ptrs = (
+            grad_key_ptr
+            + batch * stride_dkb
+            + key_positions[:, None] * stride_dks
+            + kv_head * stride_dkh
+            + d_offsets[None, :] * stride_dkd
+        )
+        value_output_ptrs = (
+            grad_value_ptr
+            + batch * stride_dvb
+            + key_positions[:, None] * stride_dvs
+            + kv_head * stride_dvh
+            + d_offsets[None, :] * stride_dvd
+        )
+        output_mask = key_mask[:, None] & (d_offsets[None, :] < head_dim)
+        existing_key = tl.load(
+            key_output_ptrs, mask=output_mask, other=0.0
+        ).to(tl.float32)
+        existing_value = tl.load(
+            value_output_ptrs, mask=output_mask, other=0.0
+        ).to(tl.float32)
+        grad_key_acc += existing_key
+        grad_value_acc += existing_value
+        if DKV_ACCUM_BF16:
+            tl.store(
+                key_output_ptrs,
+                grad_key_acc.to(tl.bfloat16),
+                mask=output_mask,
+            )
+            tl.store(
+                value_output_ptrs,
+                grad_value_acc.to(tl.bfloat16),
+                mask=output_mask,
+            )
+        else:
+            tl.store(key_output_ptrs, grad_key_acc, mask=output_mask)
+            tl.store(value_output_ptrs, grad_value_acc, mask=output_mask)
+
+    @triton.jit
     def _qsa_segment_count_blocks_kernel(
         index_ptr,
         length_ptr,
@@ -9921,6 +10122,10 @@ def qsa_segmented_dkv_reduce(
     When saved probability and ``d_score`` buffers are supplied, the owner
     skips QK/dP recomputation and consumes the derivative scalars from the
     query-owned producer.
+    ``MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_FLAT=1`` combines all GQA heads in
+    one flattened owner MMA tile and performs one contiguous dK/dV store;
+    ``..._BLOCK_OCC`` selects its occurrence tile.  It supports compact
+    routes with GQA groups up to 16 heads and remains diagnostic.
     """
 
     if ratio < 2 or (ratio & (ratio - 1)):
@@ -10884,6 +11089,20 @@ def qsa_segmented_dkv_reduce(
         and os.environ.get(
             'MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEAD_TILES_TILED', '0') != '0'
     )
+    fuse_owner_heads_flat = (
+        compact_derivatives
+        and flatten_heads
+        and os.environ.get(
+            'MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_FLAT', '0') != '0'
+    )
+    flat_owner_block_occ = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_BLOCK_OCC', '2'))
+    if flat_owner_block_occ not in {1, 2, 4, 8, 16}:
+        raise ValueError(
+            'QSA flat fused owner BLOCK_OCC expects one of {1,2,4,8,16}')
+    if fuse_owner_heads_flat and group_size > 16:
+        raise RuntimeError(
+            'QSA flat fused owner currently supports GQA groups up to 16 heads')
     if fuse_owner_heads_tiled:
         fused_kernel_args = (
             query,
@@ -10924,7 +11143,66 @@ def qsa_segmented_dkv_reduce(
             saved_d_scores.stride(2),
             saved_d_scores.stride(3),
         )
-    if fuse_owner_heads_tiled:
+    if fuse_owner_heads_flat:
+        flat_kernel_args = (
+            query,
+            grad_output,
+            occurrences,
+            starts,
+            owner_block_list_workspace,
+            saved_scores,
+            saved_d_scores,
+            grad_key,
+            grad_value,
+            sq,
+            sk,
+            num_blocks,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            softmax_scale,
+            query.stride(1),
+            query.stride(0),
+            query.stride(2),
+            query.stride(3),
+            grad_output.stride(1),
+            grad_output.stride(0),
+            grad_output.stride(2),
+            grad_output.stride(3),
+            grad_key.stride(1),
+            grad_key.stride(0),
+            grad_key.stride(2),
+            grad_key.stride(3),
+            grad_value.stride(1),
+            grad_value.stride(0),
+            grad_value.stride(2),
+            grad_value.stride(3),
+            saved_scores.stride(0),
+            saved_scores.stride(2),
+            saved_scores.stride(3),
+            saved_d_scores.stride(0),
+            saved_d_scores.stride(2),
+            saved_d_scores.stride(3),
+        )
+        _qsa_segmented_dkv_reduce_flat_heads_kernel[
+            (owner_group_count * num_kv_heads,)
+        ](
+            *flat_kernel_args,
+            RATIO=ratio,
+            GROUP_SIZE=group_size,
+            HEAD_GROUP=16,
+            BLOCK_OCC=flat_owner_block_occ,
+            BLOCK_M=flat_owner_block_occ * 16,
+            BLOCK_TOPK=block_topk,
+            BLOCK_D=block_d,
+            HAS_GRAD_OUTPUT=True,
+            DKV_ACCUM_BF16=grad_key.dtype == torch.bfloat16,
+            BATCH_ONE=batch == 1,
+            USE_BLOCK_LIST=use_block_list,
+            num_warps=segmented_num_warps,
+            num_stages=1,
+        )
+    elif fuse_owner_heads_tiled:
         _qsa_segmented_dkv_reduce_fused_heads_tiled_kernel[
             (batch * num_blocks * num_kv_heads,)
         ](
@@ -11062,6 +11340,10 @@ def qsa_selected_kv_backward(
     ``MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEAD_TILES=1`` tests a single block-owner
     CTA that combines all GQA head tiles; the optional ``..._TILED=1`` variant
     bounds its D tile.  Both require compact derivatives and remain diagnostic.
+    ``MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_FLAT=1`` combines all GQA heads in
+    one flattened owner MMA tile and performs one contiguous dK/dV store;
+    ``..._BLOCK_OCC`` selects its occurrence tile.  It supports compact
+    routes with GQA groups up to 16 heads and remains diagnostic.
     ``MCORE_BRIDGE_QSA_SEGMENT_PERSISTENT_OWNER=1`` uses a fixed CTA grid that
     strides over the device-side owner work domain; ``..._PERSISTENT_CTAS``
     controls its size and the path remains opt-in.
