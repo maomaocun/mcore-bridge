@@ -1813,6 +1813,113 @@ def test_triton_split_dkv_backward_matches_fused_on_sm90(monkeypatch):
             split_grad.float(), fused_grad.float(), atol=0.5, rtol=0.05)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_triton_long_atomic_maxnreg_override_preserves_backward(monkeypatch):
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('requires H100/SM90')
+    torch.manual_seed(2051)
+    device = 'cuda'
+    sq, batch, hq, hkv, dim, ratio, block_topk = 512, 1, 24, 2, 256, 4, 1
+    positions = torch.arange(sq, device=device, dtype=torch.int32)
+    visible_blocks = (positions.to(torch.long) + 1) // ratio
+    has_complete_block = visible_blocks > 0
+    indices = torch.where(
+        has_complete_block.view(1, sq, 1),
+        (visible_blocks - 1).clamp_min(0).view(1, sq, 1),
+        torch.full((1, sq, block_topk), -1, device=device, dtype=torch.int32),
+    ).to(torch.int32)
+    # Keep S long enough to select the untrimmed SM90 maxnreg dispatch, while
+    # bounding each KV row's atomic fan-in so this gate isolates launch
+    # resource allocation.  High-fan-in BF16 reduction accuracy is covered
+    # by the production-route parity tests below.
+    tail_lengths = positions.to(torch.long) + 1 - visible_blocks * ratio
+    lengths = (
+        has_complete_block.to(torch.long) * ratio + tail_lengths
+    ).view(1, sq).to(torch.int32)
+    query_base = torch.randn(
+        sq, batch, hq, dim, device=device, dtype=torch.bfloat16)
+    key_base = torch.randn(
+        sq, batch, hkv, dim, device=device, dtype=torch.bfloat16)
+    value_base = torch.randn_like(key_base)
+    grad_output = torch.randn_like(query_base)
+    grad_lse = torch.randn(batch, hq, sq, device=device, dtype=torch.float32)
+
+    expanded_indices = qsa_expand_block_route(
+        indices, lengths, positions, ratio)
+    reference_query = query_base.detach().clone().requires_grad_()
+    reference_key = key_base.detach().clone().requires_grad_()
+    reference_value = value_base.detach().clone().requires_grad_()
+    reference_output, reference_lse = qsa_sparse_forward_reference(
+        reference_query,
+        reference_key,
+        reference_value,
+        expanded_indices,
+        lengths,
+        softmax_scale=dim ** -0.5,
+        query_positions=positions,
+    )
+    ((reference_output.float() * grad_output.float()).sum()
+     + (reference_lse * grad_lse).sum()).backward()
+    reference = (
+        reference_output.detach(),
+        reference_lse.detach(),
+        reference_query.grad.detach(),
+        reference_key.grad.detach(),
+        reference_value.grad.detach(),
+    )
+
+    def run(maxnreg):
+        if maxnreg is None:
+            monkeypatch.delenv(
+                'MCORE_BRIDGE_QSA_BACKWARD_MAXNREG', raising=False)
+        else:
+            monkeypatch.setenv(
+                'MCORE_BRIDGE_QSA_BACKWARD_MAXNREG', str(maxnreg))
+        query = query_base.detach().clone().requires_grad_()
+        key = key_base.detach().clone().requires_grad_()
+        value = value_base.detach().clone().requires_grad_()
+        output, lse = qsa_sparse_forward(
+            query,
+            key,
+            value,
+            indices,
+            lengths,
+            softmax_scale=dim ** -0.5,
+            backend='triton',
+            query_positions=positions,
+            selected_token_group_size=ratio,
+            dkv_reduction='atomic',
+            route_block_size=ratio,
+        )
+        ((output.float() * grad_output.float()).sum()
+         + (lse * grad_lse).sum()).backward()
+        return (
+            output.detach(),
+            lse.detach(),
+            query.grad.detach(),
+            key.grad.detach(),
+            value.grad.detach(),
+        )
+
+    default = run(None)
+    uncapped = run(0)
+    for actual in (default, uncapped):
+        assert torch.allclose(actual[0].float(), reference[0].float(), atol=0.02, rtol=0.02)
+        assert torch.allclose(actual[1], reference[1], atol=0.02, rtol=0.02)
+    assert torch.equal(default[2], uncapped[2])
+    for actual, reference_grad in zip(default[3:], reference[3:]):
+        assert torch.isfinite(actual).all()
+        assert torch.allclose(
+            actual.float(), reference_grad.float(), atol=0.5, rtol=0.05)
+    for actual, reference_grad in zip(uncapped[3:], reference[3:]):
+        assert torch.isfinite(actual).all()
+        assert torch.allclose(
+            actual.float(), reference_grad.float(), atol=0.5, rtol=0.05)
+    for capped_grad, uncapped_grad in zip(default[3:], uncapped[3:]):
+        assert torch.allclose(
+            capped_grad.float(), uncapped_grad.float(), atol=0.125, rtol=0.05)
+
+
 @pytest.mark.parametrize('output_delta', ('1', '0'))
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
 def test_triton_selected_kv_backward_matches_torch_on_sm90(monkeypatch, output_delta):
