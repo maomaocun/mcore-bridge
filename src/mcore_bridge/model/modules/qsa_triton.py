@@ -11070,6 +11070,10 @@ def qsa_selected_kv_backward(
     ``precomputed_scores`` is an opt-in BF16/FP32 raw-QK workspace produced by
     the matching forward diagnostic; it removes backward QK recomputation
     while retaining the original LSE-based probability formula.
+    ``MCORE_BRIDGE_QSA_BACKWARD_MAXNREG`` overrides the Triton register cap;
+    for the validated SM90 production shape it defaults to 192 only on the
+    untrimmed long atomic route, while short and segmented paths retain the
+    compiler default.
     """
 
     if not TRITON_AVAILABLE:
@@ -11493,6 +11497,30 @@ def qsa_selected_kv_backward(
     if backward_num_warps not in {1, 2, 4, 8} or backward_num_stages not in {1, 2, 3, 4}:
         raise ValueError(
             'QSA backward tuning expects warps in {1,2,4,8} and stages in {1,2,3,4}')
+    # The long production route is the only validated point where a small
+    # register cap improves SM90 scheduling.  Short causal rows use a
+    # different two-warp geometry and spill badly under the same cap, so keep
+    # them at the compiler default.  An explicit environment value (including
+    # zero) always overrides this shape-specific default.
+    default_backward_maxnreg = (
+        192
+        if (
+            is_sm90(query.device)
+            and dkv_accum_dtype == 'bf16'
+            and tensorized_tile
+            and head_tile_size == 16
+            and group_size == 12
+            and head_dim == 256
+            and route_block_size == 4
+            and not use_segmented_reduction
+            and not trim_causal_loop
+        )
+        else 0
+    )
+    backward_maxnreg = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_BACKWARD_MAXNREG', str(default_backward_maxnreg)))
+    if backward_maxnreg < 0:
+        raise ValueError('QSA backward maxnreg must be non-negative')
     kernel_args = (
         query,
         key,
@@ -11616,6 +11644,8 @@ def qsa_selected_kv_backward(
         'num_warps': backward_num_warps,
         'num_stages': backward_num_stages,
     }
+    if backward_maxnreg:
+        kernel_options['maxnreg'] = backward_maxnreg
     split_dkv = (
         (
             not use_segmented_reduction
