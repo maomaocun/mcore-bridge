@@ -1646,7 +1646,7 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
     grad_lse = torch.randn(batch, hq, sq, device=device, dtype=torch.float32) * 0.01
 
     def run(threshold=None, reuse=False, compact=False, fuse=False, tiled=False,
-            listed=False, persistent=False):
+            listed=False, persistent=False, grouped_blocks=None):
         monkeypatch.setenv('MCORE_BRIDGE_QSA_DKV_REDUCTION', 'segmented')
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEAD_TILES', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEAD_TILES_TILED', raising=False)
@@ -1654,6 +1654,8 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_COMPACT_BLOCK_LIST', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_PERSISTENT_OWNER', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_PERSISTENT_CTAS', raising=False)
+        monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_GROUP_BLOCKS', raising=False)
+        monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_FLATTEN_HEADS', raising=False)
         if fuse:
             monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEAD_TILES', '1')
         if tiled:
@@ -1665,6 +1667,10 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
         if persistent:
             monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_PERSISTENT_OWNER', '1')
             monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_PERSISTENT_CTAS', '16')
+        if grouped_blocks is not None:
+            monkeypatch.setenv(
+                'MCORE_BRIDGE_QSA_SEGMENT_GROUP_BLOCKS', str(grouped_blocks))
+            monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_FLATTEN_HEADS', '1')
         if threshold is None:
             monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT', raising=False)
         else:
@@ -1700,8 +1706,10 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
     tiled_owner = run(threshold=2, reuse=True, compact=True, fuse=True, tiled=True)
     listed_owner = run(threshold=2, reuse=True, compact=True, listed=True)
     persistent_owner = run(threshold=2, reuse=True, compact=True, persistent=True)
+    grouped_owner2 = run(threshold=2, reuse=True, compact=True, grouped_blocks=2)
+    grouped_owner4 = run(threshold=2, reuse=True, compact=True, grouped_blocks=4)
     for actual in (hybrid, hybrid_saved, fused_owner, tiled_owner, listed_owner,
-                   persistent_owner):
+                   persistent_owner, grouped_owner2, grouped_owner4):
         assert torch.equal(actual[0], reference[0])
         assert torch.equal(actual[1], reference[1])
         assert torch.equal(actual[2], reference[2])
