@@ -5279,6 +5279,11 @@ if TRITON_AVAILABLE:
         d_score_ptr,
         grad_key_ptr,
         grad_value_ptr,
+        key_ptr,
+        value_ptr,
+        lse_ptr,
+        grad_lse_ptr,
+        correction_ptr,
         seq_len_q,
         seq_len_k,
         num_blocks,
@@ -5310,6 +5315,23 @@ if TRITON_AVAILABLE:
         stride_dscoreb,
         stride_dscoreh,
         stride_dscorek,
+        stride_kb,
+        stride_ks,
+        stride_kh,
+        stride_kd,
+        stride_vb,
+        stride_vs,
+        stride_vh,
+        stride_vd,
+        stride_lseb,
+        stride_lseh,
+        stride_lses,
+        stride_glseb,
+        stride_glseh,
+        stride_glses,
+        stride_cb,
+        stride_ch,
+        stride_cs,
         RATIO: tl.constexpr,
         GROUP_SIZE: tl.constexpr,
         HEAD_TILE: tl.constexpr,
@@ -5324,6 +5346,8 @@ if TRITON_AVAILABLE:
         USE_OWNER_MASK: tl.constexpr,
         GROUP_UNION: tl.constexpr,
         TABLE_SCAN: tl.constexpr,
+        RECOMPUTE_DERIVATIVES: tl.constexpr,
+        HAS_GRAD_LSE: tl.constexpr,
         DKV_ACCUM_BF16: tl.constexpr,
     ):
         """Fuse several adjacent block owners into one exact output tile.
@@ -5382,8 +5406,10 @@ if TRITON_AVAILABLE:
                 ) != 0
             )
         if TABLE_SCAN:
-            group_start = 0
-            group_end = seq_len_q
+            group_start = tl.load(
+                group_start_ptr + group_work).to(tl.int32)
+            group_end = tl.load(
+                group_start_ptr + group_work + 1).to(tl.int32)
         elif GROUP_UNION:
             group_start = tl.load(
                 group_start_ptr + group_work).to(tl.int32)
@@ -5456,6 +5482,37 @@ if TRITON_AVAILABLE:
                 (GROUP_BLOCKS * RATIO, BLOCK_D), dtype=tl.float32)
             grad_value_acc = tl.zeros(
                 (GROUP_BLOCKS * RATIO, BLOCK_D), dtype=tl.float32)
+            if RECOMPUTE_DERIVATIVES:
+                key_positions = safe_output_blocks * RATIO + output_tokens
+                key_valid = (
+                    output_owner_valid
+                    & (key_positions >= 0)
+                    & (key_positions < seq_len_k)
+                )
+                key_ptrs = (
+                    key_ptr
+                    + batch * stride_kb
+                    + key_positions * stride_ks
+                    + kv_head * stride_kh
+                    + (d_start + d_offsets[None, :]) * stride_kd
+                )
+                value_ptrs = (
+                    value_ptr
+                    + batch * stride_vb
+                    + key_positions * stride_vs
+                    + kv_head * stride_vh
+                    + (d_start + d_offsets[None, :]) * stride_vd
+                )
+                key_value = tl.load(
+                    key_ptrs,
+                    mask=key_valid & d_mask[None, :],
+                    other=0.0,
+                ).to(tl.bfloat16)
+                value_value = tl.load(
+                    value_ptrs,
+                    mask=key_valid & d_mask[None, :],
+                    other=0.0,
+                ).to(tl.bfloat16)
 
             for occurrence_offset in tl.range(
                 0, group_end - group_start, occurrence_step
@@ -5467,7 +5524,11 @@ if TRITON_AVAILABLE:
                         + occurrence_lanes
                     )
                     occurrence_valid = union_index < group_end
-                    query = union_index
+                    query = tl.load(
+                        group_query_ptr + union_index,
+                        mask=occurrence_valid,
+                        other=0,
+                    ).to(tl.int32)
                     if BATCH_ONE:
                         query_batch = tl.zeros((BLOCK_M,), dtype=tl.int32)
                         same_batch = occurrence_valid
@@ -5544,22 +5605,7 @@ if TRITON_AVAILABLE:
                     other=0.0,
                 ).to(tl.bfloat16)
 
-                if TABLE_SCAN:
-                    score_occurrences = tl.load(
-                        owner_occurrence_table_ptr
-                        + (batch * seq_len_q + query[None, :]) * owner_count
-                        + output_block_columns,
-                        mask=occurrence_valid[None, :]
-                        & output_block_valid,
-                        other=-1,
-                    ).to(tl.int32)
-                    block_occurrence_mask = (
-                        (score_occurrences >= 0)
-                        & same_batch[None, :]
-                        & head_valid[None, :]
-                        & occurrence_valid[None, :]
-                    )
-                elif GROUP_UNION:
+                if TABLE_SCAN or GROUP_UNION:
                     score_occurrences = tl.load(
                         group_occurrence_ptr
                         + tl.cast(union_index[None, :], tl.int64)
@@ -5583,36 +5629,94 @@ if TRITON_AVAILABLE:
                         & head_valid[None, :]
                         & occurrence_valid[None, :]
                     )
-                score_base = (
-                    score_ptr
-                    + tl.cast(score_occurrences, tl.int64)
-                    * stride_scoreb
-                    + heads[None, :] * stride_scoreh
-                )
-                score_ptrs = (
-                    score_base
-                    + output_tokens * stride_scorek
-                )
-                d_score_base = (
-                    d_score_ptr
-                    + tl.cast(score_occurrences, tl.int64)
-                    * stride_dscoreb
-                    + heads[None, :] * stride_dscoreh
-                )
-                d_score_ptrs = (
-                    d_score_base
-                    + output_tokens * stride_dscorek
-                )
-                probability = tl.load(
-                    score_ptrs,
-                    mask=block_occurrence_mask,
-                    other=0.0,
-                ).to(tl.float32)
-                grad_score = tl.load(
-                    d_score_ptrs,
-                    mask=block_occurrence_mask,
-                    other=0.0,
-                ).to(tl.float32)
+                if RECOMPUTE_DERIVATIVES:
+                    lse_ptrs = (
+                        lse_ptr
+                        + query_batch * stride_lseb
+                        + heads * stride_lseh
+                        + query * stride_lses
+                    )
+                    correction_ptrs = (
+                        correction_ptr
+                        + query_batch * stride_cb
+                        + heads * stride_ch
+                        + query * stride_cs
+                    )
+                    grad_lse_ptrs = (
+                        grad_lse_ptr
+                        + query_batch * stride_glseb
+                        + heads * stride_glseh
+                        + query * stride_glses
+                    )
+                    lse_value = tl.load(
+                        lse_ptrs, mask=row_valid, other=0.0).to(tl.float32)
+                    correction_value = tl.load(
+                        correction_ptrs,
+                        mask=row_valid,
+                        other=0.0,
+                    ).to(tl.float32)
+                    grad_lse_value = tl.load(
+                        grad_lse_ptrs,
+                        mask=row_valid & HAS_GRAD_LSE,
+                        other=0.0,
+                    ).to(tl.float32)
+                    score = tl.trans(tl.dot(
+                        q_value,
+                        tl.trans(key_value),
+                        out_dtype=tl.float32,
+                    )) * softmax_scale
+                    d_probability = tl.trans(tl.dot(
+                        grad_output,
+                        tl.trans(value_value),
+                        out_dtype=tl.float32,
+                    ))
+                    recompute_valid = (
+                        block_occurrence_mask & key_valid
+                    )
+                    probability = tl.exp2(tl.where(
+                        recompute_valid,
+                        (score - lse_value[None, :])
+                        * 1.4426950408889634,
+                        -float('inf'),
+                    ))
+                    grad_score = (
+                        probability
+                        * (d_probability - correction_value[None, :])
+                        + grad_lse_value[None, :] * probability
+                    )
+                    grad_score = tl.where(
+                        recompute_valid, grad_score, 0.0)
+                else:
+                    score_base = (
+                        score_ptr
+                        + tl.cast(score_occurrences, tl.int64)
+                        * stride_scoreb
+                        + heads[None, :] * stride_scoreh
+                    )
+                    score_ptrs = (
+                        score_base
+                        + output_tokens * stride_scorek
+                    )
+                    d_score_base = (
+                        d_score_ptr
+                        + tl.cast(score_occurrences, tl.int64)
+                        * stride_dscoreb
+                        + heads[None, :] * stride_dscoreh
+                    )
+                    d_score_ptrs = (
+                        d_score_base
+                        + output_tokens * stride_dscorek
+                    )
+                    probability = tl.load(
+                        score_ptrs,
+                        mask=block_occurrence_mask,
+                        other=0.0,
+                    ).to(tl.float32)
+                    grad_score = tl.load(
+                        d_score_ptrs,
+                        mask=block_occurrence_mask,
+                        other=0.0,
+                    ).to(tl.float32)
                 grad_key_acc += tl.dot(
                     grad_score.to(tl.bfloat16),
                     q_value,
@@ -9324,6 +9428,7 @@ if TRITON_AVAILABLE:
         owner_occurrence_map,
         block_to_owner,
         occurrence_table,
+        group_active,
         duplicate_flag,
         seq_len_q,
         seq_len_k,
@@ -9337,9 +9442,11 @@ if TRITON_AVAILABLE:
         stride_ormb,
         stride_orms,
         owner_count,
+        group_count,
         BLOCK_TOPK: tl.constexpr,
         RATIO: tl.constexpr,
         ROUTE_BLOCK_SIZE: tl.constexpr,
+        GROUP_BLOCKS: tl.constexpr,
     ):
         """Scatter compact-owner CSR IDs into a query-major owner table."""
 
@@ -9397,6 +9504,18 @@ if TRITON_AVAILABLE:
         duplicate = valid & (previous >= 0) & (previous != occurrence)
         duplicate_any = tl.max(duplicate.to(tl.int32), axis=0)
         tl.atomic_max(duplicate_flag, duplicate_any, sem='relaxed')
+        group_id = owner_column // GROUP_BLOCKS
+        group_active_ptrs = (
+            group_active
+            + (batch * group_count + group_id) * seq_len_q
+            + query
+        )
+        tl.atomic_xchg(
+            group_active_ptrs,
+            tl.full((BLOCK_TOPK,), 1, dtype=tl.int32),
+            mask=valid,
+            sem='relaxed',
+        )
 
 
 def qsa_segmented_dkv_tail(
@@ -9712,6 +9831,9 @@ def qsa_segmented_dkv_reduce(
         'MCORE_BRIDGE_QSA_SEGMENT_GROUP_UNION', '0') != '0'
     table_scan = os.environ.get(
         'MCORE_BRIDGE_QSA_SEGMENT_TABLE_SCAN', '0') != '0'
+    table_recompute = os.environ.get(
+        'MCORE_BRIDGE_QSA_SEGMENT_TABLE_RECOMPUTE_DERIVATIVES',
+        '0') != '0'
     flatten_default = (
         is_sm90(query.device)
         and grad_key.dtype == torch.bfloat16
@@ -9833,13 +9955,18 @@ def qsa_segmented_dkv_reduce(
         return
     if table_scan:
         if not (batch == 1 and group_blocks > 1 and flatten_heads
-                and compact_derivatives and route_block_size == ratio
+                and (compact_derivatives or table_recompute)
+                and route_block_size == ratio
                 and owner_occurrence_map is not None
                 and (owner_mask is not None or hybrid_min_fanout == 0)):
             raise RuntimeError(
                 'QSA owner-table scan requires B=1, compact block derivatives, '
                 'GROUP_BLOCKS>1, and either hybrid owners or full segmented '
                 'ownership')
+        if table_recompute and group_block_d != head_dim:
+            raise RuntimeError(
+                'QSA owner-table derivative recompute currently requires '
+                'GROUP_BLOCK_D == head_dim')
         owner_block_ids = (
             torch.nonzero(owner_mask, as_tuple=False).flatten().to(torch.int32)
             if owner_mask is not None else
@@ -9848,6 +9975,7 @@ def qsa_segmented_dkv_reduce(
         owner_count = int(owner_block_ids.numel())
         if owner_count == 0:
             return
+        table_group_count = triton.cdiv(owner_count, group_blocks)
         block_to_owner = torch.full(
             (batch * num_blocks,), -1, device=query.device, dtype=torch.int32)
         block_to_owner[owner_block_ids] = torch.arange(
@@ -9855,6 +9983,11 @@ def qsa_segmented_dkv_reduce(
         owner_occurrence_table = torch.full(
             (batch * sq * owner_count,),
             -1,
+            device=query.device,
+            dtype=torch.int32,
+        )
+        group_active = torch.zeros(
+            (batch * table_group_count * sq,),
             device=query.device,
             dtype=torch.int32,
         )
@@ -9867,6 +10000,7 @@ def qsa_segmented_dkv_reduce(
             owner_occurrence_map,
             block_to_owner,
             owner_occurrence_table,
+            group_active,
             duplicate_flag,
             sq,
             sk,
@@ -9880,9 +10014,11 @@ def qsa_segmented_dkv_reduce(
             sq * block_topk,
             block_topk,
             owner_count,
+            table_group_count,
             BLOCK_TOPK=block_topk,
             RATIO=ratio,
             ROUTE_BLOCK_SIZE=route_block_size,
+            GROUP_BLOCKS=group_blocks,
             num_warps=8,
             num_stages=1,
         )
@@ -9892,7 +10028,42 @@ def qsa_segmented_dkv_reduce(
             # grouped owner rather than silently dropping one contribution.
             table_scan = False
         else:
-            table_group_count = triton.cdiv(owner_count, group_blocks)
+            active_view = group_active.view(batch * table_group_count, sq)
+            group_counts = active_view.sum(dim=1, dtype=torch.int32)
+            group_starts = torch.empty(
+                batch * table_group_count + 1,
+                device=query.device,
+                dtype=torch.int32,
+            )
+            group_starts[0] = 0
+            group_starts[1:] = group_counts.cumsum(0).to(torch.int32)
+            group_ids, group_queries = torch.nonzero(active_view, as_tuple=True)
+            group_ids = group_ids.to(torch.long)
+            group_queries = group_queries.to(torch.int32).contiguous()
+            if int(group_queries.numel()) != int(group_starts[-1].item()):
+                raise RuntimeError(
+                    'QSA owner-table active query compaction count mismatch')
+            local_columns = torch.arange(
+                group_blocks, device=query.device, dtype=torch.long)
+            owner_columns = (
+                group_ids[:, None] * group_blocks + local_columns[None, :])
+            owner_column_valid = owner_columns < owner_count
+            safe_owner_columns = owner_columns.clamp(max=owner_count - 1)
+            table_indices = (
+                group_queries.to(torch.long)[:, None] * owner_count
+                + safe_owner_columns
+            )
+            group_occurrences = owner_occurrence_table.view(-1).gather(
+                0, table_indices.reshape(-1)).view(-1, group_blocks)
+            group_occurrences = torch.where(
+                owner_column_valid,
+                group_occurrences,
+                torch.full_like(group_occurrences, -1),
+            ).contiguous()
+            owner_score_workspace = (
+                saved_scores if saved_scores is not None else query)
+            owner_d_score_workspace = (
+                saved_d_scores if saved_d_scores is not None else query)
             table_grid = (
                 batch * table_group_count * num_kv_heads * num_segment_head_tiles,
             )
@@ -9901,16 +10072,21 @@ def qsa_segmented_dkv_reduce(
                 grad_output,
                 occurrences,
                 starts,
-                starts,
-                starts,
-                starts,
+                group_queries,
+                group_occurrences,
+                group_starts,
                 owner_block_ids,
                 owner_occurrence_table,
                 starts,
-                saved_scores,
-                saved_d_scores,
+                owner_score_workspace,
+                owner_d_score_workspace,
                 grad_key,
                 grad_value,
+                key,
+                value,
+                lse,
+                grad_lse,
+                correction,
                 sq,
                 sk,
                 num_blocks,
@@ -9936,12 +10112,29 @@ def qsa_segmented_dkv_reduce(
                 grad_value.stride(0),
                 grad_value.stride(2),
                 grad_value.stride(3),
-                saved_scores.stride(0),
-                saved_scores.stride(2),
-                saved_scores.stride(3),
-                saved_d_scores.stride(0),
-                saved_d_scores.stride(2),
-                saved_d_scores.stride(3),
+                owner_score_workspace.stride(0),
+                owner_score_workspace.stride(2),
+                owner_score_workspace.stride(3),
+                owner_d_score_workspace.stride(0),
+                owner_d_score_workspace.stride(2),
+                owner_d_score_workspace.stride(3),
+                key.stride(1),
+                key.stride(0),
+                key.stride(2),
+                key.stride(3),
+                value.stride(1),
+                value.stride(0),
+                value.stride(2),
+                value.stride(3),
+                lse.stride(0),
+                lse.stride(1),
+                lse.stride(2),
+                grad_lse.stride(0),
+                grad_lse.stride(1),
+                grad_lse.stride(2),
+                correction.stride(0),
+                correction.stride(1),
+                correction.stride(2),
             )
             _qsa_segmented_dkv_reduce_block_group_kernel[table_grid](
                 *table_kernel_args,
@@ -9959,6 +10152,8 @@ def qsa_segmented_dkv_reduce(
                 USE_OWNER_MASK=False,
                 GROUP_UNION=False,
                 TABLE_SCAN=True,
+                RECOMPUTE_DERIVATIVES=table_recompute,
+                HAS_GRAD_LSE=grad_lse is not lse,
                 DKV_ACCUM_BF16=grad_key.dtype == torch.bfloat16,
                 num_warps=segmented_num_warps,
                 num_stages=1,
@@ -10006,6 +10201,11 @@ def qsa_segmented_dkv_reduce(
                     saved_d_scores,
                     grad_key,
                     grad_value,
+                    query,
+                    query,
+                    query,
+                    query,
+                    query,
                     sq,
                     sk,
                     num_blocks,
@@ -10037,6 +10237,23 @@ def qsa_segmented_dkv_reduce(
                     saved_d_scores.stride(0),
                     saved_d_scores.stride(2),
                     saved_d_scores.stride(3),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
                 )
                 _qsa_segmented_dkv_reduce_block_group_kernel[group_grid](
                     *group_kernel_args,
@@ -10054,6 +10271,8 @@ def qsa_segmented_dkv_reduce(
                     USE_OWNER_MASK=owner_mask is not None,
                     GROUP_UNION=True,
                     TABLE_SCAN=False,
+                    RECOMPUTE_DERIVATIVES=False,
+                    HAS_GRAD_LSE=grad_lse is not lse,
                     DKV_ACCUM_BF16=grad_key.dtype == torch.bfloat16,
                     num_warps=segmented_num_warps,
                     num_stages=1,
@@ -10078,6 +10297,11 @@ def qsa_segmented_dkv_reduce(
             saved_d_scores,
             grad_key,
             grad_value,
+            query,
+            query,
+            query,
+            query,
+            query,
             sq,
             sk,
             num_blocks,
@@ -10109,6 +10333,23 @@ def qsa_segmented_dkv_reduce(
             saved_d_scores.stride(0),
             saved_d_scores.stride(2),
             saved_d_scores.stride(3),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
         )
         _qsa_segmented_dkv_reduce_block_group_kernel[group_grid](
             *group_kernel_args,
@@ -10126,6 +10367,8 @@ def qsa_segmented_dkv_reduce(
             USE_OWNER_MASK=owner_mask is not None,
             GROUP_UNION=False,
             TABLE_SCAN=False,
+            RECOMPUTE_DERIVATIVES=False,
+            HAS_GRAD_LSE=grad_lse is not lse,
             DKV_ACCUM_BF16=grad_key.dtype == torch.bfloat16,
             num_warps=segmented_num_warps,
             num_stages=1,
@@ -10584,6 +10827,14 @@ def qsa_selected_kv_backward(
         and os.environ.get(
             'MCORE_BRIDGE_QSA_SEGMENT_COMPACT_DERIVATIVES', '0') != '0'
     )
+    table_recompute_requested = (
+        use_segmented_reduction
+        and os.environ.get(
+            'MCORE_BRIDGE_QSA_SEGMENT_TABLE_RECOMPUTE_DERIVATIVES',
+            '0') != '0'
+    )
+    owner_occurrence_requested = (
+        compact_derivatives_requested or table_recompute_requested)
     if use_segmented_reduction:
         if (segmented_metadata is None or
                 (hybrid_min_fanout > 0 and len(segmented_metadata) < 5)):
@@ -10604,7 +10855,7 @@ def qsa_selected_kv_backward(
         if hybrid_min_fanout > 0 and owner_block_mask is None:
             raise RuntimeError(
                 'QSA hybrid segmented reduction requires an owner block mask')
-        if compact_derivatives_requested:
+        if owner_occurrence_requested:
             if route_block_size != segment_ratio:
                 raise RuntimeError(
                     'QSA compact derivative reuse requires a compact block route')
@@ -10629,6 +10880,7 @@ def qsa_selected_kv_backward(
                 )
             else:
                 compact_derivatives_requested = False
+                owner_occurrence_requested = False
     reuse_scores = (
         use_segmented_reduction
         and os.environ.get('MCORE_BRIDGE_QSA_SEGMENT_REUSE_SCORES', '0') != '0'
@@ -10939,8 +11191,18 @@ def qsa_selected_kv_backward(
         'num_stages': backward_num_stages,
     }
     split_dkv = (
-        not use_segmented_reduction
-        and os.environ.get('MCORE_BRIDGE_QSA_BACKWARD_SPLIT_DKV', '0') != '0'
+        (
+            not use_segmented_reduction
+            and os.environ.get(
+                'MCORE_BRIDGE_QSA_BACKWARD_SPLIT_DKV', '0') != '0'
+        )
+        or (
+            table_recompute_requested
+            and hybrid_reduction
+            and os.environ.get(
+                'MCORE_BRIDGE_QSA_SEGMENT_SPLIT_RECOMPUTE_DKV',
+                '0') != '0'
+        )
     )
     if split_dkv:
         # Diagnostic split: the first launch owns dQ and the second owns
