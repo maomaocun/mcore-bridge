@@ -1158,6 +1158,47 @@ def test_triton_fused_indexer_postprocess_is_bitwise_exact_on_sm90(monkeypatch):
     assert torch.equal(actual_keys, expected_keys)
 
 
+@pytest.mark.parametrize('freq_layout', ('max_length', 'flattened'))
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_triton_fused_packed_indexer_postprocess_is_bitwise_exact_on_sm90(
+        monkeypatch, freq_layout):
+    """Packed fusion must preserve segment-local RoPE and block boundaries."""
+
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('requires H100/SM90')
+    torch.manual_seed(74)
+    config = _indexer_config()
+    config.hidden_size = 80
+    config.params_dtype = torch.bfloat16
+    config.indexer_n_heads = 4
+    config.indexer_kv_heads = 1
+    config.indexer_head_dim = 128
+    config.indexer_budget = 2048
+    config.indexer_compress_ratio = 4
+    indexer = QSAIndexer(config).cuda()
+    indexer.q_layernorm.weight.data.uniform_(-0.3, 0.3)
+    indexer.k_layernorm.weight.data.uniform_(-0.3, 0.3)
+    hidden = torch.randn(
+        16, 1, config.hidden_size, device='cuda', dtype=torch.bfloat16)
+    freq_length = 9 if freq_layout == 'max_length' else hidden.shape[0]
+    freqs = torch.randn(
+        freq_length, 1, 1, config.indexer_head_dim,
+        device='cuda', dtype=torch.bfloat16)
+    # Include an empty document and tails that must not be pooled into the
+    # following document.  Both non-empty segments reset RoPE position to 0.
+    boundaries = [0, 7, 7, 16]
+
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_INDEXER_FUSED_POSTPROCESS', '0')
+    expected = indexer._project_and_pool_packed(
+        hidden, freqs, boundaries)
+    monkeypatch.delenv(
+        'MCORE_BRIDGE_QSA_INDEXER_FUSED_POSTPROCESS', raising=False)
+    actual = indexer._project_and_pool_packed(hidden, freqs, boundaries)
+
+    assert all(torch.equal(actual_tensor, expected_tensor)
+               for actual_tensor, expected_tensor in zip(actual, expected))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
 def test_triton_fused_indexer_topk_matches_torch_sets_on_sm90():
     if torch.cuda.get_device_capability() != (9, 0):

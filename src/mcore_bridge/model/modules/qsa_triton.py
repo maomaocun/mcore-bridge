@@ -90,6 +90,9 @@ if TRITON_AVAILABLE:
         sin_ptr,
         q_out_ptr,
         block_key_out_ptr,
+        local_position_ptr,
+        packed_block_start_ptr,
+        packed_block_count_ptr,
         seq_len,
         num_blocks,
         head_dim,
@@ -109,9 +112,13 @@ if TRITON_AVAILABLE:
         stride_bob,
         stride_bos,
         stride_bod,
+        stride_lp,
+        stride_pbs,
+        stride_pbc,
         NUM_HEADS: tl.constexpr,
         RATIO: tl.constexpr,
         BLOCK_D: tl.constexpr,
+        PACKED: tl.constexpr,
     ):
         """Fuse indexer RMSNorm, RoPE, and R-token key pooling.
 
@@ -124,6 +131,19 @@ if TRITON_AVAILABLE:
         row = tl.program_id(0)
         batch = row // seq_len
         position = row - batch * seq_len
+        local_position = position
+        packed_block_start = 0
+        packed_block_count = num_blocks
+        if PACKED:
+            local_position = tl.load(
+                local_position_ptr + position * stride_lp
+            ).to(tl.int32)
+            packed_block_start = tl.load(
+                packed_block_start_ptr + position * stride_pbs
+            ).to(tl.int32)
+            packed_block_count = tl.load(
+                packed_block_count_ptr + position * stride_pbc
+            ).to(tl.int32)
         head_offsets = tl.arange(0, NUM_HEADS)
         d_offsets = tl.arange(0, BLOCK_D)
         d_mask = d_offsets < head_dim
@@ -210,9 +230,10 @@ if TRITON_AVAILABLE:
         )
         tl.store(q_out_ptrs, q_value, mask=d_mask[None, :])
 
-        if position % RATIO == 0:
-            block = position // RATIO
-            if block < num_blocks:
+        if local_position % RATIO == 0:
+            local_block = local_position // RATIO
+            if local_block < packed_block_count:
+                block = packed_block_start + local_block
                 ratio_offsets = tl.arange(0, RATIO)
                 key_base = NUM_HEADS * head_dim
                 key_ptrs = (
@@ -4950,8 +4971,18 @@ def qsa_indexer_fused_postprocess(
     norm_epsilon: float,
     num_heads: int,
     ratio: int,
+    *,
+    packed_local_positions: Optional[torch.Tensor] = None,
+    packed_block_starts: Optional[torch.Tensor] = None,
+    packed_block_counts: Optional[torch.Tensor] = None,
+    packed_num_blocks: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fuse production indexer normalization, RoPE, and key pooling."""
+    """Fuse production indexer normalization, RoPE, and key pooling.
+
+    Supplying the packed metadata keeps RoPE positions and compression blocks
+    segment-local while still processing the projected THD tensor in one
+    launch. Dense callers omit all four packed arguments.
+    """
 
     if not TRITON_AVAILABLE:
         raise RuntimeError('QSA fused indexer postprocess requires Triton')
@@ -4977,12 +5008,49 @@ def qsa_indexer_fused_postprocess(
     if any(t.device != qk.device or t.dtype != qk.dtype for t in (q_weight, k_weight, cos, sin)):
         raise ValueError('QSA fused indexer postprocess inputs must share CUDA device and BF16 dtype')
 
+    packed_args = (
+        packed_local_positions,
+        packed_block_starts,
+        packed_block_counts,
+        packed_num_blocks,
+    )
+    packed = any(item is not None for item in packed_args)
+    if packed and not all(item is not None for item in packed_args):
+        raise ValueError(
+            'QSA fused packed postprocess requires local positions, block starts/counts, and num_blocks')
+    if packed:
+        if batch != 1:
+            raise ValueError('QSA fused packed postprocess requires the THD dummy batch dimension to equal one')
+        packed_tensors = (
+            packed_local_positions,
+            packed_block_starts,
+            packed_block_counts,
+        )
+        if any(t.shape != (seq_len,) for t in packed_tensors):
+            raise ValueError('QSA fused packed postprocess metadata must have shape [T]')
+        if any(t.device != qk.device or t.dtype != torch.int32 for t in packed_tensors):
+            raise ValueError('QSA fused packed postprocess metadata must be CUDA int32 on the QK device')
+        num_blocks = int(packed_num_blocks)
+        if num_blocks < 0:
+            raise ValueError('QSA fused packed postprocess num_blocks must be non-negative')
+    else:
+        num_blocks = seq_len // ratio
+
     qk = qk.contiguous()
     q_weight = q_weight.contiguous()
     k_weight = k_weight.contiguous()
     cos = cos.contiguous()
     sin = sin.contiguous()
-    num_blocks = seq_len // ratio
+    if packed:
+        packed_local_positions = packed_local_positions.contiguous()
+        packed_block_starts = packed_block_starts.contiguous()
+        packed_block_counts = packed_block_counts.contiguous()
+    else:
+        # Compile-time PACKED=false removes all accesses to these dummy
+        # pointers and their zero strides.
+        packed_local_positions = qk
+        packed_block_starts = qk
+        packed_block_counts = qk
     q = torch.empty(
         (batch, seq_len, num_heads, head_dim),
         device=qk.device,
@@ -5005,6 +5073,9 @@ def qsa_indexer_fused_postprocess(
         sin,
         q,
         block_keys,
+        packed_local_positions,
+        packed_block_starts,
+        packed_block_counts,
         seq_len,
         num_blocks,
         head_dim,
@@ -5024,9 +5095,13 @@ def qsa_indexer_fused_postprocess(
         block_keys.stride(0),
         block_keys.stride(1),
         block_keys.stride(2),
+        packed_local_positions.stride(0) if packed else 0,
+        packed_block_starts.stride(0) if packed else 0,
+        packed_block_counts.stride(0) if packed else 0,
         NUM_HEADS=num_heads,
         RATIO=ratio,
         BLOCK_D=triton.next_power_of_2(head_dim),
+        PACKED=packed,
         num_warps=4,
         num_stages=1,
         enable_fp_fusion=False,

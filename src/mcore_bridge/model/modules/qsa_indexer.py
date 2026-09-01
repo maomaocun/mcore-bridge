@@ -179,7 +179,98 @@ class QSAIndexer(nn.Module):
             raise ValueError('QSA packed indexer expects hidden_states [T,1,H]')
         total_length = hidden_states.shape[0]
         ratio = self.compress_ratio
+        device = hidden_states.device
+        segment_lengths = [
+            end - start for start, end in zip(boundaries[:-1], boundaries[1:])]
+        block_count_values = [length // ratio for length in segment_lengths]
+        lengths_q = torch.tensor(
+            segment_lengths, device=device, dtype=torch.long)
+        block_counts = torch.tensor(
+            block_count_values, device=device, dtype=torch.long)
+        segment_ids = torch.repeat_interleave(
+            torch.arange(
+                len(boundaries) - 1, device=device, dtype=torch.long),
+            lengths_q,
+        )
+        q_starts = torch.tensor(
+            boundaries[:-1], device=device, dtype=torch.long)
+        block_starts = torch.cat((
+            torch.zeros(1, device=device, dtype=torch.long),
+            block_counts.cumsum(0)[:-1],
+        ))
+        per_query_block_starts = block_starts.index_select(0, segment_ids)
+        per_query_block_counts = block_counts.index_select(0, segment_ids)
+        local_positions = (
+            torch.arange(total_length, device=device, dtype=torch.long)
+            - q_starts.index_select(0, segment_ids)
+        )
+        block_starts_i32 = per_query_block_starts.to(
+            torch.int32).contiguous()
+        block_counts_i32 = per_query_block_counts.to(
+            torch.int32).contiguous()
+        local_positions_i32 = local_positions.to(torch.int32).contiguous()
+
         qk = self.index_qk_proj(hidden_states)
+        if self.index_kv_heads != 1:
+            raise ValueError(
+                f'Qwen4-Exp QSA requires indexer_kv_heads=1, got '
+                f'{self.index_kv_heads}')
+        use_fused_postprocess = (
+            os.environ.get(
+                'MCORE_BRIDGE_QSA_INDEXER_FUSED_POSTPROCESS', '1') != '0'
+            and qk.is_cuda
+            and qk.dtype == torch.bfloat16
+            and self.index_n_heads == 4
+            and self.index_head_dim == 128
+            and self.compress_ratio == 4
+            and self.q_layernorm.weight.device == qk.device
+            and self.q_layernorm.weight.dtype == qk.dtype
+            and self.k_layernorm.weight.device == qk.device
+            and self.k_layernorm.weight.dtype == qk.dtype
+        )
+        if use_fused_postprocess:
+            from .qsa_triton import is_sm90, qsa_indexer_fused_postprocess
+
+            if is_sm90(qk.device):
+                packed_freqs = freqs[0] if isinstance(freqs, tuple) else freqs
+                if packed_freqs is None:
+                    raise ValueError('QSA indexer requires rotary frequencies')
+                max_segment_length = max(segment_lengths, default=0)
+                if packed_freqs.shape[0] == total_length:
+                    token_freqs = packed_freqs
+                elif packed_freqs.shape[0] >= max_segment_length:
+                    token_freqs = packed_freqs.index_select(
+                        0, local_positions)
+                else:
+                    raise ValueError(
+                        f'QSA packed rotary length {packed_freqs.shape[0]} '
+                        f'is shorter than segment length {max_segment_length}')
+                q_cos, q_sin = self._materialize_freqs(
+                    token_freqs, total_length, qk.dtype)
+                rotary_dim = q_cos.shape[1] if q_cos.ndim == 2 else 0
+                if 0 < rotary_dim <= self.index_head_dim and rotary_dim % 2 == 0:
+                    q, block_keys = qsa_indexer_fused_postprocess(
+                        qk,
+                        self.q_layernorm.weight,
+                        self.k_layernorm.weight,
+                        q_cos,
+                        q_sin,
+                        self.config.layernorm_epsilon,
+                        self.index_n_heads,
+                        self.compress_ratio,
+                        packed_local_positions=local_positions_i32,
+                        packed_block_starts=block_starts_i32,
+                        packed_block_counts=block_counts_i32,
+                        packed_num_blocks=sum(block_count_values),
+                    )
+                    return (
+                        q[0],
+                        block_keys[0],
+                        block_starts_i32,
+                        block_counts_i32,
+                        local_positions_i32,
+                    )
+
         q, token_k = torch.split(
             qk,
             [self.index_n_heads * self.index_head_dim,
@@ -225,32 +316,12 @@ class QSAIndexer(nn.Module):
         else:
             block_keys = raw_keys.new_empty((0, self.index_head_dim))
 
-        device = hidden_states.device
-        lengths_q = torch.tensor(
-            [end - start for start, end in zip(boundaries[:-1], boundaries[1:])],
-            device=device, dtype=torch.long)
-        block_counts = torch.tensor(
-            [(end - start) // ratio for start, end in zip(boundaries[:-1], boundaries[1:])],
-            device=device, dtype=torch.long)
-        segment_ids = torch.repeat_interleave(
-            torch.arange(len(boundaries) - 1, device=device, dtype=torch.long), lengths_q)
-        q_starts = torch.tensor(boundaries[:-1], device=device, dtype=torch.long)
-        block_starts = torch.cat((
-            torch.zeros(1, device=device, dtype=torch.long),
-            block_counts.cumsum(0)[:-1],
-        ))
-        per_query_block_starts = block_starts.index_select(0, segment_ids)
-        per_query_block_counts = block_counts.index_select(0, segment_ids)
-        local_positions = (
-            torch.arange(total_length, device=device, dtype=torch.long)
-            - q_starts.index_select(0, segment_ids)
-        )
         return (
             q[0],
             block_keys,
-            per_query_block_starts.to(torch.int32).contiguous(),
-            per_query_block_counts.to(torch.int32).contiguous(),
-            local_positions.to(torch.int32).contiguous(),
+            block_starts_i32,
+            block_counts_i32,
+            local_positions_i32,
         )
 
     @staticmethod
