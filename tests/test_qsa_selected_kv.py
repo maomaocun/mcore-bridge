@@ -1419,8 +1419,8 @@ def test_triton_selected_kv_backward_matches_torch_on_sm90(monkeypatch, output_d
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
-def test_triton_selected_kv_production_shape_default_dispatch_matches_torch(monkeypatch):
-    """Guard the D=256/K=2051 tensor-core production dispatch."""
+def test_triton_selected_kv_production_compact_default_dispatch_matches_torch(monkeypatch):
+    """Guard the SM90 D=256/K=2051 compact two-warp dispatch."""
 
     if torch.cuda.get_device_capability() != (9, 0):
         pytest.skip('requires H100/SM90')
@@ -1435,21 +1435,32 @@ def test_triton_selected_kv_production_shape_default_dispatch_matches_torch(monk
         monkeypatch.delenv(name, raising=False)
 
     torch.manual_seed(314159)
-    sq, hq, hkv, dim, slots = 32, 24, 2, 256, 2051
+    sq, hq, hkv, dim, block_slots = 32, 24, 2, 256, 512
     device = 'cuda'
     query_base = torch.randn(sq, 1, hq, dim, device=device, dtype=torch.bfloat16)
     key_base = torch.randn(sq, 1, hkv, dim, device=device, dtype=torch.bfloat16)
     value_base = torch.randn_like(key_base)
     positions = torch.arange(sq, device=device, dtype=torch.int32)
-    indices = torch.full((1, sq, slots), -1, device=device, dtype=torch.int32)
+    indices = torch.full(
+        (1, sq, block_slots), -1, device=device, dtype=torch.int32)
     lengths = torch.empty((1, sq), device=device, dtype=torch.int32)
     for position in range(sq):
-        # Vary row lengths and retain duplicate KV IDs to exercise atomic
-        # accumulation without reducing the compile-time production K.
-        count = (position * 17) % (position + 1) + 1
-        indices[0, position, :count] = torch.randint(
-            0, position + 1, (count,), device=device, dtype=torch.int32)
-        lengths[0, position] = count
+        # Vary complete-block counts and retain duplicate block IDs to exercise
+        # atomic accumulation without reducing compile-time logical K=2051.
+        complete_blocks = (position + 1) // 4
+        block_count = (
+            (position * 17) % complete_blocks + 1
+            if complete_blocks else 0
+        )
+        if block_count:
+            indices[0, position, :block_count] = torch.randint(
+                0,
+                complete_blocks,
+                (block_count,),
+                device=device,
+                dtype=torch.int32,
+            )
+        lengths[0, position] = block_count * 4 + (position + 1) % 4
     grad_out = torch.randn_like(query_base)
 
     def run(backend):
@@ -1465,6 +1476,8 @@ def test_triton_selected_kv_production_shape_default_dispatch_matches_torch(monk
             backend=backend,
             require_backend=backend == 'triton',
             query_positions=positions,
+            selected_token_group_size=4,
+            route_block_size=4,
         )
         (output.float() * grad_out.float()).sum().backward()
         return output.detach(), lse.detach(), query.grad, key.grad, value.grad

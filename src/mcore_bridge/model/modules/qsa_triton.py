@@ -2254,7 +2254,7 @@ if TRITON_AVAILABLE:
         BLOCK_D: tl.constexpr,
         DKV_ACCUM_BF16: tl.constexpr,
     ):
-        """Emit a 64-key derivative tile as two bounded 32-key WGMMA results."""
+        """Emit a 64-key derivative tile as two bounded 32-key MMA results."""
 
         half_k: tl.constexpr = 32
         d_offsets = tl.arange(0, BLOCK_D)
@@ -7245,11 +7245,27 @@ def qsa_selected_kv_backward(
     num_head_tiles = triton.cdiv(group_size, head_tile_size)
     grid = (batch * sq, num_kv_heads * num_head_tiles)
     block_d = max(16, triton.next_power_of_2(head_dim))
-    # Split-64 removes loop/decode overhead while the causal prefix is short.
-    # At long context it concentrates too many atomics from one CTA on the hot
-    # KV rows produced by the real indexer, so production falls back to K32.
+    trim_causal_loop = _qsa_trim_causal_loop(causal, sq, logical_k)
+    hopper_short_compact = (
+        tensorized_tile
+        and head_tile_size == 16
+        and group_size == 12
+        and head_dim == 256
+        and route_block_size == 4
+        and trim_causal_loop
+        and sq <= 8 * logical_k
+        and is_sm90(query.device)
+    )
+    # K32 is the stable Hopper derivative tile.  The former short-sequence
+    # K64 path reduced loop overhead but required four warps and generated a
+    # wider burst of reductions into hot KV rows.  A two-warp K32 launch is
+    # faster when the causal runtime bound is active and retains K32's
+    # bounded derivative/atomic tile.  Token-route compatibility and other
+    # shapes retain the previously tuned K64 short-prefix dispatch.
     default_block_k = (
-        64
+        32
+        if hopper_short_compact
+        else 64
         if (
             tensorized_tile
             and head_dim == 256
@@ -7268,7 +7284,14 @@ def qsa_selected_kv_backward(
         raise ValueError(
             'QSA backward correction BLOCK_K expects one of {4,8,16,32,64,128}')
     tensorize_derivatives = tensorized_tile and block_k >= 16
-    default_num_warps = 4 if tensorize_derivatives else 1
+    hopper_short_k32 = (
+        hopper_short_compact
+        and tensorize_derivatives
+        and block_k == 32
+    )
+    default_num_warps = (
+        2 if hopper_short_k32 else 4 if tensorize_derivatives else 1
+    )
     backward_num_warps = int(os.environ.get(
         'MCORE_BRIDGE_QSA_BACKWARD_WARPS', str(default_num_warps)))
     default_num_stages = 2 if tensorize_derivatives else 1
@@ -7277,11 +7300,6 @@ def qsa_selected_kv_backward(
     if backward_num_warps not in {1, 2, 4, 8} or backward_num_stages not in {1, 2, 3, 4}:
         raise ValueError(
             'QSA backward tuning expects warps in {1,2,4,8} and stages in {1,2,3,4}')
-    # A runtime loop bound avoids masked tensor-core work for the causal
-    # prefix, but also prevents Triton from fully static-pipelining the loop.
-    # The saved work wins when the sequence is roughly no longer than 8*K;
-    # long sequences keep the faster compile-time K bound.
-    trim_causal_loop = _qsa_trim_causal_loop(causal, sq, logical_k)
     _qsa_selected_kv_backward_grouped_kernel[grid](
         query,
         key,
