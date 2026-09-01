@@ -171,6 +171,74 @@ class QSAIndexer(nn.Module):
         return q, block_keys
 
     @torch.no_grad()
+    def _project_and_pool_packed_device(
+        self,
+        hidden_states: torch.Tensor,
+        freqs: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ):
+        """Project packed THD directly from device cu_seqlens on SM90."""
+
+        total_length = hidden_states.shape[0]
+        from .qsa_triton import (
+            qsa_indexer_fused_postprocess,
+            qsa_indexer_packed_metadata_from_cu,
+        )
+
+        block_starts, block_counts, local_positions = (
+            qsa_indexer_packed_metadata_from_cu(
+                cu_seqlens, total_length, self.compress_ratio))
+        qk = self.index_qk_proj(hidden_states)
+        if self.index_kv_heads != 1:
+            raise ValueError(
+                f'Qwen4-Exp QSA requires indexer_kv_heads=1, got '
+                f'{self.index_kv_heads}')
+
+        packed_freqs = freqs[0] if isinstance(freqs, tuple) else freqs
+        if packed_freqs is None:
+            raise ValueError('QSA indexer requires rotary frequencies')
+        if packed_freqs.shape[0] == total_length:
+            token_freqs = packed_freqs
+        else:
+            if not packed_freqs.shape[0]:
+                raise ValueError(
+                    'QSA packed rotary table must be non-empty')
+            torch._assert_async(
+                (local_positions < packed_freqs.shape[0]).all(),
+                'QSA packed rotary table is shorter than a segment',
+            )
+            token_freqs = packed_freqs.index_select(0, local_positions)
+        q_cos, q_sin = self._materialize_freqs(
+            token_freqs, total_length, qk.dtype)
+        rotary_dim = q_cos.shape[1] if q_cos.ndim == 2 else 0
+        if not (0 < rotary_dim <= self.index_head_dim and
+                rotary_dim % 2 == 0):
+            raise ValueError(
+                'QSA packed rotary dimension must be positive, even, and '
+                'no larger than indexer_head_dim')
+        q, block_keys = qsa_indexer_fused_postprocess(
+            qk,
+            self.q_layernorm.weight,
+            self.k_layernorm.weight,
+            q_cos,
+            q_sin,
+            self.config.layernorm_epsilon,
+            self.index_n_heads,
+            self.compress_ratio,
+            packed_local_positions=local_positions,
+            packed_block_starts=block_starts,
+            packed_block_counts=block_counts,
+            packed_num_blocks=total_length // self.compress_ratio,
+        )
+        return (
+            q[0],
+            block_keys[0],
+            block_starts,
+            block_counts,
+            local_positions,
+        )
+
+    @torch.no_grad()
     def _project_and_pool_packed(self, hidden_states: torch.Tensor, freqs: torch.Tensor,
                                  boundaries):
         """Project packed THD tokens and concatenate segment-local block keys."""
@@ -183,32 +251,70 @@ class QSAIndexer(nn.Module):
         segment_lengths = [
             end - start for start, end in zip(boundaries[:-1], boundaries[1:])]
         block_count_values = [length // ratio for length in segment_lengths]
-        lengths_q = torch.tensor(
-            segment_lengths, device=device, dtype=torch.long)
-        block_counts = torch.tensor(
-            block_count_values, device=device, dtype=torch.long)
-        segment_ids = torch.repeat_interleave(
-            torch.arange(
-                len(boundaries) - 1, device=device, dtype=torch.long),
-            lengths_q,
+        block_start_values = []
+        total_num_blocks = 0
+        for block_count in block_count_values:
+            block_start_values.append(total_num_blocks)
+            total_num_blocks += block_count
+
+        packed_metadata = None
+        use_fused_metadata = (
+            os.environ.get(
+                'MCORE_BRIDGE_QSA_PACKED_METADATA_FUSED', '1') != '0'
+            and hidden_states.is_cuda
         )
-        q_starts = torch.tensor(
-            boundaries[:-1], device=device, dtype=torch.long)
-        block_starts = torch.cat((
-            torch.zeros(1, device=device, dtype=torch.long),
-            block_counts.cumsum(0)[:-1],
-        ))
-        per_query_block_starts = block_starts.index_select(0, segment_ids)
-        per_query_block_counts = block_counts.index_select(0, segment_ids)
-        local_positions = (
-            torch.arange(total_length, device=device, dtype=torch.long)
-            - q_starts.index_select(0, segment_ids)
-        )
-        block_starts_i32 = per_query_block_starts.to(
-            torch.int32).contiguous()
-        block_counts_i32 = per_query_block_counts.to(
-            torch.int32).contiguous()
-        local_positions_i32 = local_positions.to(torch.int32).contiguous()
+        if use_fused_metadata:
+            from .qsa_triton import is_sm90, qsa_indexer_packed_metadata
+
+            if is_sm90(device):
+                descriptor_values = []
+                tile_size = 256
+                for start, length, block_start, block_count in zip(
+                        boundaries[:-1], segment_lengths,
+                        block_start_values, block_count_values):
+                    for local_start in range(0, length, tile_size):
+                        descriptor_values.append((
+                            start + local_start,
+                            local_start,
+                            block_start,
+                            block_count,
+                            min(tile_size, length - local_start),
+                        ))
+                descriptors = torch.tensor(
+                    descriptor_values, device=device,
+                    dtype=torch.int32).reshape(-1, 5)
+                packed_metadata = qsa_indexer_packed_metadata(
+                    descriptors, total_length)
+
+        if packed_metadata is None:
+            lengths_q = torch.tensor(
+                segment_lengths, device=device, dtype=torch.long)
+            block_counts = torch.tensor(
+                block_count_values, device=device, dtype=torch.long)
+            segment_ids = torch.repeat_interleave(
+                torch.arange(
+                    len(boundaries) - 1, device=device, dtype=torch.long),
+                lengths_q,
+            )
+            q_starts = torch.tensor(
+                boundaries[:-1], device=device, dtype=torch.long)
+            block_starts = torch.tensor(
+                block_start_values, device=device, dtype=torch.long)
+            per_query_block_starts = block_starts.index_select(
+                0, segment_ids)
+            per_query_block_counts = block_counts.index_select(
+                0, segment_ids)
+            local_positions = (
+                torch.arange(total_length, device=device, dtype=torch.long)
+                - q_starts.index_select(0, segment_ids)
+            )
+            packed_metadata = (
+                per_query_block_starts.to(torch.int32).contiguous(),
+                per_query_block_counts.to(torch.int32).contiguous(),
+                local_positions.to(torch.int32).contiguous(),
+            )
+        block_starts_i32, block_counts_i32, local_positions_i32 = (
+            packed_metadata)
 
         qk = self.index_qk_proj(hidden_states)
         if self.index_kv_heads != 1:
@@ -240,7 +346,7 @@ class QSAIndexer(nn.Module):
                     token_freqs = packed_freqs
                 elif packed_freqs.shape[0] >= max_segment_length:
                     token_freqs = packed_freqs.index_select(
-                        0, local_positions)
+                        0, local_positions_i32)
                 else:
                     raise ValueError(
                         f'QSA packed rotary length {packed_freqs.shape[0]} '
@@ -261,7 +367,7 @@ class QSAIndexer(nn.Module):
                         packed_local_positions=local_positions_i32,
                         packed_block_starts=block_starts_i32,
                         packed_block_counts=block_counts_i32,
-                        packed_num_blocks=sum(block_count_values),
+                        packed_num_blocks=total_num_blocks,
                     )
                     return (
                         q[0],
@@ -643,14 +749,8 @@ class QSAIndexer(nn.Module):
         if cu_seqlens_q.ndim != 1 or cu_seqlens_q.numel() < 2:
             raise ValueError('QSA packed indexer requires cu_seqlens_q [num_segments+1]')
         total_length = hidden_states.shape[0]
-        boundaries = cu_seqlens_q.to(device='cpu', dtype=torch.long).tolist()
-        if boundaries[0] != 0 or boundaries[-1] != total_length:
-            raise ValueError(
-                f'QSA packed cu_seqlens must start at 0 and end at T={total_length}, '
-                f'got {boundaries[0]}..{boundaries[-1]}')
-        if any(end < start for start, end in zip(boundaries[:-1], boundaries[1:])):
-            raise ValueError('QSA packed cu_seqlens must be non-decreasing')
-        if total_length == 0:
+
+        def empty_result():
             return (
                 torch.empty(
                     (
@@ -667,14 +767,74 @@ class QSAIndexer(nn.Module):
         # The production packed path projects/pools all documents once and
         # runs the segment-local streaming Top-K kernel in a single launch.
         # Keep torch/irregular debug shapes on the auditable segment loop.
-        if (backend == 'triton' and hidden_states.dtype == torch.bfloat16 and
-                self.block_topk in {128, 256, 512} and
-                (self.block_topk & (self.block_topk - 1)) == 0 and
-                os.environ.get('MCORE_BRIDGE_QSA_INDEXER_FUSED', '1') != '0'):
-            from .qsa_triton import qsa_indexer_fused_topk_packed
+        use_fused_packed = (
+            backend == 'triton'
+            and hidden_states.dtype == torch.bfloat16
+            and self.block_topk in {128, 256, 512}
+            and (self.block_topk & (self.block_topk - 1)) == 0
+            and os.environ.get(
+                'MCORE_BRIDGE_QSA_INDEXER_FUSED', '1') != '0'
+        )
+        boundaries = None
+        if use_fused_packed:
+            from .qsa_triton import is_sm90, qsa_indexer_fused_topk_packed
+
+            use_device_cu = (
+                os.environ.get(
+                    'MCORE_BRIDGE_QSA_PACKED_METADATA_FUSED', '1') != '0'
+                and os.environ.get(
+                    'MCORE_BRIDGE_QSA_INDEXER_FUSED_POSTPROCESS', '1') != '0'
+                and hidden_states.is_cuda
+                and cu_seqlens_q.is_cuda
+                and cu_seqlens_q.dtype in {torch.int32, torch.int64}
+                and self.index_n_heads == 4
+                and self.index_kv_heads == 1
+                and self.index_head_dim == 128
+                and self.compress_ratio == 4
+                and self.index_qk_proj.weight.device == hidden_states.device
+                and self.index_qk_proj.weight.dtype == hidden_states.dtype
+                and self.q_layernorm.weight.device == hidden_states.device
+                and self.q_layernorm.weight.dtype == hidden_states.dtype
+                and self.k_layernorm.weight.device == hidden_states.device
+                and self.k_layernorm.weight.dtype == hidden_states.dtype
+                and is_sm90(hidden_states.device)
+            )
+            if use_device_cu:
+                torch._assert_async(
+                    cu_seqlens_q[0] == 0,
+                    'QSA packed cu_seqlens must start at zero',
+                )
+                torch._assert_async(
+                    cu_seqlens_q[-1] == total_length,
+                    'QSA packed cu_seqlens must end at total token count',
+                )
+                torch._assert_async(
+                    (cu_seqlens_q[1:] >= cu_seqlens_q[:-1]).all(),
+                    'QSA packed cu_seqlens must be non-decreasing',
+                )
+                if total_length == 0:
+                    return empty_result()
+                projected = self._project_and_pool_packed_device(
+                    hidden_states, freqs, cu_seqlens_q)
+            else:
+                boundaries = cu_seqlens_q.to(
+                    device='cpu', dtype=torch.long).tolist()
+                if boundaries[0] != 0 or boundaries[-1] != total_length:
+                    raise ValueError(
+                        f'QSA packed cu_seqlens must start at 0 and end at '
+                        f'T={total_length}, got '
+                        f'{boundaries[0]}..{boundaries[-1]}')
+                if any(end < start for start, end in zip(
+                        boundaries[:-1], boundaries[1:])):
+                    raise ValueError(
+                        'QSA packed cu_seqlens must be non-decreasing')
+                if total_length == 0:
+                    return empty_result()
+                projected = self._project_and_pool_packed(
+                    hidden_states, freqs, boundaries)
 
             q, block_keys, block_starts, block_counts, local_positions = (
-                self._project_and_pool_packed(hidden_states, freqs, boundaries))
+                projected)
             selected = qsa_indexer_fused_topk_packed(
                 q,
                 block_keys,
@@ -698,6 +858,21 @@ class QSAIndexer(nn.Module):
                 selected_block_counts * self.compress_ratio + tail_lengths
             ).to(torch.int32)
             return selected.unsqueeze(0), topk_lengths.unsqueeze(0)
+
+        if boundaries is None:
+            boundaries = cu_seqlens_q.to(
+                device='cpu', dtype=torch.long).tolist()
+            if boundaries[0] != 0 or boundaries[-1] != total_length:
+                raise ValueError(
+                    f'QSA packed cu_seqlens must start at 0 and end at '
+                    f'T={total_length}, got '
+                    f'{boundaries[0]}..{boundaries[-1]}')
+            if any(end < start for start, end in zip(
+                    boundaries[:-1], boundaries[1:])):
+                raise ValueError(
+                    'QSA packed cu_seqlens must be non-decreasing')
+        if total_length == 0:
+            return empty_result()
 
         selected = torch.full(
             (

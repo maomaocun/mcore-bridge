@@ -21,6 +21,7 @@ from mcore_bridge.model.modules.qsa_triton import (
     qsa_expand_compact_route_triton,
     qsa_indexer_fused_topk_packed,
     qsa_indexer_fused_topk_with_ratio,
+    qsa_indexer_packed_metadata_from_cu,
     qsa_indexer_slab_topk_with_ratio,
 )
 from mcore_bridge.model.gpts.qwen4_exp import Qwen4ExpLayer
@@ -299,6 +300,31 @@ def test_triton_packed_split64_backward_matches_torch_on_sm90(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+@pytest.mark.parametrize(
+    'boundaries',
+    ((0, 9), (0, 3, 8), (0, 7, 7, 16), (0, 1, 2, 3, 9)),
+)
+def test_triton_packed_metadata_from_cu_resets_segments_on_sm90(boundaries):
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('requires H100/SM90')
+    ratio = 4
+    cu = torch.tensor(boundaries, device='cuda', dtype=torch.int32)
+    actual = qsa_indexer_packed_metadata_from_cu(
+        cu, boundaries[-1], ratio)
+    expected_starts = torch.empty(
+        boundaries[-1], device='cuda', dtype=torch.int32)
+    expected_counts = torch.empty_like(expected_starts)
+    expected_positions = torch.empty_like(expected_starts)
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        expected_starts[start:end] = start // ratio
+        expected_counts[start:end] = (end - start) // ratio
+        expected_positions[start:end] = torch.arange(
+            end - start, device='cuda', dtype=torch.int32)
+    expected = (expected_starts, expected_counts, expected_positions)
+    assert all(torch.equal(got, want) for got, want in zip(actual, expected))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
 def test_triton_packed_indexer_direct_fill_matches_segment_contract_on_sm90():
     if torch.cuda.get_device_capability() != (9, 0):
         pytest.skip('requires H100/SM90')
@@ -459,6 +485,25 @@ def test_triton_packed_indexer_mixed_short_long_dispatch_matches_sm90():
         block_topk,
     )[0]
     assert torch.equal(actual, expected)
+
+    # Compact production dispatch must not synchronize through max/any or
+    # materialize dynamic nonzero token lists.  Mixed short/long rows replay
+    # in one fixed-size launch under CUDA Graph capture.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = qsa_indexer_fused_topk_packed(
+            query,
+            block_keys,
+            block_starts,
+            block_counts,
+            query_positions,
+            ratio,
+            block_topk,
+            return_block_ids=True,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured, compact)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
@@ -1189,14 +1234,85 @@ def test_triton_fused_packed_indexer_postprocess_is_bitwise_exact_on_sm90(
     boundaries = [0, 7, 7, 16]
 
     monkeypatch.setenv('MCORE_BRIDGE_QSA_INDEXER_FUSED_POSTPROCESS', '0')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_PACKED_METADATA_FUSED', '0')
     expected = indexer._project_and_pool_packed(
         hidden, freqs, boundaries)
     monkeypatch.delenv(
         'MCORE_BRIDGE_QSA_INDEXER_FUSED_POSTPROCESS', raising=False)
+    monkeypatch.delenv(
+        'MCORE_BRIDGE_QSA_PACKED_METADATA_FUSED', raising=False)
     actual = indexer._project_and_pool_packed(hidden, freqs, boundaries)
 
     assert all(torch.equal(actual_tensor, expected_tensor)
                for actual_tensor, expected_tensor in zip(actual, expected))
+
+
+@pytest.mark.parametrize('freq_layout', ('max_length', 'flattened'))
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_triton_packed_device_cu_matches_host_path_and_captures_on_sm90(
+        monkeypatch, freq_layout):
+    """Guard static slab holes, long Top-K, and full selector graph replay."""
+
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('requires H100/SM90')
+    torch.manual_seed(76)
+    config = _indexer_config()
+    config.hidden_size = 80
+    config.params_dtype = torch.bfloat16
+    config.indexer_n_heads = 4
+    config.indexer_kv_heads = 1
+    config.indexer_head_dim = 128
+    config.indexer_budget = 2048
+    config.indexer_compress_ratio = 4
+    indexer = QSAIndexer(config).cuda()
+    indexer.q_layernorm.weight.data.uniform_(-0.3, 0.3)
+    indexer.k_layernorm.weight.data.uniform_(-0.3, 0.3)
+    # Two three-token documents accumulate enough discarded tail to make the
+    # static block slab start the long document at slot one.  The old compact
+    # host path starts it at slot zero, so route parity exercises hole mapping.
+    boundaries = (0, 3, 6, 6, 2319)
+    cu = torch.tensor(boundaries, device='cuda', dtype=torch.int32)
+    hidden = torch.randn(
+        boundaries[-1], 1, config.hidden_size,
+        device='cuda', dtype=torch.bfloat16)
+    max_segment_length = max(end - start for start, end in zip(
+        boundaries[:-1], boundaries[1:]))
+    freq_length = (
+        max_segment_length
+        if freq_layout == 'max_length' else boundaries[-1]
+    )
+    freqs = torch.randn(
+        freq_length,
+        1, 1, config.indexer_head_dim,
+        device='cuda', dtype=torch.bfloat16)
+
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_PACKED_METADATA_FUSED', '0')
+    expected_indices, expected_lengths = indexer.select_topk_packed(
+        hidden, freqs, cu, backend='triton', return_block_ids=True)
+    monkeypatch.delenv(
+        'MCORE_BRIDGE_QSA_PACKED_METADATA_FUSED', raising=False)
+    actual_indices, actual_lengths = indexer.select_topk_packed(
+        hidden, freqs, cu, backend='triton', return_block_ids=True)
+
+    assert torch.equal(actual_lengths, expected_lengths)
+    assert int(actual_lengths.max()) <= indexer.selected_k
+    assert torch.equal(
+        torch.sort(actual_indices, dim=-1).values,
+        torch.sort(expected_indices, dim=-1).values,
+    )
+
+    if freq_layout == 'max_length':
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured_indices, captured_lengths = indexer.select_topk_packed(
+                hidden, freqs, cu, backend='triton', return_block_ids=True)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(captured_lengths, actual_lengths)
+        assert torch.equal(
+            torch.sort(captured_indices, dim=-1).values,
+            torch.sort(actual_indices, dim=-1).values,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')

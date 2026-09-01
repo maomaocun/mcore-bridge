@@ -305,6 +305,100 @@ if TRITON_AVAILABLE:
                 tl.store(block_out_ptrs, key_value, mask=d_mask)
 
     @triton.jit
+    def _qsa_indexer_packed_metadata_kernel(
+        descriptor_ptr,
+        block_start_out_ptr,
+        block_count_out_ptr,
+        local_position_out_ptr,
+        total_tokens,
+        stride_dr,
+        stride_dc,
+        BLOCK_T: tl.constexpr,
+    ):
+        """Expand compact segment tiles into the packed per-token metadata."""
+
+        tile = tl.program_id(0)
+        descriptor = descriptor_ptr + tile * stride_dr
+        global_start = tl.load(descriptor).to(tl.int32)
+        local_start = tl.load(descriptor + stride_dc).to(tl.int32)
+        block_start = tl.load(descriptor + 2 * stride_dc).to(tl.int32)
+        block_count = tl.load(descriptor + 3 * stride_dc).to(tl.int32)
+        tile_length = tl.load(descriptor + 4 * stride_dc).to(tl.int32)
+        offsets = tl.arange(0, BLOCK_T)
+        positions = global_start + offsets
+        valid = (offsets < tile_length) & (positions < total_tokens)
+        tl.store(
+            block_start_out_ptr + positions,
+            block_start,
+            mask=valid,
+        )
+        tl.store(
+            block_count_out_ptr + positions,
+            block_count,
+            mask=valid,
+        )
+        tl.store(
+            local_position_out_ptr + positions,
+            local_start + offsets,
+            mask=valid,
+        )
+
+    @triton.jit
+    def _qsa_indexer_packed_metadata_from_cu_kernel(
+        cu_seqlens_ptr,
+        block_start_out_ptr,
+        block_count_out_ptr,
+        local_position_out_ptr,
+        total_tokens,
+        RATIO: tl.constexpr,
+        NUM_SEGMENTS: tl.constexpr,
+        SEARCH_STEPS: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+    ):
+        """Map packed tokens to segments directly from device cu_seqlens."""
+
+        positions = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+        valid = positions < total_tokens
+        low = tl.zeros((BLOCK_T,), dtype=tl.int32)
+        high = tl.full((BLOCK_T,), NUM_SEGMENTS, dtype=tl.int32)
+        for _ in tl.static_range(0, SEARCH_STEPS):
+            middle = (low + high) // 2
+            segment_end = tl.load(
+                cu_seqlens_ptr + middle + 1,
+                mask=valid,
+                other=total_tokens,
+            ).to(tl.int32)
+            move_right = positions >= segment_end
+            low = tl.where(move_right, middle + 1, low)
+            high = tl.where(move_right, high, middle)
+        segment = low
+        segment_start = tl.load(
+            cu_seqlens_ptr + segment,
+            mask=valid,
+            other=0,
+        ).to(tl.int32)
+        segment_end = tl.load(
+            cu_seqlens_ptr + segment + 1,
+            mask=valid,
+            other=0,
+        ).to(tl.int32)
+        tl.store(
+            block_start_out_ptr + positions,
+            segment_start // RATIO,
+            mask=valid,
+        )
+        tl.store(
+            block_count_out_ptr + positions,
+            (segment_end - segment_start) // RATIO,
+            mask=valid,
+        )
+        tl.store(
+            local_position_out_ptr + positions,
+            positions - segment_start,
+            mask=valid,
+        )
+
+    @triton.jit
     def _qsa_indexer_score_kernel(
         q_ptr,
         block_key_ptr,
@@ -4962,6 +5056,109 @@ if TRITON_AVAILABLE:
                 tl.store(value_output_ptrs, grad_value_acc, mask=output_mask)
 
 
+def qsa_indexer_packed_metadata(
+    tile_descriptors: torch.Tensor,
+    total_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Expand compact packed-segment tiles without an output-size sync.
+
+    Each descriptor stores ``global_start, local_start, block_start,
+    block_count, tile_length``.  Descriptors are intentionally small; the
+    three O(T) arrays are written by one bandwidth-only device launch.
+    """
+
+    if not TRITON_AVAILABLE:
+        raise RuntimeError('QSA packed indexer metadata requires Triton')
+    if (not tile_descriptors.is_cuda or
+            tile_descriptors.dtype != torch.int32):
+        raise ValueError(
+            'QSA packed indexer descriptors must be CUDA int32')
+    if tile_descriptors.ndim != 2 or tile_descriptors.shape[1] != 5:
+        raise ValueError(
+            'QSA packed indexer descriptors must have shape [tiles,5]')
+    total_tokens = int(total_tokens)
+    if total_tokens < 0:
+        raise ValueError('QSA packed indexer total_tokens must be non-negative')
+    if total_tokens and not tile_descriptors.shape[0]:
+        raise ValueError(
+            'QSA non-empty packed input requires at least one descriptor')
+    tile_descriptors = tile_descriptors.contiguous()
+    outputs = tuple(
+        torch.empty(
+            (total_tokens,),
+            device=tile_descriptors.device,
+            dtype=torch.int32,
+        )
+        for _ in range(3)
+    )
+    if total_tokens:
+        _qsa_indexer_packed_metadata_kernel[(tile_descriptors.shape[0],)](
+            tile_descriptors,
+            outputs[0],
+            outputs[1],
+            outputs[2],
+            total_tokens,
+            tile_descriptors.stride(0),
+            tile_descriptors.stride(1),
+            BLOCK_T=256,
+            num_warps=4,
+            num_stages=1,
+        )
+    return outputs
+
+
+def qsa_indexer_packed_metadata_from_cu(
+    cu_seqlens: torch.Tensor,
+    total_tokens: int,
+    ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build packed metadata from device cu_seqlens without a host copy."""
+
+    if not TRITON_AVAILABLE:
+        raise RuntimeError('QSA packed indexer metadata requires Triton')
+    if not cu_seqlens.is_cuda or cu_seqlens.dtype not in {
+            torch.int32, torch.int64}:
+        raise ValueError(
+            'QSA packed cu_seqlens must be CUDA int32 or int64')
+    if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
+        raise ValueError(
+            'QSA packed cu_seqlens must have shape [num_segments+1]')
+    total_tokens = int(total_tokens)
+    ratio = int(ratio)
+    if total_tokens < 0 or ratio < 2:
+        raise ValueError(
+            'QSA packed metadata requires non-negative T and ratio >= 2')
+    cu_seqlens = cu_seqlens.contiguous()
+    outputs = tuple(
+        torch.empty(
+            (total_tokens,),
+            device=cu_seqlens.device,
+            dtype=torch.int32,
+        )
+        for _ in range(3)
+    )
+    if total_tokens:
+        num_segments = cu_seqlens.numel() - 1
+        _qsa_indexer_packed_metadata_from_cu_kernel[
+            (triton.cdiv(total_tokens, 256),)
+        ](
+            cu_seqlens,
+            outputs[0],
+            outputs[1],
+            outputs[2],
+            total_tokens,
+            RATIO=ratio,
+            NUM_SEGMENTS=num_segments,
+            # ``high`` is an exclusive bound.  Powers of two therefore need
+            # one more comparison than ``(N - 1).bit_length()``.
+            SEARCH_STEPS=num_segments.bit_length(),
+            BLOCK_T=256,
+            num_warps=4,
+            num_stages=1,
+        )
+    return outputs
+
+
 def qsa_indexer_fused_postprocess(
     qk: torch.Tensor,
     q_weight: torch.Tensor,
@@ -6439,6 +6636,76 @@ def qsa_indexer_fused_topk_packed(
         device=query.device,
         dtype=torch.int32,
     )
+    static_compact_dispatch = (
+        return_block_ids
+        and os.environ.get(
+            'MCORE_BRIDGE_QSA_PACKED_STATIC_DISPATCH', '1') != '0'
+    )
+    if static_compact_dispatch:
+        # Compact production rows can branch inside one fixed-size launch:
+        # short prefixes write ascending IDs immediately, while saturated
+        # rows continue into score/Top-K.  This removes max/any/nonzero host
+        # synchronization and is safe to replay under a CUDA Graph.
+        index_bits = max(1, (max(1, total_blocks) - 1).bit_length())
+        index_mask = (1 << index_bits) - 1
+        num_warps = int(os.environ.get(
+            'MCORE_BRIDGE_QSA_INDEXER_WARPS', '8'))
+        if num_warps not in {2, 4, 8}:
+            raise ValueError(
+                'QSA packed indexer num_warps expects one of {2,4,8}')
+        num_stages = int(os.environ.get(
+            'MCORE_BRIDGE_QSA_INDEXER_STAGES', '2'))
+        if num_stages not in {1, 2, 3, 4}:
+            raise ValueError(
+                'QSA packed indexer stages expects one of {1,2,3,4}')
+        stream_block_n = int(os.environ.get(
+            'MCORE_BRIDGE_QSA_INDEXER_STREAM_BLOCK_N', str(block_topk)))
+        if (stream_block_n < 1
+                or (stream_block_n & (stream_block_n - 1))
+                or stream_block_n > block_topk
+                or block_topk % stream_block_n):
+            raise ValueError(
+                'QSA packed indexer stream BLOCK_N must be a positive '
+                'power-of-two not larger than block_topk and divide '
+                'block_topk')
+        _qsa_indexer_fused_topk_packed_kernel[(total_tokens,)](
+            query,
+            block_keys,
+            output,
+            block_starts,
+            segment_block_counts,
+            query_positions,
+            segment_block_counts,
+            total_tokens,
+            total_blocks,
+            num_heads,
+            head_dim,
+            compress_ratio,
+            head_dim**-0.5,
+            query.stride(0),
+            query.stride(1),
+            query.stride(2),
+            block_keys.stride(0),
+            block_keys.stride(1),
+            output.stride(0),
+            block_starts.stride(0),
+            segment_block_counts.stride(0),
+            query_positions.stride(0),
+            BLOCK_TOPK=block_topk,
+            BLOCK_N=stream_block_n,
+            BLOCK_H=max(1, triton.next_power_of_2(num_heads)),
+            BLOCK_D=max(16, triton.next_power_of_2(head_dim)),
+            BLOCK_TAIL=max(
+                1, triton.next_power_of_2(compress_ratio - 1)),
+            INDEX_BITS=index_bits,
+            INDEX_MASK=index_mask,
+            RATIO=compress_ratio,
+            USE_TOKEN_IDS=False,
+            OUTPUT_BLOCKS=True,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        return output
     max_segment_blocks = max(1, int(segment_block_counts.max().item()))
     if max_segment_blocks <= block_topk:
         # All complete blocks fit in the selected-token budget, so the
