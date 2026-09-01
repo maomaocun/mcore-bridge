@@ -1125,6 +1125,40 @@ def test_triton_selected_kv_right_padding_rows_are_zero_on_sm90():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_triton_fused_indexer_postprocess_is_bitwise_exact_on_sm90(monkeypatch):
+    """Keep the default Hopper fusion identical to the torch BF16 contract."""
+
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('requires H100/SM90')
+    torch.manual_seed(72)
+    config = _indexer_config()
+    config.hidden_size = 80
+    config.params_dtype = torch.bfloat16
+    config.indexer_n_heads = 4
+    config.indexer_kv_heads = 1
+    config.indexer_head_dim = 128
+    config.indexer_budget = 2048
+    config.indexer_compress_ratio = 4
+    indexer = QSAIndexer(config).cuda()
+    indexer.q_layernorm.weight.data.uniform_(-0.3, 0.3)
+    indexer.k_layernorm.weight.data.uniform_(-0.3, 0.3)
+    hidden = torch.randn(
+        67, 2, config.hidden_size, device='cuda', dtype=torch.bfloat16)
+    freqs = torch.randn(
+        67, 1, 1, config.indexer_head_dim,
+        device='cuda', dtype=torch.bfloat16)
+
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_INDEXER_FUSED_POSTPROCESS', '0')
+    expected_q, expected_keys = indexer._project_and_pool(hidden, freqs)
+    monkeypatch.delenv(
+        'MCORE_BRIDGE_QSA_INDEXER_FUSED_POSTPROCESS', raising=False)
+    actual_q, actual_keys = indexer._project_and_pool(hidden, freqs)
+
+    assert torch.equal(actual_q, expected_q)
+    assert torch.equal(actual_keys, expected_keys)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
 def test_triton_fused_indexer_topk_matches_torch_sets_on_sm90():
     if torch.cuda.get_device_capability() != (9, 0):
         pytest.skip('requires H100/SM90')

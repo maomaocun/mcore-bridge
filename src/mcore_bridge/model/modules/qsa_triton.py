@@ -1,11 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Small SM90 Triton building blocks used by the QSA selected-KV backend.
 
-The kernels in this module deliberately have a narrow contract.  They do not
-own projection, block pooling, top-k merging, or autograd.  Keeping those
-pieces in Python makes the reference path easy to compare with the HF model
-and, more importantly, means that a missing Triton installation has an
-explicit and testable fallback.
+The kernels in this module deliberately have a narrow contract.  The vendor
+GEMM still owns indexer projection; an SM90-only postprocess kernel fuses its
+RMSNorm, RoPE, and block pooling.  Top-k orchestration and autograd remain in
+Python so the reference path stays easy to compare with the HF model and a
+missing Triton installation has an explicit, testable fallback.
 
 The production indexer kernel follows the inference-side QSA pattern: it
 computes score tiles, packs score/id keys, and applies a device-side Top-K
@@ -80,6 +80,208 @@ def _qsa_trim_causal_loop(causal: bool, sequence_extent: int, logical_k: int) ->
 
 
 if TRITON_AVAILABLE:
+
+    @triton.jit
+    def _qsa_indexer_fused_postprocess_kernel(
+        qk_ptr,
+        q_weight_ptr,
+        k_weight_ptr,
+        cos_ptr,
+        sin_ptr,
+        q_out_ptr,
+        block_key_out_ptr,
+        seq_len,
+        num_blocks,
+        head_dim,
+        rotary_dim,
+        norm_epsilon,
+        stride_qks,
+        stride_qkb,
+        stride_qkd,
+        stride_qw,
+        stride_kw,
+        stride_fs,
+        stride_fd,
+        stride_qob,
+        stride_qos,
+        stride_qoh,
+        stride_qod,
+        stride_bob,
+        stride_bos,
+        stride_bod,
+        NUM_HEADS: tl.constexpr,
+        RATIO: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        """Fuse indexer RMSNorm, RoPE, and R-token key pooling.
+
+        Projection remains a vendor GEMM.  One CTA owns all index heads of a
+        token and, on compression-block starts, also produces the pooled key.
+        Cosine and sine are supplied in the same BF16 form as the torch path,
+        so this launch does not introduce a lower-precision RoPE contract.
+        """
+
+        row = tl.program_id(0)
+        batch = row // seq_len
+        position = row - batch * seq_len
+        head_offsets = tl.arange(0, NUM_HEADS)
+        d_offsets = tl.arange(0, BLOCK_D)
+        d_mask = d_offsets < head_dim
+
+        q_ptrs = (
+            qk_ptr
+            + position * stride_qks
+            + batch * stride_qkb
+            + (head_offsets[:, None] * head_dim + d_offsets[None, :])
+            * stride_qkd
+        )
+        q_raw = tl.load(
+            q_ptrs,
+            mask=d_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        q_inv_rms = tl.rsqrt(
+            tl.sum(q_raw * q_raw, axis=1) / head_dim + norm_epsilon
+        )
+        q_weight = tl.load(
+            q_weight_ptr + d_offsets * stride_qw,
+            mask=d_mask,
+            other=0.0,
+        ).to(tl.float32)
+        q_normalized = (
+            q_raw * q_inv_rms[:, None] * (1.0 + q_weight[None, :])
+        ).to(tl.bfloat16)
+
+        half_rotary = rotary_dim // 2
+        first_half = d_offsets < half_rotary
+        partner_offsets = tl.where(
+            first_half,
+            d_offsets + half_rotary,
+            d_offsets - half_rotary,
+        )
+        partner_mask = (d_offsets < rotary_dim) & (
+            partner_offsets >= 0
+        ) & (partner_offsets < rotary_dim)
+        q_partner_ptrs = (
+            qk_ptr
+            + position * stride_qks
+            + batch * stride_qkb
+            + (
+                head_offsets[:, None] * head_dim
+                + partner_offsets[None, :]
+            ) * stride_qkd
+        )
+        q_partner_raw = tl.load(
+            q_partner_ptrs,
+            mask=partner_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        q_partner_weight = tl.load(
+            q_weight_ptr + partner_offsets * stride_qw,
+            mask=partner_mask,
+            other=0.0,
+        ).to(tl.float32)
+        q_partner = (
+            q_partner_raw
+            * q_inv_rms[:, None]
+            * (1.0 + q_partner_weight[None, :])
+        ).to(tl.bfloat16)
+        q_partner = tl.where(first_half[None, :], -q_partner, q_partner)
+        cos = tl.load(
+            cos_ptr + position * stride_fs + d_offsets * stride_fd,
+            mask=d_offsets < rotary_dim,
+            other=0.0,
+        )
+        sin = tl.load(
+            sin_ptr + position * stride_fs + d_offsets * stride_fd,
+            mask=d_offsets < rotary_dim,
+            other=0.0,
+        )
+        q_rope = q_normalized * cos[None, :] + q_partner * sin[None, :]
+        q_value = tl.where(
+            (d_offsets < rotary_dim)[None, :], q_rope, q_normalized
+        )
+        q_out_ptrs = (
+            q_out_ptr
+            + batch * stride_qob
+            + position * stride_qos
+            + head_offsets[:, None] * stride_qoh
+            + d_offsets[None, :] * stride_qod
+        )
+        tl.store(q_out_ptrs, q_value, mask=d_mask[None, :])
+
+        if position % RATIO == 0:
+            block = position // RATIO
+            if block < num_blocks:
+                ratio_offsets = tl.arange(0, RATIO)
+                key_base = NUM_HEADS * head_dim
+                key_ptrs = (
+                    qk_ptr
+                    + (position + ratio_offsets[:, None]) * stride_qks
+                    + batch * stride_qkb
+                    + (key_base + d_offsets[None, :]) * stride_qkd
+                )
+                key_raw = tl.load(
+                    key_ptrs,
+                    mask=d_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                pooled = (
+                    tl.sum(key_raw, axis=0) / RATIO
+                ).to(tl.bfloat16)
+                pooled_float = pooled.to(tl.float32)
+                key_inv_rms = tl.rsqrt(
+                    tl.sum(pooled_float * pooled_float, axis=0)
+                    / head_dim
+                    + norm_epsilon
+                )
+                key_weight = tl.load(
+                    k_weight_ptr + d_offsets * stride_kw,
+                    mask=d_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                key_normalized = (
+                    pooled_float * key_inv_rms * (1.0 + key_weight)
+                ).to(tl.bfloat16)
+
+                key_partner_ptrs = (
+                    qk_ptr
+                    + (position + ratio_offsets[:, None]) * stride_qks
+                    + batch * stride_qkb
+                    + (key_base + partner_offsets[None, :]) * stride_qkd
+                )
+                key_partner_raw = tl.load(
+                    key_partner_ptrs,
+                    mask=partner_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                key_partner_pooled = (
+                    tl.sum(key_partner_raw, axis=0) / RATIO
+                ).to(tl.bfloat16).to(tl.float32)
+                key_partner_weight = tl.load(
+                    k_weight_ptr + partner_offsets * stride_kw,
+                    mask=partner_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                key_partner = (
+                    key_partner_pooled
+                    * key_inv_rms
+                    * (1.0 + key_partner_weight)
+                ).to(tl.bfloat16)
+                key_partner = tl.where(
+                    first_half, -key_partner, key_partner
+                )
+                key_rope = key_normalized * cos + key_partner * sin
+                key_value = tl.where(
+                    d_offsets < rotary_dim, key_rope, key_normalized
+                )
+                block_out_ptrs = (
+                    block_key_out_ptr
+                    + batch * stride_bob
+                    + block * stride_bos
+                    + d_offsets * stride_bod
+                )
+                tl.store(block_out_ptrs, key_value, mask=d_mask)
 
     @triton.jit
     def _qsa_indexer_score_kernel(
@@ -4739,6 +4941,99 @@ if TRITON_AVAILABLE:
                 tl.store(value_output_ptrs, grad_value_acc, mask=output_mask)
 
 
+def qsa_indexer_fused_postprocess(
+    qk: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    norm_epsilon: float,
+    num_heads: int,
+    ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse production indexer normalization, RoPE, and key pooling."""
+
+    if not TRITON_AVAILABLE:
+        raise RuntimeError('QSA fused indexer postprocess requires Triton')
+    if not qk.is_cuda or qk.dtype != torch.bfloat16:
+        raise ValueError('QSA fused indexer postprocess requires CUDA BF16 projection output')
+    if qk.ndim != 3:
+        raise ValueError('QSA fused indexer postprocess expects qk=[S,B,(H+1)D]')
+    seq_len, batch, projected_dim = qk.shape
+    num_heads = int(num_heads)
+    ratio = int(ratio)
+    if num_heads <= 0 or ratio <= 1 or projected_dim % (num_heads + 1):
+        raise ValueError('QSA fused indexer postprocess received incompatible head/ratio shape')
+    head_dim = projected_dim // (num_heads + 1)
+    if head_dim != 128 or num_heads != 4 or ratio != 4:
+        raise ValueError('QSA fused indexer postprocess currently specializes H=4,D=128,R=4')
+    if q_weight.shape != (head_dim,) or k_weight.shape != (head_dim,):
+        raise ValueError('QSA fused indexer postprocess norm weights must match head_dim')
+    if cos.ndim != 2 or sin.shape != cos.shape or cos.shape[0] != seq_len:
+        raise ValueError('QSA fused indexer postprocess expects cos/sin=[S,rotary_dim]')
+    rotary_dim = cos.shape[1]
+    if rotary_dim <= 0 or rotary_dim > head_dim or rotary_dim % 2:
+        raise ValueError('QSA fused indexer postprocess requires an even rotary_dim <= head_dim')
+    if any(t.device != qk.device or t.dtype != qk.dtype for t in (q_weight, k_weight, cos, sin)):
+        raise ValueError('QSA fused indexer postprocess inputs must share CUDA device and BF16 dtype')
+
+    qk = qk.contiguous()
+    q_weight = q_weight.contiguous()
+    k_weight = k_weight.contiguous()
+    cos = cos.contiguous()
+    sin = sin.contiguous()
+    num_blocks = seq_len // ratio
+    q = torch.empty(
+        (batch, seq_len, num_heads, head_dim),
+        device=qk.device,
+        dtype=qk.dtype,
+    )
+    block_keys = torch.empty(
+        (batch, num_blocks, head_dim),
+        device=qk.device,
+        dtype=qk.dtype,
+    )
+    # Keep four warps fixed: it matches the torch FP32 reduction tree before
+    # the BF16 cast.  Other warp counts are slightly faster at long sequence
+    # lengths but change BF16 least-significant bits and therefore are not a
+    # valid production tuning dimension.
+    _qsa_indexer_fused_postprocess_kernel[(batch * seq_len,)](
+        qk,
+        q_weight,
+        k_weight,
+        cos,
+        sin,
+        q,
+        block_keys,
+        seq_len,
+        num_blocks,
+        head_dim,
+        rotary_dim,
+        float(norm_epsilon),
+        qk.stride(0),
+        qk.stride(1),
+        qk.stride(2),
+        q_weight.stride(0),
+        k_weight.stride(0),
+        cos.stride(0),
+        cos.stride(1),
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        block_keys.stride(0),
+        block_keys.stride(1),
+        block_keys.stride(2),
+        NUM_HEADS=num_heads,
+        RATIO=ratio,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        num_warps=4,
+        num_stages=1,
+        enable_fp_fusion=False,
+    )
+    return q, block_keys
+
+
 def qsa_expand_compact_route_triton(
     block_indices: torch.Tensor,
     topk_length: torch.Tensor,
@@ -7679,6 +7974,7 @@ __all__ = [
     "qsa_cp_remap_route_triton",
     "qsa_cp_request_mask_triton",
     "qsa_expand_compact_route_triton",
+    "qsa_indexer_fused_postprocess",
     "qsa_indexer_fused_topk_with_ratio",
     "qsa_indexer_fused_topk_packed",
     "qsa_indexer_score_slab_with_ratio",

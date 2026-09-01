@@ -116,6 +116,38 @@ class QSAIndexer(nn.Module):
         device = hidden_states.device
 
         qk = self.index_qk_proj(hidden_states)
+        if self.index_kv_heads != 1:
+            raise ValueError(f'Qwen4-Exp QSA requires indexer_kv_heads=1, got {self.index_kv_heads}')
+        cos, sin = self._materialize_freqs(freqs, sequence_length, qk.dtype)
+        use_fused_postprocess = (
+            os.environ.get('MCORE_BRIDGE_QSA_INDEXER_FUSED_POSTPROCESS', '1') != '0'
+            and qk.is_cuda
+            and qk.dtype == torch.bfloat16
+            and self.index_n_heads == 4
+            and self.index_head_dim == 128
+            and self.compress_ratio == 4
+            and self.q_layernorm.weight.device == qk.device
+            and self.q_layernorm.weight.dtype == qk.dtype
+            and self.k_layernorm.weight.device == qk.device
+            and self.k_layernorm.weight.dtype == qk.dtype
+            and cos.ndim == 2
+            and 0 < cos.shape[1] <= self.index_head_dim
+            and cos.shape[1] % 2 == 0
+        )
+        if use_fused_postprocess:
+            from .qsa_triton import is_sm90, qsa_indexer_fused_postprocess
+
+            if is_sm90(qk.device):
+                return qsa_indexer_fused_postprocess(
+                    qk,
+                    self.q_layernorm.weight,
+                    self.k_layernorm.weight,
+                    cos,
+                    sin,
+                    self.config.layernorm_epsilon,
+                    self.index_n_heads,
+                    self.compress_ratio,
+                )
         q, token_k = torch.split(
             qk,
             [self.index_n_heads * self.index_head_dim, self.index_kv_heads * self.index_head_dim],
@@ -123,11 +155,8 @@ class QSAIndexer(nn.Module):
         q = q.reshape(sequence_length, batch, self.index_n_heads, self.index_head_dim).permute(1, 0, 2, 3)
         raw_keys = token_k.reshape(
             sequence_length, batch, self.index_kv_heads, self.index_head_dim).permute(1, 0, 2, 3)
-        if self.index_kv_heads != 1:
-            raise ValueError(f'Qwen4-Exp QSA requires indexer_kv_heads=1, got {self.index_kv_heads}')
         raw_keys = raw_keys.squeeze(2)
         q = self.q_layernorm(q)
-        cos, sin = self._materialize_freqs(freqs, sequence_length, q.dtype)
         q = self._apply_rope(q, cos[None, :, None, :], sin[None, :, None, :]).contiguous()
 
         usable = num_blocks * ratio
