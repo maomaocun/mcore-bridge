@@ -3220,6 +3220,7 @@ if TRITON_AVAILABLE:
         HYBRID_DKV: tl.constexpr,
         COMPUTE_DQ: tl.constexpr,
         COMPACT_DERIVATIVES: tl.constexpr,
+        OWNER_SLOT_DERIVATIVES: tl.constexpr,
         STORE_SCORES: tl.constexpr,
         LOAD_SAVED_SCORES: tl.constexpr,
         STORE_DERIVATIVES: tl.constexpr,
@@ -3396,7 +3397,22 @@ if TRITON_AVAILABLE:
                 score_row = query - score_chunk_id * SCORE_CHUNK
                 score_group = batch * SCORE_CHUNKS + score_chunk_id
                 score_store_mask = valid
-                if COMPACT_DERIVATIVES:
+                if OWNER_SLOT_DERIVATIVES:
+                    complete_token_count = (length // RATIO) * RATIO
+                    owner_block = safe_selected // RATIO
+                    owner_rank = tl.load(
+                        owner_occurrence_map_ptr
+                        + batch * stride_ormb
+                        + owner_block * stride_orms,
+                        mask=valid & (key_offsets < complete_token_count),
+                        other=-1,
+                    ).to(tl.int32)
+                    score_store_mask = (
+                        valid
+                        & (key_offsets < complete_token_count)
+                        & (owner_rank >= 0)
+                    )
+                elif COMPACT_DERIVATIVES:
                     complete_token_count = (length // RATIO) * RATIO
                     route_slot = key_offsets // RATIO
                     compact_occurrence = tl.load(
@@ -3433,7 +3449,20 @@ if TRITON_AVAILABLE:
                         & (owner_mask != 0)
                     )
             if STORE_SCORES:
-                if COMPACT_DERIVATIVES:
+                if OWNER_SLOT_DERIVATIVES:
+                    safe_owner_rank = tl.maximum(owner_rank, 0)
+                    score_base = (
+                        score_ptr
+                        + tl.cast(batch * seq_len_q + query, tl.int64)
+                        * stride_scoreb
+                        + safe_owner_rank[None, :] * stride_scores
+                    )
+                    score_ptrs = (
+                        score_base
+                        + heads[:, None] * stride_scoreh
+                        + (key_offsets % RATIO)[None, :] * stride_scorek
+                    )
+                elif COMPACT_DERIVATIVES:
                     safe_occurrence = tl.maximum(compact_occurrence, 0)
                     score_base = (
                         score_ptr
@@ -3470,7 +3499,20 @@ if TRITON_AVAILABLE:
             d_score = tl.where(
                 valid[None, :] & head_valid[:, None], d_score, 0.0)
             if STORE_DERIVATIVES:
-                if COMPACT_DERIVATIVES:
+                if OWNER_SLOT_DERIVATIVES:
+                    safe_owner_rank = tl.maximum(owner_rank, 0)
+                    d_score_base = (
+                        d_score_ptr
+                        + tl.cast(batch * seq_len_q + query, tl.int64)
+                        * stride_dscoreb
+                        + safe_owner_rank[None, :] * stride_dscores
+                    )
+                    d_score_ptrs = (
+                        d_score_base
+                        + heads[:, None] * stride_dscoreh
+                        + (key_offsets % RATIO)[None, :] * stride_dscorek
+                    )
+                elif COMPACT_DERIVATIVES:
                     safe_occurrence = tl.maximum(compact_occurrence, 0)
                     d_score_base = (
                         d_score_ptr
@@ -6438,9 +6480,11 @@ if TRITON_AVAILABLE:
         stride_dvh,
         stride_dvd,
         stride_scoreb,
+        stride_scores,
         stride_scoreh,
         stride_scorek,
         stride_dscoreb,
+        stride_dscores,
         stride_dscoreh,
         stride_dscorek,
         RATIO: tl.constexpr,
@@ -6454,6 +6498,7 @@ if TRITON_AVAILABLE:
         HAS_GRAD_OUTPUT: tl.constexpr,
         DKV_ACCUM_BF16: tl.constexpr,
         BATCH_ONE: tl.constexpr,
+        OWNER_SLOT_DERIVATIVES: tl.constexpr,
     ):
         """Flatten all GQA heads for one KV block into one owner MMA tile.
 
@@ -6539,22 +6584,51 @@ if TRITON_AVAILABLE:
                 & HAS_GRAD_OUTPUT,
                 other=0.0,
             ).to(tl.bfloat16)
-            probability = tl.load(
-                score_ptr
-                + tl.cast(occurrence[:, None], tl.int64) * stride_scoreb
-                + heads[:, None] * stride_scoreh
-                + token_offsets[None, :] * stride_scorek,
-                mask=row_valid[:, None] & key_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            grad_score = tl.load(
-                d_score_ptr
-                + tl.cast(occurrence[:, None], tl.int64) * stride_dscoreb
-                + heads[:, None] * stride_dscoreh
-                + token_offsets[None, :] * stride_dscorek,
-                mask=row_valid[:, None] & key_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
+            if OWNER_SLOT_DERIVATIVES:
+                score_base = (
+                    score_ptr
+                    + tl.cast(
+                        (query_batch * seq_len_q + query)[:, None],
+                        tl.int64,
+                    ) * stride_scoreb
+                    + owner_group * stride_scores
+                    + heads[:, None] * stride_scoreh
+                )
+                probability = tl.load(
+                    score_base
+                    + token_offsets[None, :] * stride_scorek,
+                    mask=row_valid[:, None] & key_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                grad_score = tl.load(
+                    d_score_ptr
+                    + tl.cast(
+                        (query_batch * seq_len_q + query)[:, None],
+                        tl.int64,
+                    ) * stride_dscoreb
+                    + owner_group * stride_dscores
+                    + heads[:, None] * stride_dscoreh
+                    + token_offsets[None, :] * stride_dscorek,
+                    mask=row_valid[:, None] & key_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+            else:
+                probability = tl.load(
+                    score_ptr
+                    + tl.cast(occurrence[:, None], tl.int64) * stride_scoreb
+                    + heads[:, None] * stride_scoreh
+                    + token_offsets[None, :] * stride_scorek,
+                    mask=row_valid[:, None] & key_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                grad_score = tl.load(
+                    d_score_ptr
+                    + tl.cast(occurrence[:, None], tl.int64) * stride_dscoreb
+                    + heads[:, None] * stride_dscoreh
+                    + token_offsets[None, :] * stride_dscorek,
+                    mask=row_valid[:, None] & key_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
             grad_key_acc += tl.dot(
                 tl.trans(grad_score.to(tl.bfloat16)),
                 q_value,
@@ -10448,6 +10522,9 @@ def qsa_segmented_dkv_reduce(
     contiguous store.  ``..._OWNER_SPLITS`` controls the shard count and
     ``..._PARTIAL_DTYPE`` selects the temporary partial workspace dtype; this
     path is correctness-gated and remains opt-in.
+    ``MCORE_BRIDGE_QSA_SEGMENT_OWNER_SLOT_DERIVATIVES=1`` selects the
+    owner-rank derivative workspace, which avoids the reverse occurrence map
+    but scales with the selected owner count and remains diagnostic.
     """
 
     if ratio < 2 or (ratio & (ratio - 1)):
@@ -10492,12 +10569,29 @@ def qsa_segmented_dkv_reduce(
         and os.environ.get(
             'MCORE_BRIDGE_QSA_SEGMENT_COMPACT_DERIVATIVES', '0') != '0'
     )
+    owner_slot_derivatives = (
+        use_saved_scores
+        and route_block_size == ratio
+        and os.environ.get(
+            'MCORE_BRIDGE_QSA_SEGMENT_OWNER_SLOT_DERIVATIVES', '0') != '0'
+    )
+    if owner_slot_derivatives and compact_derivatives:
+        raise ValueError(
+            'QSA owner-slot derivatives cannot combine with compact derivatives')
     if compact_derivatives:
         if (saved_scores.ndim != 4
                 or saved_scores.shape[1] != 1
                 or saved_scores.shape[2:] != (num_q_heads, ratio)):
             raise ValueError(
                 'QSA compact derivative workspace shape does not match route')
+        score_chunk = 1
+        score_chunks = 1
+    elif owner_slot_derivatives:
+        if (saved_scores.ndim != 4
+                or saved_scores.shape[0] != batch * sq
+                or saved_scores.shape[2:] != (num_q_heads, ratio)):
+            raise ValueError(
+                'QSA owner-slot derivative workspace shape does not match route')
         score_chunk = 1
         score_chunks = 1
     elif use_saved_scores:
@@ -10551,8 +10645,11 @@ def qsa_segmented_dkv_reduce(
     )
     use_block_list = (
         not persistent_owner_requested
-        and os.environ.get(
-            'MCORE_BRIDGE_QSA_SEGMENT_COMPACT_BLOCK_LIST', '0') != '0'
+        and (
+            os.environ.get(
+                'MCORE_BRIDGE_QSA_SEGMENT_COMPACT_BLOCK_LIST', '0') != '0'
+            or owner_slot_derivatives
+        )
     )
     owner_block_list = None
     if use_block_list:
@@ -10565,6 +10662,13 @@ def qsa_segmented_dkv_reduce(
             owner_candidates, as_tuple=False).flatten().to(torch.int32)
         if owner_block_list.numel() == 0:
             return
+    if owner_slot_derivatives:
+        if owner_block_list is None:
+            raise RuntimeError(
+                'QSA owner-slot derivatives require a compact owner list')
+        if saved_scores.shape[1] != owner_block_list.numel():
+            raise ValueError(
+                'QSA owner-slot derivative workspace owner dimension mismatch')
     group_size = num_q_heads // num_kv_heads
     block_d = max(16, triton.next_power_of_2(head_dim))
     # Real score-selected routes have a heavier occurrence tail than the
@@ -11410,11 +11514,14 @@ def qsa_segmented_dkv_reduce(
             'MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEAD_TILES_TILED', '0') != '0'
     )
     fuse_owner_heads_flat = (
-        compact_derivatives
+        (compact_derivatives or owner_slot_derivatives)
         and flatten_heads
         and os.environ.get(
             'MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_FLAT', '0') != '0'
     )
+    if owner_slot_derivatives and not fuse_owner_heads_flat:
+        raise RuntimeError(
+            'QSA owner-slot derivatives require FUSE_HEADS_FLAT=1')
     flat_owner_block_occ = int(os.environ.get(
         'MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_BLOCK_OCC', '2'))
     if flat_owner_block_occ not in {1, 2, 4, 8, 16}:
@@ -11623,9 +11730,11 @@ def qsa_segmented_dkv_reduce(
             grad_value.stride(2),
             grad_value.stride(3),
             saved_scores.stride(0),
+            saved_scores.stride(1),
             saved_scores.stride(2),
             saved_scores.stride(3),
             saved_d_scores.stride(0),
+            saved_d_scores.stride(1),
             saved_d_scores.stride(2),
             saved_d_scores.stride(3),
         )
@@ -11644,6 +11753,7 @@ def qsa_segmented_dkv_reduce(
             DKV_ACCUM_BF16=grad_key.dtype == torch.bfloat16,
             BATCH_ONE=batch == 1,
             USE_BLOCK_LIST=use_block_list,
+            OWNER_SLOT_DERIVATIVES=owner_slot_derivatives,
             num_warps=segmented_num_warps,
             num_stages=1,
         )
@@ -11782,6 +11892,10 @@ def qsa_selected_kv_backward(
     d-score only for owner occurrences in CSR order instead of the logical
     ``[B,S,Hq,K]`` slab.  It is an opt-in diagnostic and may synchronize once
     to size the compact workspace.
+    ``MCORE_BRIDGE_QSA_SEGMENT_OWNER_SLOT_DERIVATIVES=1`` stores owner
+    derivatives in a ``[B*S,owner,Hq,R]`` BF16 workspace indexed by a dense
+    block-to-owner rank map.  It avoids the reverse occurrence lookup at the
+    cost of owner-count-scaled memory and is an opt-in diagnostic only.
     ``MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEAD_TILES=1`` tests a single block-owner
     CTA that combines all GQA head tiles; the optional ``..._TILED=1`` variant
     bounds its D tile.  Both require compact derivatives and remain diagnostic.
@@ -11964,6 +12078,8 @@ def qsa_selected_kv_backward(
     owner_occurrence_map = None
     owner_occurrence_count = 0
     resident_owner_occurrence_map = None
+    owner_slot_map = None
+    owner_slot_count = 0
     if segmented_metadata is not None:
         # The current ABI stores the map at slot 5 because slot 4 is the
         # optional owner mask.  Accept the pre-fix slot-4 form as well, but
@@ -11980,6 +12096,14 @@ def qsa_selected_kv_backward(
         and os.environ.get(
             'MCORE_BRIDGE_QSA_SEGMENT_COMPACT_DERIVATIVES', '0') != '0'
     )
+    owner_slot_derivatives_requested = (
+        use_segmented_reduction
+        and os.environ.get(
+            'MCORE_BRIDGE_QSA_SEGMENT_OWNER_SLOT_DERIVATIVES', '0') != '0'
+    )
+    if owner_slot_derivatives_requested and compact_derivatives_requested:
+        raise ValueError(
+            'QSA owner-slot derivatives cannot combine with compact derivatives')
     table_recompute_requested = (
         use_segmented_reduction
         and os.environ.get(
@@ -12008,6 +12132,27 @@ def qsa_selected_kv_backward(
         if hybrid_min_fanout > 0 and owner_block_mask is None:
             raise RuntimeError(
                 'QSA hybrid segmented reduction requires an owner block mask')
+        if owner_slot_derivatives_requested:
+            if route_block_size != segment_ratio:
+                raise RuntimeError(
+                    'QSA owner-slot derivative reuse requires a compact block route')
+            owner_slot_candidates = (
+                owner_block_mask != 0
+                if owner_block_mask is not None
+                else segmented_metadata[1][1:] > segmented_metadata[1][:-1]
+            )
+            owner_slot_count = int(owner_slot_candidates.sum().item())
+            if owner_slot_count > 0:
+                owner_slot_map = torch.full(
+                    (batch * segmented_metadata[3],),
+                    -1,
+                    device=query.device,
+                    dtype=torch.int32,
+                )
+                owner_slot_map[owner_slot_candidates] = torch.arange(
+                    owner_slot_count, device=query.device, dtype=torch.int32)
+            else:
+                owner_slot_derivatives_requested = False
         if owner_occurrence_requested:
             if route_block_size != segment_ratio:
                 raise RuntimeError(
@@ -12046,12 +12191,12 @@ def qsa_selected_kv_backward(
     reuse_scores = (
         use_segmented_reduction
         and os.environ.get('MCORE_BRIDGE_QSA_SEGMENT_REUSE_SCORES', '0') != '0'
-    ) or compact_derivatives_requested
+    ) or compact_derivatives_requested or owner_slot_derivatives_requested
     reuse_derivatives = (
         use_segmented_reduction
         and os.environ.get(
             'MCORE_BRIDGE_QSA_SEGMENT_REUSE_DERIVATIVES', '0') != '0'
-    ) or compact_derivatives_requested
+    ) or compact_derivatives_requested or owner_slot_derivatives_requested
     saved_scores = precomputed_scores
     saved_d_scores = None
     compact_derivatives = False
@@ -12076,6 +12221,19 @@ def qsa_selected_kv_backward(
         )
         score_chunks = 1
         compact_derivatives = True
+    elif owner_slot_derivatives_requested:
+        score_dtype = os.environ.get(
+            'MCORE_BRIDGE_QSA_SEGMENT_SCORE_DTYPE', 'bf16').lower()
+        if score_dtype not in {'bf16', 'fp32'}:
+            raise ValueError(
+                'QSA segmented score dtype expects bf16 or fp32')
+        saved_scores = torch.empty(
+            (batch * sq, owner_slot_count, num_q_heads, segment_ratio),
+            device=query.device,
+            dtype=torch.bfloat16 if score_dtype == 'bf16' else torch.float32,
+        )
+        score_chunk = 1
+        score_chunks = 1
     elif reuse_scores or reuse_derivatives:
         requested_score_chunk = int(os.environ.get(
             'MCORE_BRIDGE_QSA_SEGMENT_SCORE_CHUNK', '1024'))
@@ -12097,7 +12255,20 @@ def qsa_selected_kv_backward(
             device=query.device,
             dtype=torch.bfloat16 if score_dtype == 'bf16' else torch.float32,
         )
-    if reuse_derivatives and not compact_derivatives:
+    if owner_slot_derivatives_requested:
+        d_score_dtype = os.environ.get(
+            'MCORE_BRIDGE_QSA_SEGMENT_D_SCORE_DTYPE',
+            os.environ.get('MCORE_BRIDGE_QSA_SEGMENT_SCORE_DTYPE', 'bf16'),
+        ).lower()
+        if d_score_dtype not in {'bf16', 'fp32'}:
+            raise ValueError(
+                'QSA segmented d_score dtype expects bf16 or fp32')
+        saved_d_scores = torch.empty(
+            (batch * sq, owner_slot_count, num_q_heads, segment_ratio),
+            device=query.device,
+            dtype=torch.bfloat16 if d_score_dtype == 'bf16' else torch.float32,
+        )
+    elif reuse_derivatives and not compact_derivatives:
         d_score_dtype = os.environ.get(
             'MCORE_BRIDGE_QSA_SEGMENT_D_SCORE_DTYPE',
             os.environ.get('MCORE_BRIDGE_QSA_SEGMENT_SCORE_DTYPE', 'fp32'),
@@ -12141,14 +12312,19 @@ def qsa_selected_kv_backward(
     owner_mask_stride_batch = (
         owner_block_mask.numel() // batch if owner_block_mask is not None else 0)
     owner_mask_stride_block = 1 if owner_block_mask is not None else 0
-    owner_occurrence_map_workspace = (
-        owner_occurrence_map if owner_occurrence_map is not None else query)
-    owner_occurrence_map_stride_batch = (
-        sq * segmented_metadata[2]
-        if owner_occurrence_map is not None else 0)
-    owner_occurrence_map_stride_query = (
-        segmented_metadata[2]
-        if owner_occurrence_map is not None else 0)
+    if owner_slot_map is not None:
+        owner_occurrence_map_workspace = owner_slot_map
+        owner_occurrence_map_stride_batch = segmented_metadata[3]
+        owner_occurrence_map_stride_query = 1
+    else:
+        owner_occurrence_map_workspace = (
+            owner_occurrence_map if owner_occurrence_map is not None else query)
+        owner_occurrence_map_stride_batch = (
+            sq * segmented_metadata[2]
+            if owner_occurrence_map is not None else 0)
+        owner_occurrence_map_stride_query = (
+            segmented_metadata[2]
+            if owner_occurrence_map is not None else 0)
     group_size = num_q_heads // num_kv_heads
     tensorized_fp32_atomic = (
         dkv_accum_dtype == 'fp32'
@@ -12364,6 +12540,7 @@ def qsa_selected_kv_backward(
         'HYBRID_DKV': hybrid_reduction,
         'COMPUTE_DQ': True,
         'COMPACT_DERIVATIVES': compact_derivatives,
+        'OWNER_SLOT_DERIVATIVES': owner_slot_derivatives_requested,
         'STORE_SCORES': saved_scores is not None and not load_saved_scores,
         'LOAD_SAVED_SCORES': load_saved_scores,
         'STORE_DERIVATIVES': saved_d_scores is not None,

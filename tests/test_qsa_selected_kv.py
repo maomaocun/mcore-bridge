@@ -1743,7 +1743,7 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
             listed=False, persistent=False, grouped_blocks=None,
             grouped_union=False, table_scan=False, table_recompute=False,
             split_recompute=False, resident_owner_map=False,
-            resident_table_plan=False):
+            resident_table_plan=False, owner_slot=False):
         monkeypatch.setenv('MCORE_BRIDGE_QSA_DKV_REDUCTION', 'segmented')
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEAD_TILES', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEAD_TILES_TILED', raising=False)
@@ -1751,6 +1751,8 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_COMPACT_BLOCK_LIST', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_PERSISTENT_OWNER', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_PERSISTENT_CTAS', raising=False)
+        monkeypatch.delenv(
+            'MCORE_BRIDGE_QSA_SEGMENT_OWNER_SLOT_DERIVATIVES', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_GROUP_BLOCKS', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_GROUP_UNION', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_TABLE_SCAN', raising=False)
@@ -1778,6 +1780,11 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
             monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEAD_TILES_TILED', '1')
         if compact:
             monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_COMPACT_DERIVATIVES', '1')
+        if owner_slot:
+            monkeypatch.setenv(
+                'MCORE_BRIDGE_QSA_SEGMENT_OWNER_SLOT_DERIVATIVES', '1')
+            monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_FLAT', '1')
+            monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_COMPACT_BLOCK_LIST', '1')
         if listed:
             monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_COMPACT_BLOCK_LIST', '1')
         if persistent:
@@ -1837,6 +1844,7 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
     grouped_union_duplicate = run(
         threshold=2, reuse=True, compact=True, grouped_blocks=4,
         grouped_union=True)
+    owner_slot = run(threshold=2, reuse=True, owner_slot=True)
     table_scan_duplicate = run(
         threshold=2, reuse=True, compact=True, grouped_blocks=4,
         table_scan=True)
@@ -1846,7 +1854,7 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
     for actual in (hybrid, hybrid_saved, fused_owner, tiled_owner, listed_owner,
                    persistent_owner, grouped_owner2, grouped_owner4,
                    grouped_union_duplicate, table_scan_duplicate,
-                   resident_table_scan_duplicate):
+                   resident_table_scan_duplicate, owner_slot):
         assert torch.equal(actual[0], reference[0])
         assert torch.equal(actual[1], reference[1])
         assert torch.equal(actual[2], reference[2])
@@ -1854,6 +1862,75 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
             assert torch.isfinite(actual_grad).all()
             assert torch.allclose(
                 actual_grad.float(), reference_grad.float(), atol=0.125, rtol=0.05)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_triton_owner_slot_derivatives_batch_two_matches_reference_on_sm90(monkeypatch):
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('requires H100/SM90')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_DKV_REDUCTION', 'segmented')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT', '2')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_OWNER_SLOT_DERIVATIVES', '1')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_FLAT', '1')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_BLOCK_OCC', '2')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_COMPACT_BLOCK_LIST', '1')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_FLATTEN_HEADS', '1')
+    monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_COMPACT_DERIVATIVES', raising=False)
+    torch.manual_seed(2053)
+    device = 'cuda'
+    sq, batch, hq, hkv, dim, ratio, block_topk = 64, 2, 24, 2, 256, 4, 4
+    positions = torch.arange(sq, device=device, dtype=torch.int32)
+    blocks = torch.full(
+        (batch, sq, block_topk), -1, device=device, dtype=torch.int32)
+    lengths = torch.zeros((batch, sq), device=device, dtype=torch.int32)
+    for query in range(sq):
+        complete = min((query + 1) // ratio, block_topk)
+        if complete:
+            block_ids = torch.arange(
+                complete, device=device, dtype=torch.int32)
+            if query % 2:
+                block_ids = block_ids.flip(0)
+            blocks[:, query, :complete] = block_ids
+        lengths[:, query] = complete * ratio + (query + 1) % ratio
+    tokens = qsa_expand_block_route(blocks, lengths, positions, ratio)
+    q0 = torch.randn(sq, batch, hq, dim, device=device, dtype=torch.bfloat16)
+    k0 = torch.randn(sq, batch, hkv, dim, device=device, dtype=torch.bfloat16)
+    v0 = torch.randn_like(k0)
+    grad_output = torch.randn_like(q0)
+    grad_lse = torch.randn(batch, hq, sq, device=device, dtype=torch.float32) * 0.01
+
+    def run(route, route_size, backend):
+        query = q0.detach().clone().requires_grad_()
+        key = k0.detach().clone().requires_grad_()
+        value = v0.detach().clone().requires_grad_()
+        output, lse = qsa_sparse_forward(
+            query,
+            key,
+            value,
+            route,
+            lengths,
+            backend=backend,
+            require_backend=backend == 'triton',
+            query_positions=positions,
+            selected_token_group_size=ratio,
+            dkv_reduction='segmented',
+            route_block_size=route_size,
+        )
+        ((output.float() * grad_output.float()).sum()
+         + (lse * grad_lse).sum()).backward()
+        return (
+            output.detach(), lse.detach(), query.grad.detach(),
+            key.grad.detach(), value.grad.detach())
+
+    reference = run(tokens, 1, 'torch')
+    actual = run(blocks, ratio, 'triton')
+    assert torch.allclose(actual[0].float(), reference[0].float(), atol=2e-2, rtol=2e-2)
+    assert torch.allclose(actual[1], reference[1], atol=2e-5, rtol=2e-5)
+    assert torch.allclose(actual[2].float(), reference[2].float(), atol=5e-2, rtol=5e-2)
+    for actual_grad, reference_grad in zip(actual[3:], reference[3:]):
+        assert torch.isfinite(actual_grad).all()
+        assert torch.allclose(
+            actual_grad.float(), reference_grad.float(), atol=0.125, rtol=0.05)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
