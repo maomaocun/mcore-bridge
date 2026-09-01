@@ -8254,10 +8254,10 @@ def qsa_selected_kv_forward(query: torch.Tensor, key: torch.Tensor, value: torch
                 and saved_scores.shape[0] // batch * saved_scores.shape[1] >= sq)
         )
         if (saved_scores.device != query.device
-                or saved_scores.dtype != torch.float32
+                or saved_scores.dtype not in {torch.bfloat16, torch.float32}
                 or not valid_score_shape):
             raise ValueError(
-                'QSA saved score workspace must be chunked FP32 [C,S_c,Hq,K]')
+                'QSA saved score workspace must be chunked BF16/FP32 [C,S_c,Hq,K]')
         score_workspace = saved_scores.contiguous()
         if score_workspace.ndim == 3:
             score_chunk = sq
@@ -9517,9 +9517,9 @@ def qsa_selected_kv_backward(
     controls its size and the path remains opt-in.
     ``MCORE_BRIDGE_QSA_BACKWARD_SPLIT_DKV=1`` is a separate diagnostic that
     launches dQ and dK/dV independently and deliberately recomputes scores.
-    ``precomputed_scores`` is an opt-in FP32 raw-QK workspace produced by the
-    matching forward diagnostic; it removes backward QK recomputation while
-    retaining the original LSE-based probability formula.
+    ``precomputed_scores`` is an opt-in BF16/FP32 raw-QK workspace produced by
+    the matching forward diagnostic; it removes backward QK recomputation
+    while retaining the original LSE-based probability formula.
     """
 
     if not TRITON_AVAILABLE:
@@ -9561,10 +9561,10 @@ def qsa_selected_kv_backward(
                 and precomputed_scores.shape[0] // batch * precomputed_scores.shape[1] >= sq)
         )
         if (precomputed_scores.device != query.device
-                or precomputed_scores.dtype != torch.float32
+                or precomputed_scores.dtype not in {torch.bfloat16, torch.float32}
                 or not valid_score_shape):
             raise ValueError(
-                'QSA precomputed score workspace must be chunked FP32 [C,S_c,Hq,K]')
+                'QSA precomputed score workspace must be chunked BF16/FP32 [C,S_c,Hq,K]')
         precomputed_scores = precomputed_scores.contiguous()
     if lse.shape != (batch, num_q_heads, sq):
         raise ValueError(f"QSA LSE shape must be {(batch, num_q_heads, sq)}, got {tuple(lse.shape)}")

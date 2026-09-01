@@ -837,9 +837,10 @@ def qsa_sparse_forward(
     ``MCORE_BRIDGE_QSA_SEGMENT_COMPACT_DERIVATIVES=1`` additionally stores
     probability and d-score only for owner occurrences in CSR order; this is
     an opt-in diagnostic that uses a bounded owner-sized workspace.
-    ``MCORE_BRIDGE_QSA_SAVE_FORWARD_SCORES=1`` stores the FP32 raw-QK score
+    ``MCORE_BRIDGE_QSA_SAVE_FORWARD_SCORES=1`` stores the raw-QK score
     workspace for the Triton atomic backward diagnostic, avoiding backward
     QK recomputation at the cost of ``[B,S,Hq,K]`` memory and traffic.
+    ``MCORE_BRIDGE_QSA_SAVE_FORWARD_SCORE_DTYPE`` selects BF16 or FP32 storage.
     ``route_block_size > 1`` selects the compact complete-block metadata ABI.
     """
 
@@ -924,11 +925,16 @@ def qsa_sparse_forward(
         if score_chunk <= 0:
             raise ValueError(
                 'QSA forward score reuse chunk must be positive')
+        score_dtype = os.environ.get(
+            'MCORE_BRIDGE_QSA_SAVE_FORWARD_SCORE_DTYPE', 'fp32').lower()
+        if score_dtype not in {'bf16', 'fp32'}:
+            raise ValueError(
+                'QSA forward score reuse dtype must be bf16 or fp32')
         score_chunks = (query.shape[0] + score_chunk - 1) // score_chunk
         precomputed_scores = torch.empty(
             (score_chunks, score_chunk, query.shape[2], score_k),
             device=query.device,
-            dtype=torch.float32,
+            dtype=torch.bfloat16 if score_dtype == 'bf16' else torch.float32,
         )
     return _QSASelectedKVFunction.apply(
         query,
