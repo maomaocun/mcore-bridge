@@ -620,7 +620,7 @@ class _QSASelectedKVFunction(Function):
                 route_block_size=route_block_size,
                 owner_min_fanout=hybrid_min_fanout,
             )
-            resident_owner_map = (
+            resident_owner_map_requested = (
                 os.environ.get(
                     'MCORE_BRIDGE_QSA_SEGMENT_RESIDENT_OWNER_MAP', '0')
                 != '0'
@@ -633,19 +633,53 @@ class _QSASelectedKVFunction(Function):
                         '0') != '0'
                 )
             )
-            if resident_owner_map:
+            resident_table_plan_requested = (
+                resident_owner_map_requested
+                and os.environ.get(
+                    'MCORE_BRIDGE_QSA_SEGMENT_RESIDENT_TABLE_PLAN', '0')
+                != '0'
+                and os.environ.get(
+                    'MCORE_BRIDGE_QSA_SEGMENT_TABLE_SCAN', '0') != '0'
+            )
+            if resident_owner_map_requested:
                 from .qsa_triton import (
-                    qsa_prepare_segmented_owner_occurrence_map)
+                    qsa_prepare_segmented_owner_occurrence_map,
+                    qsa_prepare_segmented_owner_table_plan,
+                )
 
-                owner_occurrence_map = (
-                    qsa_prepare_segmented_owner_occurrence_map(
-                        ctx.segmented_metadata,
-                        query.shape[1],
-                        query.shape[0],
-                    ))
+                if resident_table_plan_requested:
+                    group_blocks = int(os.environ.get(
+                        'MCORE_BRIDGE_QSA_SEGMENT_GROUP_BLOCKS', '1'))
+                    owner_occurrence_map, owner_table_plan = (
+                        qsa_prepare_segmented_owner_table_plan(
+                            topk_indices,
+                            topk_length,
+                            query_positions,
+                            ctx.segmented_metadata,
+                            query.shape[1],
+                            query.shape[0],
+                            key.shape[0],
+                            int(selected_token_group_size),
+                            route_block_size,
+                            group_blocks,
+                            co_select_order=os.environ.get(
+                                'MCORE_BRIDGE_QSA_SEGMENT_COSELECT_ORDER',
+                                '0') != '0',
+                        ))
+                else:
+                    owner_table_plan = None
+                    owner_occurrence_map = (
+                        qsa_prepare_segmented_owner_occurrence_map(
+                            ctx.segmented_metadata,
+                            query.shape[1],
+                            query.shape[0],
+                        ))
                 if owner_occurrence_map is not None:
                     ctx.segmented_metadata = (
                         *ctx.segmented_metadata, owner_occurrence_map)
+                if owner_table_plan is not None:
+                    ctx.segmented_metadata = (
+                        *ctx.segmented_metadata, owner_table_plan)
         # Backward can recover the softmax correction as ``sum(output *
         # grad_output)``.  Saving the already-materialized output avoids a
         # second full selected-K/V scan without allocating another tensor.

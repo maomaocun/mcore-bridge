@@ -1648,7 +1648,8 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
     def run(threshold=None, reuse=False, compact=False, fuse=False, tiled=False,
             listed=False, persistent=False, grouped_blocks=None,
             grouped_union=False, table_scan=False, table_recompute=False,
-            split_recompute=False):
+            split_recompute=False, resident_owner_map=False,
+            resident_table_plan=False):
         monkeypatch.setenv('MCORE_BRIDGE_QSA_DKV_REDUCTION', 'segmented')
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEAD_TILES', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEAD_TILES_TILED', raising=False)
@@ -1668,7 +1669,15 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
             'MCORE_BRIDGE_QSA_SEGMENT_COSELECT_ORDER', raising=False)
         monkeypatch.delenv(
             'MCORE_BRIDGE_QSA_SEGMENT_RESIDENT_OWNER_MAP', raising=False)
+        monkeypatch.delenv(
+            'MCORE_BRIDGE_QSA_SEGMENT_RESIDENT_TABLE_PLAN', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_FLATTEN_HEADS', raising=False)
+        if resident_owner_map:
+            monkeypatch.setenv(
+                'MCORE_BRIDGE_QSA_SEGMENT_RESIDENT_OWNER_MAP', '1')
+        if resident_table_plan:
+            monkeypatch.setenv(
+                'MCORE_BRIDGE_QSA_SEGMENT_RESIDENT_TABLE_PLAN', '1')
         if fuse:
             monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEAD_TILES', '1')
         if tiled:
@@ -1737,9 +1746,13 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
     table_scan_duplicate = run(
         threshold=2, reuse=True, compact=True, grouped_blocks=4,
         table_scan=True)
+    resident_table_scan_duplicate = run(
+        threshold=2, reuse=True, compact=True, grouped_blocks=4,
+        table_scan=True, resident_owner_map=True, resident_table_plan=True)
     for actual in (hybrid, hybrid_saved, fused_owner, tiled_owner, listed_owner,
                    persistent_owner, grouped_owner2, grouped_owner4,
-                   grouped_union_duplicate, table_scan_duplicate):
+                   grouped_union_duplicate, table_scan_duplicate,
+                   resident_table_scan_duplicate):
         assert torch.equal(actual[0], reference[0])
         assert torch.equal(actual[1], reference[1])
         assert torch.equal(actual[2], reference[2])
@@ -2049,25 +2062,28 @@ def test_triton_packed_compact_block_route_matches_token_route():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
 @pytest.mark.parametrize(
-    'transpose_dkv,group_union,table_scan,table_scan_full,table_recompute,split_recompute,coselect_order,resident_owner_map',
+    'transpose_dkv,group_union,table_scan,table_scan_full,table_recompute,split_recompute,coselect_order,resident_owner_map,resident_table_plan',
     (
-        (False, False, False, False, False, False, False, False),
-        (True, False, False, False, False, False, False, False),
-        (False, True, False, False, False, False, False, False),
-        (True, True, False, False, False, False, False, False),
-        (False, False, True, False, False, False, False, False),
-        (False, False, True, True, False, False, False, False),
-        (False, False, True, False, True, False, False, False),
-        (False, False, True, False, True, True, False, False),
-        (False, False, True, False, False, False, True, False),
-        (False, False, True, False, True, False, True, False),
-        (False, False, True, False, False, False, False, True),
-        (False, False, True, False, True, False, False, True),
+        (False, False, False, False, False, False, False, False, False),
+        (True, False, False, False, False, False, False, False, False),
+        (False, True, False, False, False, False, False, False, False),
+        (True, True, False, False, False, False, False, False, False),
+        (False, False, True, False, False, False, False, False, False),
+        (False, False, True, True, False, False, False, False, False),
+        (False, False, True, False, True, False, False, False, False),
+        (False, False, True, False, True, True, False, False, False),
+        (False, False, True, False, False, False, True, False, False),
+        (False, False, True, False, True, False, True, False, False),
+        (False, False, True, False, False, False, False, True, False),
+        (False, False, True, False, True, False, False, True, False),
+        (False, False, True, False, False, False, False, True, True),
+        (False, False, True, False, True, False, False, True, True),
     ),
 )
 def test_triton_packed_compact_block_owned_backward_matches_token_route_on_sm90(
         monkeypatch, transpose_dkv, group_union, table_scan, table_scan_full,
-        table_recompute, split_recompute, coselect_order, resident_owner_map):
+        table_recompute, split_recompute, coselect_order, resident_owner_map,
+        resident_table_plan):
     """Exercise packed block ownership on aligned multi-segment routes."""
 
     if torch.cuda.get_device_capability() != (9, 0):
@@ -2109,6 +2125,9 @@ def test_triton_packed_compact_block_owned_backward_matches_token_route_on_sm90(
     monkeypatch.setenv(
         'MCORE_BRIDGE_QSA_SEGMENT_RESIDENT_OWNER_MAP',
         '1' if resident_owner_map else '0')
+    monkeypatch.setenv(
+        'MCORE_BRIDGE_QSA_SEGMENT_RESIDENT_TABLE_PLAN',
+        '1' if resident_table_plan else '0')
     torch.manual_seed(3142)
     device = 'cuda'
     segments = (20, 16)

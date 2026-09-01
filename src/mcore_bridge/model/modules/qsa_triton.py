@@ -9550,6 +9550,203 @@ if TRITON_AVAILABLE:
         )
 
 
+def qsa_prepare_segmented_owner_table_plan(
+    topk_indices: torch.Tensor,
+    topk_length: torch.Tensor,
+    query_positions: torch.Tensor,
+    segmented_metadata,
+    batch: int,
+    seq_len_q: int,
+    seq_len_k: int,
+    ratio: int,
+    route_block_size: int,
+    group_blocks: int,
+    owner_occurrence_map: torch.Tensor = None,
+    co_select_order: bool = False,
+):
+    """Build a reusable exact grouped-owner plan during forward.
+
+    The returned tensors are safe to retain in an autograd context.  This is
+    deliberately opt-in: the regular backward path still builds its own plan
+    so existing CUDA Graph and production behavior stay unchanged.
+    """
+
+    if batch != 1 or group_blocks <= 1:
+        raise RuntimeError(
+            'QSA resident owner table plan requires B=1 and GROUP_BLOCKS>1')
+    if route_block_size != ratio:
+        raise RuntimeError(
+            'QSA resident owner table plan requires a compact block route')
+    occurrences, starts, block_topk, num_blocks = segmented_metadata[:4]
+    owner_mask = (
+        segmented_metadata[4]
+        if len(segmented_metadata) >= 5 else None
+    )
+    if owner_occurrence_map is None:
+        owner_occurrence_map = qsa_prepare_segmented_owner_occurrence_map(
+            segmented_metadata, batch, seq_len_q)
+    if owner_occurrence_map is None:
+        return None, None
+    owner_block_ids = (
+        torch.nonzero(owner_mask, as_tuple=False).flatten().to(torch.int32)
+        if owner_mask is not None else
+        torch.arange(batch * num_blocks, device=occurrences.device, dtype=torch.int32)
+    )
+    owner_count = int(owner_block_ids.numel())
+    if owner_count == 0:
+        return owner_occurrence_map, None
+    group_count = triton.cdiv(owner_count, group_blocks)
+    block_to_owner = torch.full(
+        (batch * num_blocks,), -1,
+        device=occurrences.device,
+        dtype=torch.int32,
+    )
+    block_to_owner[owner_block_ids] = torch.arange(
+        owner_count, device=occurrences.device, dtype=torch.int32)
+    owner_occurrence_table = torch.full(
+        (batch * seq_len_q * owner_count,),
+        -1,
+        device=occurrences.device,
+        dtype=torch.int32,
+    )
+    group_active = torch.zeros(
+        (batch * group_count * seq_len_q,),
+        device=occurrences.device,
+        dtype=torch.int32,
+    )
+    duplicate_flag = torch.zeros(
+        (), device=occurrences.device, dtype=torch.int32)
+    _qsa_build_owner_occurrence_table_kernel[(batch * seq_len_q,)](
+        topk_indices,
+        topk_length,
+        query_positions,
+        owner_occurrence_map,
+        block_to_owner,
+        owner_occurrence_table,
+        group_active,
+        duplicate_flag,
+        seq_len_q,
+        seq_len_k,
+        num_blocks,
+        topk_indices.stride(0),
+        topk_indices.stride(1),
+        topk_indices.stride(2),
+        topk_length.stride(0),
+        topk_length.stride(1),
+        query_positions.stride(0),
+        seq_len_q * block_topk,
+        block_topk,
+        owner_count,
+        group_count,
+        BLOCK_TOPK=block_topk,
+        RATIO=ratio,
+        ROUTE_BLOCK_SIZE=route_block_size,
+        GROUP_BLOCKS=group_blocks,
+        num_warps=8,
+        num_stages=1,
+    )
+    if bool(duplicate_flag.item()):
+        return owner_occurrence_map, {
+            'duplicate': True,
+            'owner_count': owner_count,
+            'group_count': group_count,
+            'group_blocks': group_blocks,
+            'co_select_order': co_select_order,
+        }
+    if co_select_order:
+        owner_active = (
+            owner_occurrence_table.view(batch * seq_len_q, owner_count) >= 0)
+        overlap = torch.matmul(
+            owner_active.transpose(0, 1).to(torch.float32),
+            owner_active.to(torch.float32),
+        ).cpu()
+        remaining = list(range(owner_count))
+        ordered_columns = []
+        while remaining:
+            seed = max(
+                remaining,
+                key=lambda index: int(overlap[index, remaining].max()),
+            )
+            remaining.remove(seed)
+            group_columns = [seed]
+            for _ in range(group_blocks - 1):
+                if not remaining:
+                    break
+                candidate = max(
+                    remaining,
+                    key=lambda index: sum(
+                        int(overlap[index, member])
+                        for member in group_columns
+                    ),
+                )
+                remaining.remove(candidate)
+                group_columns.append(candidate)
+            ordered_columns.extend(group_columns)
+        order = torch.tensor(
+            ordered_columns, device=occurrences.device, dtype=torch.long)
+        owner_block_ids = owner_block_ids.index_select(0, order)
+        owner_occurrence_table = (
+            owner_occurrence_table.view(batch * seq_len_q, owner_count)
+            .index_select(1, order)
+            .reshape(-1)
+            .contiguous()
+        )
+        owner_active = (
+            owner_occurrence_table.view(batch * seq_len_q, owner_count) >= 0)
+        padded_active = torch.zeros(
+            (batch * seq_len_q, group_count * group_blocks),
+            device=occurrences.device,
+            dtype=torch.bool,
+        )
+        padded_active[:, :owner_count] = owner_active
+        group_active = padded_active.view(
+            batch, seq_len_q, group_count, group_blocks
+        ).any(dim=3).permute(0, 2, 1).reshape(-1).to(torch.int32)
+    active_view = group_active.view(batch * group_count, seq_len_q)
+    group_counts = active_view.sum(dim=1, dtype=torch.int32)
+    group_starts = torch.empty(
+        batch * group_count + 1,
+        device=occurrences.device,
+        dtype=torch.int32,
+    )
+    group_starts[0] = 0
+    group_starts[1:] = group_counts.cumsum(0).to(torch.int32)
+    group_ids, group_queries = torch.nonzero(active_view, as_tuple=True)
+    group_ids = group_ids.to(torch.long)
+    group_queries = group_queries.to(torch.int32).contiguous()
+    if int(group_queries.numel()) != int(group_starts[-1].item()):
+        raise RuntimeError(
+            'QSA resident owner-table active query compaction count mismatch')
+    local_columns = torch.arange(
+        group_blocks, device=occurrences.device, dtype=torch.long)
+    owner_columns = (
+        group_ids[:, None] * group_blocks + local_columns[None, :])
+    owner_column_valid = owner_columns < owner_count
+    safe_owner_columns = owner_columns.clamp(max=owner_count - 1)
+    table_indices = (
+        group_queries.to(torch.long)[:, None] * owner_count
+        + safe_owner_columns
+    )
+    group_occurrences = owner_occurrence_table.view(-1).gather(
+        0, table_indices.reshape(-1)).view(-1, group_blocks)
+    group_occurrences = torch.where(
+        owner_column_valid,
+        group_occurrences,
+        torch.full_like(group_occurrences, -1),
+    ).contiguous()
+    return owner_occurrence_map, {
+        'duplicate': False,
+        'owner_block_ids': owner_block_ids,
+        'group_queries': group_queries,
+        'group_occurrences': group_occurrences,
+        'group_starts': group_starts,
+        'owner_count': owner_count,
+        'group_count': group_count,
+        'group_blocks': group_blocks,
+        'co_select_order': co_select_order,
+    }
+
+
 def qsa_segmented_dkv_tail(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -9868,6 +10065,12 @@ def qsa_segmented_dkv_reduce(
         '0') != '0'
     co_select_order = os.environ.get(
         'MCORE_BRIDGE_QSA_SEGMENT_COSELECT_ORDER', '0') != '0'
+    resident_table_plan = (
+        segmented_metadata[6]
+        if len(segmented_metadata) >= 7
+        and isinstance(segmented_metadata[6], dict)
+        else None
+    )
     flatten_default = (
         is_sm90(query.device)
         and grad_key.dtype == torch.bfloat16
@@ -9987,6 +10190,124 @@ def qsa_segmented_dkv_reduce(
             num_stages=1,
         )
         return
+    if table_scan and resident_table_plan is not None:
+        if resident_table_plan.get('duplicate', False):
+            if table_recompute:
+                raise RuntimeError(
+                    'QSA resident recompute plan cannot preserve duplicate '
+                    'block multiplicity; disable resident table planning')
+            table_scan = False
+        else:
+            if (resident_table_plan.get('group_blocks') != group_blocks
+                    or resident_table_plan.get('group_count') <= 0):
+                raise RuntimeError(
+                    'QSA resident owner table plan configuration mismatch')
+            if table_recompute and group_block_d != head_dim:
+                raise RuntimeError(
+                    'QSA owner-table derivative recompute currently requires '
+                    'GROUP_BLOCK_D == head_dim')
+            owner_block_ids = resident_table_plan['owner_block_ids']
+            owner_count = int(resident_table_plan['owner_count'])
+            table_group_count = int(resident_table_plan['group_count'])
+            table_grid = (
+                batch * table_group_count * num_kv_heads * num_segment_head_tiles,
+            )
+            owner_score_workspace = (
+                saved_scores if saved_scores is not None else query)
+            owner_d_score_workspace = (
+                saved_d_scores if saved_d_scores is not None else query)
+            resident_table_kernel_args = (
+                query,
+                grad_output,
+                occurrences,
+                starts,
+                resident_table_plan['group_queries'],
+                resident_table_plan['group_occurrences'],
+                resident_table_plan['group_starts'],
+                owner_block_ids,
+                starts,
+                starts,
+                owner_score_workspace,
+                owner_d_score_workspace,
+                grad_key,
+                grad_value,
+                key,
+                value,
+                lse,
+                grad_lse,
+                correction,
+                sq,
+                sk,
+                num_blocks,
+                table_group_count,
+                owner_count,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                softmax_scale,
+                query.stride(1),
+                query.stride(0),
+                query.stride(2),
+                query.stride(3),
+                grad_output.stride(1),
+                grad_output.stride(0),
+                grad_output.stride(2),
+                grad_output.stride(3),
+                grad_key.stride(1),
+                grad_key.stride(0),
+                grad_key.stride(2),
+                grad_key.stride(3),
+                grad_value.stride(1),
+                grad_value.stride(0),
+                grad_value.stride(2),
+                grad_value.stride(3),
+                owner_score_workspace.stride(0),
+                owner_score_workspace.stride(2),
+                owner_score_workspace.stride(3),
+                owner_d_score_workspace.stride(0),
+                owner_d_score_workspace.stride(2),
+                owner_d_score_workspace.stride(3),
+                key.stride(1),
+                key.stride(0),
+                key.stride(2),
+                key.stride(3),
+                value.stride(1),
+                value.stride(0),
+                value.stride(2),
+                value.stride(3),
+                lse.stride(0),
+                lse.stride(1),
+                lse.stride(2),
+                grad_lse.stride(0),
+                grad_lse.stride(1),
+                grad_lse.stride(2),
+                correction.stride(0),
+                correction.stride(1),
+                correction.stride(2),
+            )
+            _qsa_segmented_dkv_reduce_block_group_kernel[table_grid](
+                *resident_table_kernel_args,
+                RATIO=ratio,
+                GROUP_SIZE=group_size,
+                HEAD_TILE=segment_head_tile,
+                NUM_HEAD_TILES=num_segment_head_tiles,
+                GROUP_BLOCKS=group_blocks,
+                BLOCK_OCC=block_occ,
+                BLOCK_M=block_occ * segment_head_tile,
+                BLOCK_TOPK=block_topk,
+                BLOCK_D=group_block_d,
+                NUM_D_TILES=triton.cdiv(head_dim, group_block_d),
+                BATCH_ONE=batch == 1,
+                USE_OWNER_MASK=False,
+                GROUP_UNION=False,
+                TABLE_SCAN=True,
+                RECOMPUTE_DERIVATIVES=table_recompute,
+                HAS_GRAD_LSE=grad_lse is not lse,
+                DKV_ACCUM_BF16=grad_key.dtype == torch.bfloat16,
+                num_warps=segmented_num_warps,
+                num_stages=1,
+            )
+            return
     if table_scan:
         if not (batch == 1 and group_blocks > 1 and flatten_heads
                 and (compact_derivatives or table_recompute)
