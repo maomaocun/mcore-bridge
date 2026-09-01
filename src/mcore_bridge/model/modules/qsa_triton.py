@@ -9652,10 +9652,15 @@ def qsa_selected_kv_backward(
         segmented_metadata[2]
         if owner_occurrence_map is not None else 0)
     group_size = num_q_heads // num_kv_heads
+    tensorized_fp32_atomic = (
+        dkv_accum_dtype == 'fp32'
+        and os.environ.get(
+            'MCORE_BRIDGE_QSA_BACKWARD_TENSORIZE_FP32_ATOMIC', '0') != '0'
+    )
     tensorized_default = (
         group_size >= 5
         and head_dim >= 64
-        and dkv_accum_dtype == 'bf16'
+        and (dkv_accum_dtype == 'bf16' or tensorized_fp32_atomic)
     )
     default_head_tile = 16 if tensorized_default else min(
         4, 1 << max(0, group_size - 1).bit_length())
@@ -9666,7 +9671,7 @@ def qsa_selected_kv_backward(
     tensorized_tile = (
         head_tile_size >= 16
         and head_dim >= 64
-        and dkv_accum_dtype == 'bf16'
+        and (dkv_accum_dtype == 'bf16' or tensorized_fp32_atomic)
     )
     num_head_tiles = triton.cdiv(group_size, head_tile_size)
     grid = (batch * sq, num_kv_heads * num_head_tiles)
@@ -10028,8 +10033,15 @@ def qsa_selected_kv_backward_packed(
         else torch.zeros_like(value, dtype=torch.float32)
     )
     group_size = num_q_heads // num_kv_heads
+    tensorized_fp32_atomic = (
+        dkv_accum_dtype == 'fp32'
+        and os.environ.get(
+            'MCORE_BRIDGE_QSA_BACKWARD_TENSORIZE_FP32_ATOMIC', '0') != '0'
+    )
     tensorized_default = (
-        group_size >= 5 and head_dim >= 64 and dkv_accum_dtype == 'bf16'
+        group_size >= 5
+        and head_dim >= 64
+        and (dkv_accum_dtype == 'bf16' or tensorized_fp32_atomic)
     )
     default_head_tile = 16 if tensorized_default else min(
         4, 1 << max(0, group_size - 1).bit_length())
@@ -10040,7 +10052,7 @@ def qsa_selected_kv_backward_packed(
     tensorized_tile = (
         head_tile_size >= 16
         and head_dim >= 64
-        and dkv_accum_dtype == 'bf16'
+        and (dkv_accum_dtype == 'bf16' or tensorized_fp32_atomic)
     )
     num_head_tiles = triton.cdiv(group_size, head_tile_size)
     block_d = max(16, triton.next_power_of_2(head_dim))

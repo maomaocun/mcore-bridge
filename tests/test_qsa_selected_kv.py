@@ -1874,9 +1874,13 @@ def test_triton_selected_kv_production_compact_default_dispatch_matches_torch(mo
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
-def test_triton_compact_block_route_forward_backward_matches_token_route():
+@pytest.mark.parametrize('dkv_accum_dtype', ('bf16', 'fp32'))
+def test_triton_compact_block_route_forward_backward_matches_token_route(
+        monkeypatch, dkv_accum_dtype):
     if torch.cuda.get_device_capability() != (9, 0):
         pytest.skip('requires H100/SM90')
+    if dkv_accum_dtype == 'fp32':
+        monkeypatch.setenv('MCORE_BRIDGE_QSA_BACKWARD_TENSORIZE_FP32_ATOMIC', '1')
     torch.manual_seed(2718)
     device = 'cuda'
     sq, hq, hkv, dim, ratio, block_topk = 35, 12, 2, 64, 4, 8
@@ -1921,7 +1925,7 @@ def test_triton_compact_block_route_forward_backward_matches_token_route():
             backend=backend,
             require_backend=backend == 'triton',
             query_positions=positions,
-            dkv_accum_dtype='bf16',
+            dkv_accum_dtype=dkv_accum_dtype,
             selected_token_group_size=ratio,
             route_block_size=block_size,
         )
@@ -1934,10 +1938,12 @@ def test_triton_compact_block_route_forward_backward_matches_token_route():
     assert torch.allclose(actual[0].float(), reference[0].float(), atol=2e-2, rtol=2e-2)
     assert torch.allclose(actual[1], reference[1], atol=2e-5, rtol=2e-5)
     assert torch.allclose(actual[2].float(), reference[2].float(), atol=5e-2, rtol=5e-2)
+    grad_atol = 1.25e-1 if dkv_accum_dtype == 'fp32' else 2e-2
+    grad_rtol = 1e-1 if dkv_accum_dtype == 'fp32' else 2e-2
     for actual_grad, reference_grad in zip(actual[3:], reference[3:]):
         difference = actual_grad.float() - reference_grad.float()
-        assert difference.abs().mean().item() < 2e-2
-        assert difference.norm().item() / reference_grad.float().norm().item() < 2e-2
+        assert difference.abs().mean().item() < grad_atol
+        assert difference.norm().item() / reference_grad.float().norm().item() < grad_rtol
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
