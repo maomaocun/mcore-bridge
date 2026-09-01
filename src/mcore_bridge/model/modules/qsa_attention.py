@@ -830,6 +830,9 @@ def qsa_sparse_forward(
     ``MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT`` to a positive value makes
     only complete blocks with at least that many query occurrences owner-owned;
     the remaining blocks stay on the query-side atomic path for A/B studies.
+    ``MCORE_BRIDGE_QSA_SEGMENT_COMPACT_DERIVATIVES=1`` additionally stores
+    probability and d-score only for owner occurrences in CSR order; this is
+    an opt-in diagnostic that uses a bounded owner-sized workspace.
     ``route_block_size > 1`` selects the compact complete-block metadata ABI.
     """
 
