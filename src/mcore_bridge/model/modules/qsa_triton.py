@@ -5272,6 +5272,8 @@ if TRITON_AVAILABLE:
         group_query_ptr,
         group_occurrence_ptr,
         group_start_ptr,
+        owner_block_ids_ptr,
+        owner_occurrence_table_ptr,
         owner_block_mask_ptr,
         score_ptr,
         d_score_ptr,
@@ -5281,6 +5283,7 @@ if TRITON_AVAILABLE:
         seq_len_k,
         num_blocks,
         num_groups_per_batch,
+        owner_count,
         num_q_heads,
         num_kv_heads,
         head_dim,
@@ -5320,6 +5323,7 @@ if TRITON_AVAILABLE:
         BATCH_ONE: tl.constexpr,
         USE_OWNER_MASK: tl.constexpr,
         GROUP_UNION: tl.constexpr,
+        TABLE_SCAN: tl.constexpr,
         DKV_ACCUM_BF16: tl.constexpr,
     ):
         """Fuse several adjacent block owners into one exact output tile.
@@ -5340,8 +5344,22 @@ if TRITON_AVAILABLE:
         group = group_work - batch * num_groups_per_batch
         block_base = group * GROUP_BLOCKS
         block_offsets = tl.arange(0, GROUP_BLOCKS)
-        block_ids = block_base + block_offsets
-        block_valid = block_ids < num_blocks
+        block_columns = block_base + block_offsets
+        block_valid = (
+            block_columns < owner_count if TABLE_SCAN
+            else block_columns < num_blocks
+        )
+        safe_columns = tl.where(block_valid, block_columns, 0)
+        if TABLE_SCAN:
+            block_ids = tl.load(
+                owner_block_ids_ptr
+                + batch * owner_count
+                + safe_columns,
+                mask=block_valid,
+                other=0,
+            ).to(tl.int32)
+        else:
+            block_ids = block_columns
         safe_blocks = tl.where(block_valid, block_ids, 0)
         batch_block_base = batch * num_blocks
         block_starts = tl.load(
@@ -5363,7 +5381,10 @@ if TRITON_AVAILABLE:
                     other=0,
                 ) != 0
             )
-        if GROUP_UNION:
+        if TABLE_SCAN:
+            group_start = 0
+            group_end = seq_len_q
+        elif GROUP_UNION:
             group_start = tl.load(
                 group_start_ptr + group_work).to(tl.int32)
             group_end = tl.load(
@@ -5382,12 +5403,27 @@ if TRITON_AVAILABLE:
         heads = kv_head * GROUP_SIZE + head_offsets
         head_valid = (head_offsets < GROUP_SIZE) & (heads < num_q_heads)
         occurrence_step = (
-            BLOCK_OCC if GROUP_UNION else BLOCK_OCC * GROUP_BLOCKS)
+            BLOCK_OCC if (GROUP_UNION or TABLE_SCAN)
+            else BLOCK_OCC * GROUP_BLOCKS)
         output_rows = tl.arange(0, GROUP_BLOCKS * RATIO)[:, None]
         output_block_offsets = output_rows // RATIO
-        output_block_ids = block_base + output_block_offsets
+        output_block_columns = block_base + output_block_offsets
         output_tokens = output_rows % RATIO
-        output_block_valid = output_block_ids < num_blocks
+        output_block_valid = (
+            output_block_columns < owner_count if TABLE_SCAN
+            else output_block_columns < num_blocks
+        )
+        safe_output_columns = tl.where(output_block_valid, output_block_columns, 0)
+        if TABLE_SCAN:
+            output_block_ids = tl.load(
+                owner_block_ids_ptr
+                + batch * owner_count
+                + safe_output_columns,
+                mask=output_block_valid,
+                other=0,
+            ).to(tl.int32)
+        else:
+            output_block_ids = output_block_columns
         safe_output_blocks = tl.where(output_block_valid, output_block_ids, 0)
         output_block_starts = tl.load(
             segment_start_ptr + batch_block_base + safe_output_blocks,
@@ -5424,7 +5460,22 @@ if TRITON_AVAILABLE:
             for occurrence_offset in tl.range(
                 0, group_end - group_start, occurrence_step
             ):
-                if GROUP_UNION:
+                if TABLE_SCAN:
+                    union_index = (
+                        group_start
+                        + occurrence_offset
+                        + occurrence_lanes
+                    )
+                    occurrence_valid = union_index < group_end
+                    query = union_index
+                    if BATCH_ONE:
+                        query_batch = tl.zeros((BLOCK_M,), dtype=tl.int32)
+                        same_batch = occurrence_valid
+                    else:
+                        query_batch = tl.full(
+                            (BLOCK_M,), batch, dtype=tl.int32)
+                        same_batch = occurrence_valid
+                elif GROUP_UNION:
                     union_index = (
                         group_start
                         + occurrence_offset
@@ -5493,7 +5544,22 @@ if TRITON_AVAILABLE:
                     other=0.0,
                 ).to(tl.bfloat16)
 
-                if GROUP_UNION:
+                if TABLE_SCAN:
+                    score_occurrences = tl.load(
+                        owner_occurrence_table_ptr
+                        + (batch * seq_len_q + query[None, :]) * owner_count
+                        + output_block_columns,
+                        mask=occurrence_valid[None, :]
+                        & output_block_valid,
+                        other=-1,
+                    ).to(tl.int32)
+                    block_occurrence_mask = (
+                        (score_occurrences >= 0)
+                        & same_batch[None, :]
+                        & head_valid[None, :]
+                        & occurrence_valid[None, :]
+                    )
+                elif GROUP_UNION:
                     score_occurrences = tl.load(
                         group_occurrence_ptr
                         + tl.cast(union_index[None, :], tl.int64)
@@ -9248,6 +9314,91 @@ def _qsa_prepare_segmented_query_union(
     return group_starts, union_queries, union_occurrences, groups_per_batch
 
 
+if TRITON_AVAILABLE:
+
+    @triton.jit
+    def _qsa_build_owner_occurrence_table_kernel(
+        topk_indices,
+        topk_length,
+        query_positions,
+        owner_occurrence_map,
+        block_to_owner,
+        occurrence_table,
+        duplicate_flag,
+        seq_len_q,
+        seq_len_k,
+        num_blocks,
+        stride_ib,
+        stride_is,
+        stride_ik,
+        stride_lb,
+        stride_ls,
+        stride_qp,
+        stride_ormb,
+        stride_orms,
+        owner_count,
+        BLOCK_TOPK: tl.constexpr,
+        RATIO: tl.constexpr,
+        ROUTE_BLOCK_SIZE: tl.constexpr,
+    ):
+        """Scatter compact-owner CSR IDs into a query-major owner table."""
+
+        batch_query = tl.program_id(0)
+        batch = batch_query // seq_len_q
+        query = batch_query - batch * seq_len_q
+        slots = tl.arange(0, BLOCK_TOPK)
+        route = tl.load(
+            topk_indices
+            + batch * stride_ib
+            + query * stride_is
+            + slots * stride_ik,
+            mask=slots < BLOCK_TOPK,
+            other=-1,
+        ).to(tl.int32)
+        length = tl.load(
+            topk_length + batch * stride_lb + query * stride_ls).to(tl.int32)
+        query_position = tl.load(
+            query_positions + query * stride_qp).to(tl.int32)
+        complete_count = length // RATIO
+        valid = (
+            (slots < complete_count)
+            & (slots < BLOCK_TOPK)
+            & (route >= 0)
+            & (route < num_blocks)
+        )
+        global_block = batch * num_blocks + route
+        safe_block = tl.where(valid, global_block, 0)
+        owner_column = tl.load(
+            block_to_owner + safe_block,
+            mask=valid,
+            other=-1,
+        ).to(tl.int32)
+        valid = valid & (owner_column >= 0) & (owner_column < owner_count)
+        occurrence = tl.load(
+            owner_occurrence_map
+            + batch * stride_ormb
+            + query * stride_orms
+            + slots,
+            mask=valid,
+            other=-1,
+        ).to(tl.int32)
+        valid = valid & (occurrence >= 0)
+        table_ptrs = (
+            occurrence_table
+            + (batch * seq_len_q + query) * owner_count
+            + owner_column
+        )
+        previous = tl.atomic_xchg(
+            table_ptrs,
+            occurrence,
+            mask=valid,
+            sem='relaxed',
+        )
+        duplicate = valid & (previous >= 0) & (previous != occurrence)
+        duplicate_any = tl.max(duplicate.to(tl.int32), axis=0)
+        tl.atomic_max(duplicate_flag, duplicate_any, sem='relaxed')
+
+
 def qsa_segmented_dkv_tail(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -9410,6 +9561,7 @@ def qsa_segmented_dkv_reduce(
     route_block_size: int = 1,
     saved_scores: torch.Tensor = None,
     saved_d_scores: torch.Tensor = None,
+    owner_occurrence_map: torch.Tensor = None,
 ) -> None:
     """Build a block-level inverse CSR map and reduce dK/dV by segment.
 
@@ -9558,6 +9710,8 @@ def qsa_segmented_dkv_reduce(
             'QSA segmented owner group D tile expects one of {32,64,128,256}')
     group_union = os.environ.get(
         'MCORE_BRIDGE_QSA_SEGMENT_GROUP_UNION', '0') != '0'
+    table_scan = os.environ.get(
+        'MCORE_BRIDGE_QSA_SEGMENT_TABLE_SCAN', '0') != '0'
     flatten_default = (
         is_sm90(query.device)
         and grad_key.dtype == torch.bfloat16
@@ -9677,6 +9831,139 @@ def qsa_segmented_dkv_reduce(
             num_stages=1,
         )
         return
+    if table_scan:
+        if not (batch == 1 and group_blocks > 1 and flatten_heads
+                and compact_derivatives and route_block_size == ratio
+                and owner_occurrence_map is not None
+                and (owner_mask is not None or hybrid_min_fanout == 0)):
+            raise RuntimeError(
+                'QSA owner-table scan requires B=1, compact block derivatives, '
+                'GROUP_BLOCKS>1, and either hybrid owners or full segmented '
+                'ownership')
+        owner_block_ids = (
+            torch.nonzero(owner_mask, as_tuple=False).flatten().to(torch.int32)
+            if owner_mask is not None else
+            torch.arange(batch * num_blocks, device=query.device, dtype=torch.int32)
+        )
+        owner_count = int(owner_block_ids.numel())
+        if owner_count == 0:
+            return
+        block_to_owner = torch.full(
+            (batch * num_blocks,), -1, device=query.device, dtype=torch.int32)
+        block_to_owner[owner_block_ids] = torch.arange(
+            owner_count, device=query.device, dtype=torch.int32)
+        owner_occurrence_table = torch.full(
+            (batch * sq * owner_count,),
+            -1,
+            device=query.device,
+            dtype=torch.int32,
+        )
+        duplicate_flag = torch.zeros(
+            (), device=query.device, dtype=torch.int32)
+        _qsa_build_owner_occurrence_table_kernel[(batch * sq,)](
+            topk_indices,
+            topk_length,
+            query_positions,
+            owner_occurrence_map,
+            block_to_owner,
+            owner_occurrence_table,
+            duplicate_flag,
+            sq,
+            sk,
+            num_blocks,
+            topk_indices.stride(0),
+            topk_indices.stride(1),
+            topk_indices.stride(2),
+            topk_length.stride(0),
+            topk_length.stride(1),
+            query_positions.stride(0),
+            sq * block_topk,
+            block_topk,
+            owner_count,
+            BLOCK_TOPK=block_topk,
+            RATIO=ratio,
+            ROUTE_BLOCK_SIZE=route_block_size,
+            num_warps=8,
+            num_stages=1,
+        )
+        if bool(duplicate_flag.item()):
+            # The table stores one occurrence per query/block.  A duplicate
+            # selection requires a multiplicity list; use the already exact
+            # grouped owner rather than silently dropping one contribution.
+            table_scan = False
+        else:
+            table_group_count = triton.cdiv(owner_count, group_blocks)
+            table_grid = (
+                batch * table_group_count * num_kv_heads * num_segment_head_tiles,
+            )
+            table_kernel_args = (
+                query,
+                grad_output,
+                occurrences,
+                starts,
+                starts,
+                starts,
+                starts,
+                owner_block_ids,
+                owner_occurrence_table,
+                starts,
+                saved_scores,
+                saved_d_scores,
+                grad_key,
+                grad_value,
+                sq,
+                sk,
+                num_blocks,
+                table_group_count,
+                owner_count,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                softmax_scale,
+                query.stride(1),
+                query.stride(0),
+                query.stride(2),
+                query.stride(3),
+                grad_output.stride(1),
+                grad_output.stride(0),
+                grad_output.stride(2),
+                grad_output.stride(3),
+                grad_key.stride(1),
+                grad_key.stride(0),
+                grad_key.stride(2),
+                grad_key.stride(3),
+                grad_value.stride(1),
+                grad_value.stride(0),
+                grad_value.stride(2),
+                grad_value.stride(3),
+                saved_scores.stride(0),
+                saved_scores.stride(2),
+                saved_scores.stride(3),
+                saved_d_scores.stride(0),
+                saved_d_scores.stride(2),
+                saved_d_scores.stride(3),
+            )
+            _qsa_segmented_dkv_reduce_block_group_kernel[table_grid](
+                *table_kernel_args,
+                RATIO=ratio,
+                GROUP_SIZE=group_size,
+                HEAD_TILE=segment_head_tile,
+                NUM_HEAD_TILES=num_segment_head_tiles,
+                GROUP_BLOCKS=group_blocks,
+                BLOCK_OCC=block_occ,
+                BLOCK_M=block_occ * segment_head_tile,
+                BLOCK_TOPK=block_topk,
+                BLOCK_D=group_block_d,
+                NUM_D_TILES=triton.cdiv(head_dim, group_block_d),
+                BATCH_ONE=batch == 1,
+                USE_OWNER_MASK=False,
+                GROUP_UNION=False,
+                TABLE_SCAN=True,
+                DKV_ACCUM_BF16=grad_key.dtype == torch.bfloat16,
+                num_warps=segmented_num_warps,
+                num_stages=1,
+            )
+            return
     if group_blocks > 1:
         if not (flatten_heads and compact_derivatives and route_block_size == ratio):
             raise RuntimeError(
@@ -9712,6 +9999,8 @@ def qsa_segmented_dkv_reduce(
                     group_queries,
                     group_occurrences,
                     group_starts,
+                    starts,
+                    starts,
                     owner_mask if owner_mask is not None else starts,
                     saved_scores,
                     saved_d_scores,
@@ -9721,6 +10010,7 @@ def qsa_segmented_dkv_reduce(
                     sk,
                     num_blocks,
                     group_count,
+                    0,
                     num_q_heads,
                     num_kv_heads,
                     head_dim,
@@ -9763,6 +10053,7 @@ def qsa_segmented_dkv_reduce(
                     BATCH_ONE=batch == 1,
                     USE_OWNER_MASK=owner_mask is not None,
                     GROUP_UNION=True,
+                    TABLE_SCAN=False,
                     DKV_ACCUM_BF16=grad_key.dtype == torch.bfloat16,
                     num_warps=segmented_num_warps,
                     num_stages=1,
@@ -9780,6 +10071,8 @@ def qsa_segmented_dkv_reduce(
             starts,
             starts,
             starts,
+            starts,
+            starts,
             owner_mask if owner_mask is not None else starts,
             saved_scores,
             saved_d_scores,
@@ -9789,6 +10082,7 @@ def qsa_segmented_dkv_reduce(
             sk,
             num_blocks,
             group_count,
+            0,
             num_q_heads,
             num_kv_heads,
             head_dim,
@@ -9831,6 +10125,7 @@ def qsa_segmented_dkv_reduce(
             BATCH_ONE=batch == 1,
             USE_OWNER_MASK=owner_mask is not None,
             GROUP_UNION=False,
+            TABLE_SCAN=False,
             DKV_ACCUM_BF16=grad_key.dtype == torch.bfloat16,
             num_warps=segmented_num_warps,
             num_stages=1,
@@ -10703,6 +10998,7 @@ def qsa_selected_kv_backward(
             route_block_size=route_block_size,
             saved_scores=saved_scores,
             saved_d_scores=saved_d_scores,
+            owner_occurrence_map=owner_occurrence_map,
         )
     return grad_query.to(query.dtype), grad_key.to(key.dtype), grad_value.to(value.dtype)
 
