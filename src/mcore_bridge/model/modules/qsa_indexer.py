@@ -703,6 +703,106 @@ class QSAIndexer(nn.Module):
             return_block_ids=return_block_ids,
             dense_zero_based=True)
 
+    @torch.no_grad()
+    def prepare_segmented_owner_plan(
+        self,
+        topk_indices: torch.Tensor,
+        topk_length: torch.Tensor,
+        query_positions: Optional[torch.Tensor] = None,
+        seq_len_k: Optional[int] = None,
+    ):
+        """Build optional segmented owner metadata for a compact route.
+
+        This is an explicit hand-off from the route producer to selected-KV
+        attention.  The normal :meth:`select_topk` return contract is
+        unchanged; callers that opt into block-owned backward can pass the
+        returned metadata as ``segmented_metadata`` to
+        ``qsa_sparse_forward``.
+        """
+
+        if not topk_indices.is_cuda or not topk_length.is_cuda:
+            raise ValueError(
+                'QSA segmented owner plans require CUDA route tensors')
+        if topk_indices.ndim != 3 or topk_length.shape != topk_indices.shape[:2]:
+            raise ValueError(
+                'QSA segmented owner plan expects indices [B,S,K] and lengths [B,S]')
+        if topk_indices.shape[-1] != self.block_topk:
+            raise ValueError(
+                'QSA segmented owner plan requires the indexer compact block width '
+                f'{self.block_topk}, got {topk_indices.shape[-1]}')
+        batch, seq_len_q = topk_indices.shape[:2]
+        if query_positions is None:
+            query_positions = torch.arange(
+                seq_len_q, device=topk_indices.device, dtype=torch.int32)
+        else:
+            query_positions = query_positions.to(
+                device=topk_indices.device, dtype=torch.int32).contiguous()
+        if query_positions.shape != (seq_len_q,):
+            raise ValueError(
+                f'QSA segmented owner plan positions must have shape [{seq_len_q}]')
+        seq_len_k = seq_len_q if seq_len_k is None else int(seq_len_k)
+        if seq_len_k <= 0:
+            raise ValueError('QSA segmented owner plan seq_len_k must be positive')
+        from .qsa_triton import (
+            qsa_prepare_segmented_metadata,
+            qsa_prepare_segmented_owner_occurrence_map,
+            qsa_prepare_segmented_owner_table_plan,
+        )
+
+        ratio = int(self.compress_ratio)
+        topk_indices = topk_indices.to(torch.int32).contiguous()
+        topk_length = topk_length.to(torch.int32).contiguous()
+        metadata = qsa_prepare_segmented_metadata(
+            topk_indices,
+            topk_length,
+            query_positions,
+            seq_len_q,
+            seq_len_k,
+            ratio,
+            route_block_size=ratio,
+            owner_min_fanout=int(os.environ.get(
+                'MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT', '0')),
+        )
+        needs_owner_map = (
+            os.environ.get(
+                'MCORE_BRIDGE_QSA_SEGMENT_COMPACT_DERIVATIVES', '0') != '0'
+            or os.environ.get(
+                'MCORE_BRIDGE_QSA_SEGMENT_TABLE_RECOMPUTE_DERIVATIVES',
+                '0') != '0'
+            or os.environ.get(
+                'MCORE_BRIDGE_QSA_SEGMENT_TABLE_SCAN', '0') != '0'
+        )
+        if not needs_owner_map:
+            return metadata
+        owner_map = qsa_prepare_segmented_owner_occurrence_map(
+            metadata, batch, seq_len_q)
+        if owner_map is not None:
+            metadata = (*metadata, owner_map)
+        if os.environ.get('MCORE_BRIDGE_QSA_SEGMENT_TABLE_SCAN', '0') == '0':
+            return metadata
+        group_blocks = int(os.environ.get(
+            'MCORE_BRIDGE_QSA_SEGMENT_GROUP_BLOCKS', '1'))
+        if group_blocks <= 1 or owner_map is None:
+            return metadata
+        _, owner_plan = qsa_prepare_segmented_owner_table_plan(
+            topk_indices,
+            topk_length,
+            query_positions,
+            metadata,
+            batch,
+            seq_len_q,
+            seq_len_k,
+            ratio,
+            ratio,
+            group_blocks,
+            owner_occurrence_map=owner_map,
+            co_select_order=os.environ.get(
+                'MCORE_BRIDGE_QSA_SEGMENT_COSELECT_ORDER', '0') != '0',
+        )
+        if owner_plan is not None:
+            metadata = (*metadata, owner_plan)
+        return metadata
+
     @staticmethod
     def _slice_packed_freqs(freqs, start: int, end: int, length: int, total_length: int):
         """Select one packed segment from either flattened or max-length RoPE."""

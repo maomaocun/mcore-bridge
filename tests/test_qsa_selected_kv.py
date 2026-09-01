@@ -23,8 +23,6 @@ from mcore_bridge.model.modules.qsa_triton import (
     qsa_indexer_fused_topk_packed,
     qsa_indexer_fused_topk_with_ratio,
     qsa_indexer_packed_metadata_from_cu,
-    qsa_prepare_segmented_metadata,
-    qsa_prepare_segmented_owner_table_plan,
     qsa_indexer_slab_topk_with_ratio,
 )
 from mcore_bridge.model.gpts.qwen4_exp import Qwen4ExpLayer
@@ -2221,43 +2219,39 @@ def test_triton_external_segmented_owner_plan_matches_internal_build_on_sm90(
     monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_RESIDENT_TABLE_PLAN', '0')
     torch.manual_seed(4242)
     device = 'cuda'
-    sq, batch, hq, hkv, dim, ratio, block_topk = 32, 1, 8, 2, 64, 4, 4
+    sq, batch, hq, hkv, dim, ratio, block_topk = 64, 1, 8, 2, 64, 4, 8
     positions = torch.arange(sq, device=device, dtype=torch.int32)
-    indices = torch.full(
-        (batch, sq, block_topk), -1, device=device, dtype=torch.int32)
-    lengths = torch.zeros((batch, sq), device=device, dtype=torch.int32)
-    for query in range(sq):
-        complete = min((query + 1) // ratio, block_topk)
-        if complete:
-            indices[0, query, :complete] = torch.arange(
-                complete, device=device, dtype=torch.int32)
-        lengths[0, query] = (
-            complete * ratio + (query + 1 - complete * ratio))
-    metadata = qsa_prepare_segmented_metadata(
-        indices,
-        lengths,
-        positions,
-        sq,
-        sq,
-        ratio,
-        route_block_size=ratio,
-        owner_min_fanout=1,
+    class IndexerConfig:
+        hidden_size = 8
+        indexer_n_heads = 2
+        indexer_kv_heads = 1
+        indexer_head_dim = 4
+        indexer_budget = block_topk * ratio
+        indexer_compress_ratio = ratio
+        layernorm_epsilon = 1e-6
+        params_dtype = torch.bfloat16
+        sequence_parallel = False
+        attention_scaling = 1.0
+        qsa_indexer_query_tile_size = 8
+        qsa_indexer_key_tile_size = 8
+
+    indexer = QSAIndexer(IndexerConfig()).cuda()
+    hidden = torch.randn(
+        sq, batch, IndexerConfig.hidden_size,
+        device=device, dtype=torch.bfloat16)
+    freqs = torch.zeros(
+        sq, 1, 1, IndexerConfig.indexer_head_dim,
+        device=device, dtype=torch.bfloat16)
+    indices, lengths = indexer.select_topk(
+        hidden,
+        freqs,
+        backend='triton',
+        query_tile_size=8,
+        key_tile_size=8,
+        return_block_ids=True,
     )
-    owner_map, owner_plan = qsa_prepare_segmented_owner_table_plan(
-        indices,
-        lengths,
-        positions,
-        metadata,
-        batch,
-        sq,
-        sq,
-        ratio,
-        ratio,
-        2,
-    )
-    assert owner_map is not None
-    assert owner_plan is not None
-    external_metadata = (*metadata, owner_map, owner_plan)
+    external_metadata = indexer.prepare_segmented_owner_plan(
+        indices, lengths, positions)
     query_base = torch.randn(
         sq, batch, hq, dim, device=device, dtype=torch.bfloat16)
     key_base = torch.randn(
