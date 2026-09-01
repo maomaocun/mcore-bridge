@@ -1646,7 +1646,8 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
     grad_lse = torch.randn(batch, hq, sq, device=device, dtype=torch.float32) * 0.01
 
     def run(threshold=None, reuse=False, compact=False, fuse=False, tiled=False,
-            listed=False, persistent=False, grouped_blocks=None):
+            listed=False, persistent=False, grouped_blocks=None,
+            grouped_union=False):
         monkeypatch.setenv('MCORE_BRIDGE_QSA_DKV_REDUCTION', 'segmented')
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEAD_TILES', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEAD_TILES_TILED', raising=False)
@@ -1655,6 +1656,7 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_PERSISTENT_OWNER', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_PERSISTENT_CTAS', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_GROUP_BLOCKS', raising=False)
+        monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_GROUP_UNION', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_FLATTEN_HEADS', raising=False)
         if fuse:
             monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEAD_TILES', '1')
@@ -1671,6 +1673,8 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
             monkeypatch.setenv(
                 'MCORE_BRIDGE_QSA_SEGMENT_GROUP_BLOCKS', str(grouped_blocks))
             monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_FLATTEN_HEADS', '1')
+        if grouped_union:
+            monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_GROUP_UNION', '1')
         if threshold is None:
             monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT', raising=False)
         else:
@@ -1708,8 +1712,12 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
     persistent_owner = run(threshold=2, reuse=True, compact=True, persistent=True)
     grouped_owner2 = run(threshold=2, reuse=True, compact=True, grouped_blocks=2)
     grouped_owner4 = run(threshold=2, reuse=True, compact=True, grouped_blocks=4)
+    grouped_union_duplicate = run(
+        threshold=2, reuse=True, compact=True, grouped_blocks=4,
+        grouped_union=True)
     for actual in (hybrid, hybrid_saved, fused_owner, tiled_owner, listed_owner,
-                   persistent_owner, grouped_owner2, grouped_owner4):
+                   persistent_owner, grouped_owner2, grouped_owner4,
+                   grouped_union_duplicate):
         assert torch.equal(actual[0], reference[0])
         assert torch.equal(actual[1], reference[1])
         assert torch.equal(actual[2], reference[2])
@@ -2018,9 +2026,12 @@ def test_triton_packed_compact_block_route_matches_token_route():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
-@pytest.mark.parametrize('transpose_dkv', (False, True))
+@pytest.mark.parametrize(
+    'transpose_dkv,group_union',
+    ((False, False), (True, False), (False, True), (True, True)),
+)
 def test_triton_packed_compact_block_owned_backward_matches_token_route_on_sm90(
-        monkeypatch, transpose_dkv):
+        monkeypatch, transpose_dkv, group_union):
     """Exercise packed block ownership on aligned multi-segment routes."""
 
     if torch.cuda.get_device_capability() != (9, 0):
@@ -2032,6 +2043,19 @@ def test_triton_packed_compact_block_owned_backward_matches_token_route_on_sm90(
     monkeypatch.setenv(
         'MCORE_BRIDGE_QSA_SEGMENT_TRANSPOSE_DKV',
         '1' if transpose_dkv else '0')
+    monkeypatch.setenv(
+        'MCORE_BRIDGE_QSA_SEGMENT_GROUP_BLOCKS',
+        '4' if group_union else '1')
+    monkeypatch.setenv(
+        'MCORE_BRIDGE_QSA_SEGMENT_GROUP_UNION',
+        '1' if group_union else '0')
+    monkeypatch.setenv(
+        'MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT',
+        '1' if group_union else '0')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_FLATTEN_HEADS', '1')
+    monkeypatch.setenv(
+        'MCORE_BRIDGE_QSA_SEGMENT_COMPACT_DERIVATIVES',
+        '1' if group_union else '0')
     torch.manual_seed(3142)
     device = 'cuda'
     segments = (20, 16)
