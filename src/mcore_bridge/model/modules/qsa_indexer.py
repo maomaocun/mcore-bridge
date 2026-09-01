@@ -777,6 +777,11 @@ class QSAIndexer(nn.Module):
         owner_map = qsa_prepare_segmented_owner_occurrence_map(
             metadata, batch, seq_len_q)
         if owner_map is not None:
+            # Slot 4 is reserved for the optional fan-out owner mask.  Keep
+            # that position explicit when the full-owner plan has no mask so
+            # backward cannot mistake the int32 occurrence map for int8 mask.
+            if len(metadata) == 4:
+                metadata = (*metadata, None)
             metadata = (*metadata, owner_map)
         if os.environ.get('MCORE_BRIDGE_QSA_SEGMENT_TABLE_SCAN', '0') == '0':
             return metadata

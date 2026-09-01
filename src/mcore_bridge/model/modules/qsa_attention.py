@@ -684,6 +684,9 @@ class _QSASelectedKVFunction(Function):
                             query.shape[0],
                         ))
                 if owner_occurrence_map is not None:
+                    if len(ctx.segmented_metadata) == 4:
+                        ctx.segmented_metadata = (
+                            *ctx.segmented_metadata, None)
                     ctx.segmented_metadata = (
                         *ctx.segmented_metadata, owner_occurrence_map)
                 if owner_table_plan is not None:

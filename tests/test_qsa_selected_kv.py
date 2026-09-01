@@ -2397,14 +2397,32 @@ def test_triton_packed_compact_block_owned_backward_matches_token_route_on_sm90(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_triton_split_partial_owner_matches_reference_on_sm90(monkeypatch):
+    """Guard the opt-in fixed-split owner against the torch reference."""
+
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('requires H100/SM90')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_SPLIT_PARTIAL_OWNER', '1')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_OWNER_SPLITS', '4')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_PARTIAL_DTYPE', 'bf16')
+    # Reuse the existing exact route/reference fixture with the dynamic
+    # block-list path, which is the ABI required by the partial reducer.
+    test_triton_flat_head_owner_matches_reference_on_sm90(
+        monkeypatch, block_occ=2, block_list=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+@pytest.mark.parametrize('owner_threshold', (0, 1))
+@pytest.mark.parametrize('resident_owner_map', (False, True))
 def test_triton_external_segmented_owner_plan_matches_internal_build_on_sm90(
-        monkeypatch):
+        monkeypatch, owner_threshold, resident_owner_map):
     """Use an indexer-produced segmented plan directly in autograd."""
 
     if torch.cuda.get_device_capability() != (9, 0):
         pytest.skip('requires H100/SM90')
     monkeypatch.setenv('MCORE_BRIDGE_QSA_DKV_REDUCTION', 'segmented')
-    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT', '1')
+    monkeypatch.setenv(
+        'MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT', str(owner_threshold))
     monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_REUSE_DERIVATIVES', '0')
     monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_REUSE_SCORES', '0')
     monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_COMPACT_DERIVATIVES', '0')
@@ -2416,7 +2434,9 @@ def test_triton_external_segmented_owner_plan_matches_internal_build_on_sm90(
     monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_TABLE_SCAN', '1')
     monkeypatch.setenv(
         'MCORE_BRIDGE_QSA_SEGMENT_TABLE_RECOMPUTE_DERIVATIVES', '1')
-    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_RESIDENT_OWNER_MAP', '0')
+    monkeypatch.setenv(
+        'MCORE_BRIDGE_QSA_SEGMENT_RESIDENT_OWNER_MAP',
+        '1' if resident_owner_map else '0')
     monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_RESIDENT_TABLE_PLAN', '0')
     torch.manual_seed(4242)
     device = 'cuda'

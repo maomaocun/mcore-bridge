@@ -6605,6 +6605,301 @@ if TRITON_AVAILABLE:
             tl.store(value_output_ptrs, grad_value_acc, mask=output_mask)
 
     @triton.jit
+    def _qsa_segmented_dkv_reduce_flat_partial_kernel(
+        query_ptr,
+        grad_out_ptr,
+        occurrence_query_ptr,
+        segment_start_ptr,
+        owner_block_list_ptr,
+        score_ptr,
+        d_score_ptr,
+        partial_key_ptr,
+        partial_value_ptr,
+        seq_len_q,
+        seq_len_k,
+        num_blocks,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        softmax_scale,
+        stride_qb,
+        stride_qs,
+        stride_qh,
+        stride_qd,
+        stride_gob,
+        stride_gos,
+        stride_goh,
+        stride_god,
+        stride_scoreb,
+        stride_scoreh,
+        stride_scorek,
+        stride_dscoreb,
+        stride_dscoreh,
+        stride_dscorek,
+        stride_partial_group,
+        stride_partial_split,
+        stride_partial_head,
+        stride_partial_token,
+        stride_partial_d,
+        RATIO: tl.constexpr,
+        GROUP_SIZE: tl.constexpr,
+        HEAD_GROUP: tl.constexpr,
+        NUM_SPLITS: tl.constexpr,
+        BLOCK_OCC: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_TOPK: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        HAS_GRAD_OUTPUT: tl.constexpr,
+        BATCH_ONE: tl.constexpr,
+        PARTIAL_BF16: tl.constexpr,
+    ):
+        """Compute one flat-owner partial without destination atomics."""
+
+        program = tl.program_id(0)
+        kv_head = program % num_kv_heads
+        split = (program // num_kv_heads) % NUM_SPLITS
+        owner_group = program // (num_kv_heads * NUM_SPLITS)
+        key_group = tl.load(owner_block_list_ptr + owner_group).to(tl.int32)
+        batch = key_group // num_blocks
+        block = key_group - batch * num_blocks
+        segment_start = tl.load(segment_start_ptr + key_group).to(tl.int32)
+        segment_end = tl.load(segment_start_ptr + key_group + 1).to(tl.int32)
+        if segment_start >= segment_end:
+            return
+
+        token_offsets = tl.arange(0, RATIO)
+        d_offsets = tl.arange(0, BLOCK_D)
+        key_positions = block * RATIO + token_offsets
+        key_mask = key_positions < seq_len_k
+        grad_key_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
+        grad_value_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
+        flat_offsets = tl.arange(0, BLOCK_M)
+        occurrence_lanes = flat_offsets // HEAD_GROUP
+        head_lanes = flat_offsets - occurrence_lanes * HEAD_GROUP
+        heads = kv_head * GROUP_SIZE + head_lanes
+        head_valid = (head_lanes < GROUP_SIZE) & (heads < num_q_heads)
+
+        for occurrence_offset in tl.range(
+            split * BLOCK_OCC,
+            segment_end - segment_start,
+            NUM_SPLITS * BLOCK_OCC,
+        ):
+            occurrence = segment_start + occurrence_offset + occurrence_lanes
+            encoded = tl.load(
+                occurrence_query_ptr + occurrence,
+                mask=occurrence < segment_end,
+                other=0,
+            ).to(tl.int32)
+            row = encoded // BLOCK_TOPK
+            if BATCH_ONE:
+                query_batch = tl.zeros((BLOCK_M,), dtype=tl.int32)
+                query = row
+                same_batch = occurrence < segment_end
+            else:
+                query_batch = row // seq_len_q
+                query = row - query_batch * seq_len_q
+                same_batch = (
+                    (query_batch == batch) & (occurrence < segment_end)
+                )
+            row_valid = same_batch & head_valid
+            q_ptrs = (
+                query_ptr
+                + query_batch[:, None] * stride_qb
+                + query[:, None] * stride_qs
+                + heads[:, None] * stride_qh
+                + d_offsets[None, :] * stride_qd
+            )
+            grad_out_ptrs = (
+                grad_out_ptr
+                + query_batch[:, None] * stride_gob
+                + query[:, None] * stride_gos
+                + heads[:, None] * stride_goh
+                + d_offsets[None, :] * stride_god
+            )
+            q_value = tl.load(
+                q_ptrs,
+                mask=row_valid[:, None] & (d_offsets[None, :] < head_dim),
+                other=0.0,
+            ).to(tl.bfloat16)
+            grad_output = tl.load(
+                grad_out_ptrs,
+                mask=row_valid[:, None]
+                & (d_offsets[None, :] < head_dim)
+                & HAS_GRAD_OUTPUT,
+                other=0.0,
+            ).to(tl.bfloat16)
+            probability = tl.load(
+                score_ptr
+                + tl.cast(occurrence[:, None], tl.int64) * stride_scoreb
+                + heads[:, None] * stride_scoreh
+                + token_offsets[None, :] * stride_scorek,
+                mask=row_valid[:, None] & key_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            grad_score = tl.load(
+                d_score_ptr
+                + tl.cast(occurrence[:, None], tl.int64) * stride_dscoreb
+                + heads[:, None] * stride_dscoreh
+                + token_offsets[None, :] * stride_dscorek,
+                mask=row_valid[:, None] & key_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            grad_key_acc += tl.dot(
+                tl.trans(grad_score.to(tl.bfloat16)),
+                q_value,
+                out_dtype=tl.float32,
+            ) * softmax_scale
+            grad_value_acc += tl.dot(
+                tl.trans(probability.to(tl.bfloat16)),
+                grad_output,
+                out_dtype=tl.float32,
+            )
+
+        partial_key_ptrs = (
+            partial_key_ptr
+            + owner_group * stride_partial_group
+            + split * stride_partial_split
+            + kv_head * stride_partial_head
+            + token_offsets[:, None] * stride_partial_token
+            + d_offsets[None, :] * stride_partial_d
+        )
+        output_mask = key_mask[:, None] & (d_offsets[None, :] < head_dim)
+        if PARTIAL_BF16:
+            tl.store(
+                partial_key_ptrs,
+                grad_key_acc.to(tl.bfloat16),
+                mask=output_mask,
+            )
+        else:
+            tl.store(partial_key_ptrs, grad_key_acc, mask=output_mask)
+        partial_value_ptrs = (
+            partial_value_ptr
+            + owner_group * stride_partial_group
+            + split * stride_partial_split
+            + kv_head * stride_partial_head
+            + token_offsets[:, None] * stride_partial_token
+            + d_offsets[None, :] * stride_partial_d
+        )
+        if PARTIAL_BF16:
+            tl.store(
+                partial_value_ptrs,
+                grad_value_acc.to(tl.bfloat16),
+                mask=output_mask,
+            )
+        else:
+            tl.store(partial_value_ptrs, grad_value_acc, mask=output_mask)
+
+    @triton.jit
+    def _qsa_segmented_dkv_reduce_flat_partial_finalize_kernel(
+        owner_block_list_ptr,
+        partial_key_ptr,
+        partial_value_ptr,
+        grad_key_ptr,
+        grad_value_ptr,
+        num_blocks,
+        num_kv_heads,
+        seq_len_k,
+        head_dim,
+        stride_partial_group,
+        stride_partial_split,
+        stride_partial_head,
+        stride_partial_token,
+        stride_partial_d,
+        stride_dkb,
+        stride_dks,
+        stride_dkh,
+        stride_dkd,
+        stride_dvb,
+        stride_dvs,
+        stride_dvh,
+        stride_dvd,
+        RATIO: tl.constexpr,
+        NUM_SPLITS: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        DKV_ACCUM_BF16: tl.constexpr,
+        PARTIAL_BF16: tl.constexpr,
+    ):
+        """Fold flat-owner partials into one contiguous dK/dV store."""
+
+        program = tl.program_id(0)
+        kv_head = program % num_kv_heads
+        owner_group = program // num_kv_heads
+        key_group = tl.load(owner_block_list_ptr + owner_group).to(tl.int32)
+        batch = key_group // num_blocks
+        block = key_group - batch * num_blocks
+        token_offsets = tl.arange(0, RATIO)
+        d_offsets = tl.arange(0, BLOCK_D)
+        key_positions = block * RATIO + token_offsets
+        output_mask = key_positions[:, None] < seq_len_k
+        output_mask = output_mask & (d_offsets[None, :] < head_dim)
+        grad_key_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
+        grad_value_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
+        for split in tl.static_range(0, NUM_SPLITS):
+            partial_key_ptrs = (
+                partial_key_ptr
+                + owner_group * stride_partial_group
+                + split * stride_partial_split
+                + kv_head * stride_partial_head
+                + token_offsets[:, None] * stride_partial_token
+                + d_offsets[None, :] * stride_partial_d
+            )
+            partial_value_ptrs = (
+                partial_value_ptr
+                + owner_group * stride_partial_group
+                + split * stride_partial_split
+                + kv_head * stride_partial_head
+                + token_offsets[:, None] * stride_partial_token
+                + d_offsets[None, :] * stride_partial_d
+            )
+            if PARTIAL_BF16:
+                grad_key_acc += tl.load(
+                    partial_key_ptrs,
+                    mask=output_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                grad_value_acc += tl.load(
+                    partial_value_ptrs,
+                    mask=output_mask,
+                    other=0.0,
+                ).to(tl.float32)
+            else:
+                grad_key_acc += tl.load(
+                    partial_key_ptrs, mask=output_mask, other=0.0)
+                grad_value_acc += tl.load(
+                    partial_value_ptrs, mask=output_mask, other=0.0)
+
+        key_output_ptrs = (
+            grad_key_ptr
+            + batch * stride_dkb
+            + key_positions[:, None] * stride_dks
+            + kv_head * stride_dkh
+            + d_offsets[None, :] * stride_dkd
+        )
+        value_output_ptrs = (
+            grad_value_ptr
+            + batch * stride_dvb
+            + key_positions[:, None] * stride_dvs
+            + kv_head * stride_dvh
+            + d_offsets[None, :] * stride_dvd
+        )
+        grad_key_acc += tl.load(key_output_ptrs, mask=output_mask, other=0.0)
+        grad_value_acc += tl.load(value_output_ptrs, mask=output_mask, other=0.0)
+        if DKV_ACCUM_BF16:
+            tl.store(
+                key_output_ptrs,
+                grad_key_acc.to(tl.bfloat16),
+                mask=output_mask,
+            )
+            tl.store(
+                value_output_ptrs,
+                grad_value_acc.to(tl.bfloat16),
+                mask=output_mask,
+            )
+        else:
+            tl.store(key_output_ptrs, grad_key_acc, mask=output_mask)
+            tl.store(value_output_ptrs, grad_value_acc, mask=output_mask)
+
+    @triton.jit
     def _qsa_segment_count_blocks_kernel(
         index_ptr,
         length_ptr,
@@ -9569,6 +9864,27 @@ def qsa_prepare_segmented_owner_occurrence_map(
     return occurrence_map
 
 
+def _qsa_segmented_owner_mask(
+    segmented_metadata,
+    batch: int,
+    seq_len_k: int,
+    ratio: int,
+):
+    """Return the optional owner mask without confusing it with owner map."""
+
+    if segmented_metadata is None or len(segmented_metadata) < 5:
+        return None
+    candidate = segmented_metadata[4]
+    if not torch.is_tensor(candidate):
+        return None
+    expected = batch * triton.cdiv(int(seq_len_k), int(ratio))
+    if candidate.dtype not in {torch.bool, torch.uint8, torch.int8}:
+        return None
+    if candidate.numel() != expected:
+        return None
+    return candidate
+
+
 def _qsa_prepare_segmented_query_union(
     segmented_metadata,
     batch: int,
@@ -9779,10 +10095,8 @@ def qsa_prepare_segmented_owner_table_plan(
         raise RuntimeError(
             'QSA resident owner table plan requires a compact block route')
     occurrences, starts, block_topk, num_blocks = segmented_metadata[:4]
-    owner_mask = (
-        segmented_metadata[4]
-        if len(segmented_metadata) >= 5 else None
-    )
+    owner_mask = _qsa_segmented_owner_mask(
+        segmented_metadata, batch, seq_len_k, ratio)
     if owner_occurrence_map is None:
         owner_occurrence_map = qsa_prepare_segmented_owner_occurrence_map(
             segmented_metadata, batch, seq_len_q)
@@ -10126,6 +10440,14 @@ def qsa_segmented_dkv_reduce(
     one flattened owner MMA tile and performs one contiguous dK/dV store;
     ``..._BLOCK_OCC`` selects its occurrence tile.  It supports compact
     routes with GQA groups up to 16 heads and remains diagnostic.
+    ``MCORE_BRIDGE_QSA_SEGMENT_SPLIT_PARTIAL_OWNER=1`` is an opt-in full-owner
+    diagnostic that uses fixed partial workspaces and a final owner fold; it
+    does not change the production atomic path.
+    ``MCORE_BRIDGE_QSA_SEGMENT_SPLIT_PARTIAL_OWNER=1`` shards a flat owner's
+    inverse-CSR segment into fixed partial CTAs and folds them with one final
+    contiguous store.  ``..._OWNER_SPLITS`` controls the shard count and
+    ``..._PARTIAL_DTYPE`` selects the temporary partial workspace dtype; this
+    path is correctness-gated and remains opt-in.
     """
 
     if ratio < 2 or (ratio & (ratio - 1)):
@@ -10217,10 +10539,8 @@ def qsa_segmented_dkv_reduce(
             owner_min_fanout=hybrid_min_fanout,
         )
     occurrences, starts, block_topk, num_blocks = segmented_metadata[:4]
-    owner_mask = (
-        segmented_metadata[4]
-        if len(segmented_metadata) >= 5 else None
-    )
+    owner_mask = _qsa_segmented_owner_mask(
+        segmented_metadata, batch, sk, ratio)
     if hybrid_min_fanout > 0 and len(segmented_metadata) < 5:
         raise RuntimeError(
             'QSA hybrid segmented reduction requires an owner block mask')
@@ -10236,10 +10556,11 @@ def qsa_segmented_dkv_reduce(
     )
     owner_block_list = None
     if use_block_list:
-        if len(segmented_metadata) >= 5:
-            owner_candidates = segmented_metadata[4] != 0
-        else:
-            owner_candidates = starts[1:] > starts[:-1]
+        owner_candidates = (
+            owner_mask != 0
+            if owner_mask is not None
+            else starts[1:] > starts[:-1]
+        )
         owner_block_list = torch.nonzero(
             owner_candidates, as_tuple=False).flatten().to(torch.int32)
         if owner_block_list.numel() == 0:
@@ -10332,8 +10653,7 @@ def qsa_segmented_dkv_reduce(
             batch * num_blocks * num_kv_heads * num_segment_head_tiles,
         )
         persistent_mask_workspace = (
-            segmented_metadata[4]
-            if len(segmented_metadata) >= 5 else starts
+            owner_mask if owner_mask is not None else starts
         )
         persistent_kernel_args = (
             query,
@@ -11100,6 +11420,25 @@ def qsa_segmented_dkv_reduce(
     if flat_owner_block_occ not in {1, 2, 4, 8, 16}:
         raise ValueError(
             'QSA flat fused owner BLOCK_OCC expects one of {1,2,4,8,16}')
+    split_partial_owner = (
+        compact_derivatives
+        and flatten_heads
+        and fuse_owner_heads_flat
+        and use_block_list
+        and os.environ.get(
+            'MCORE_BRIDGE_QSA_SEGMENT_SPLIT_PARTIAL_OWNER', '0') != '0'
+    )
+    partial_owner_splits = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_SEGMENT_OWNER_SPLITS', '8'))
+    if partial_owner_splits not in {2, 4, 8, 16}:
+        raise ValueError(
+            'QSA split partial owner count expects one of {2,4,8,16}')
+    partial_dtype = os.environ.get(
+        'MCORE_BRIDGE_QSA_SEGMENT_PARTIAL_DTYPE', 'fp32').lower()
+    if partial_dtype not in {'bf16', 'fp32'}:
+        raise ValueError(
+            'QSA split partial owner dtype expects bf16 or fp32')
+    partial_bf16 = partial_dtype == 'bf16'
     if fuse_owner_heads_flat and group_size > 16:
         raise RuntimeError(
             'QSA flat fused owner currently supports GQA groups up to 16 heads')
@@ -11143,6 +11482,112 @@ def qsa_segmented_dkv_reduce(
             saved_d_scores.stride(2),
             saved_d_scores.stride(3),
         )
+    if split_partial_owner:
+        if not fuse_owner_heads_flat:
+            raise RuntimeError(
+                'QSA split partial owner requires flat all-head owner')
+        partial_shape = (
+            owner_group_count,
+            partial_owner_splits,
+            num_kv_heads,
+            ratio,
+            block_d,
+        )
+        partial_key = torch.empty(
+            partial_shape,
+            device=query.device,
+            dtype=torch.bfloat16 if partial_bf16 else torch.float32,
+        )
+        partial_value = torch.empty_like(partial_key)
+        partial_kernel_args = (
+            query,
+            grad_output,
+            occurrences,
+            starts,
+            owner_block_list_workspace,
+            saved_scores,
+            saved_d_scores,
+            partial_key,
+            partial_value,
+            sq,
+            sk,
+            num_blocks,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            softmax_scale,
+            query.stride(1),
+            query.stride(0),
+            query.stride(2),
+            query.stride(3),
+            grad_output.stride(1),
+            grad_output.stride(0),
+            grad_output.stride(2),
+            grad_output.stride(3),
+            saved_scores.stride(0),
+            saved_scores.stride(2),
+            saved_scores.stride(3),
+            saved_d_scores.stride(0),
+            saved_d_scores.stride(2),
+            saved_d_scores.stride(3),
+            partial_key.stride(0),
+            partial_key.stride(1),
+            partial_key.stride(2),
+            partial_key.stride(3),
+            partial_key.stride(4),
+        )
+        _qsa_segmented_dkv_reduce_flat_partial_kernel[
+            (owner_group_count * partial_owner_splits * num_kv_heads,)
+        ](
+            *partial_kernel_args,
+            RATIO=ratio,
+            GROUP_SIZE=group_size,
+            HEAD_GROUP=16,
+            NUM_SPLITS=partial_owner_splits,
+            BLOCK_OCC=flat_owner_block_occ,
+            BLOCK_M=flat_owner_block_occ * 16,
+            BLOCK_TOPK=block_topk,
+            BLOCK_D=block_d,
+            HAS_GRAD_OUTPUT=True,
+            BATCH_ONE=batch == 1,
+            PARTIAL_BF16=partial_bf16,
+            num_warps=segmented_num_warps,
+            num_stages=1,
+        )
+        _qsa_segmented_dkv_reduce_flat_partial_finalize_kernel[
+            (owner_group_count * num_kv_heads,)
+        ](
+            owner_block_list_workspace,
+            partial_key,
+            partial_value,
+            grad_key,
+            grad_value,
+            num_blocks,
+            num_kv_heads,
+            sk,
+            head_dim,
+            partial_key.stride(0),
+            partial_key.stride(1),
+            partial_key.stride(2),
+            partial_key.stride(3),
+            partial_key.stride(4),
+            grad_key.stride(1),
+            grad_key.stride(0),
+            grad_key.stride(2),
+            grad_key.stride(3),
+            grad_value.stride(1),
+            grad_value.stride(0),
+            grad_value.stride(2),
+            grad_value.stride(3),
+            RATIO=ratio,
+            NUM_SPLITS=partial_owner_splits,
+            BLOCK_D=block_d,
+            DKV_ACCUM_BF16=grad_key.dtype == torch.bfloat16,
+            PARTIAL_BF16=partial_bf16,
+            num_warps=segmented_num_warps,
+            num_stages=1,
+        )
+        return
     if fuse_owner_heads_flat:
         flat_kernel_args = (
             query,
@@ -11518,13 +11963,18 @@ def qsa_selected_kv_backward(
     owner_block_mask = None
     owner_occurrence_map = None
     owner_occurrence_count = 0
-    resident_owner_occurrence_map = (
-        segmented_metadata[5]
-        if segmented_metadata is not None
-        and len(segmented_metadata) >= 6
-        and torch.is_tensor(segmented_metadata[5])
-        else None
-    )
+    resident_owner_occurrence_map = None
+    if segmented_metadata is not None:
+        # The current ABI stores the map at slot 5 because slot 4 is the
+        # optional owner mask.  Accept the pre-fix slot-4 form as well, but
+        # only when its dtype identifies it as an int32 occurrence map.
+        for metadata_index in (5, 4):
+            if (len(segmented_metadata) > metadata_index
+                    and torch.is_tensor(segmented_metadata[metadata_index])
+                    and segmented_metadata[metadata_index].dtype == torch.int32):
+                resident_owner_occurrence_map = segmented_metadata[
+                    metadata_index]
+                break
     compact_derivatives_requested = (
         use_segmented_reduction
         and os.environ.get(
@@ -11539,8 +11989,10 @@ def qsa_selected_kv_backward(
     owner_occurrence_requested = (
         compact_derivatives_requested or table_recompute_requested)
     if use_segmented_reduction:
+        metadata_owner_mask = _qsa_segmented_owner_mask(
+            segmented_metadata, batch, sk, segment_ratio)
         if (segmented_metadata is None or
-                (hybrid_min_fanout > 0 and len(segmented_metadata) < 5)):
+                (hybrid_min_fanout > 0 and metadata_owner_mask is None)):
             segmented_metadata = qsa_prepare_segmented_metadata(
                 topk_indices,
                 topk_length,
@@ -11551,10 +12003,8 @@ def qsa_selected_kv_backward(
                 route_block_size=route_block_size,
                 owner_min_fanout=hybrid_min_fanout,
             )
-        owner_block_mask = (
-            segmented_metadata[4]
-            if len(segmented_metadata) >= 5 else None
-        )
+        owner_block_mask = _qsa_segmented_owner_mask(
+            segmented_metadata, batch, sk, segment_ratio)
         if hybrid_min_fanout > 0 and owner_block_mask is None:
             raise RuntimeError(
                 'QSA hybrid segmented reduction requires an owner block mask')
