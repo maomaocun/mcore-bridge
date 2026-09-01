@@ -1645,12 +1645,15 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
     grad_out = torch.randn_like(q0)
     grad_lse = torch.randn(batch, hq, sq, device=device, dtype=torch.float32) * 0.01
 
-    def run(threshold=None, reuse=False, compact=False, fuse=False, tiled=False, listed=False):
+    def run(threshold=None, reuse=False, compact=False, fuse=False, tiled=False,
+            listed=False, persistent=False):
         monkeypatch.setenv('MCORE_BRIDGE_QSA_DKV_REDUCTION', 'segmented')
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEAD_TILES', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEAD_TILES_TILED', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_COMPACT_DERIVATIVES', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_COMPACT_BLOCK_LIST', raising=False)
+        monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_PERSISTENT_OWNER', raising=False)
+        monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_PERSISTENT_CTAS', raising=False)
         if fuse:
             monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEAD_TILES', '1')
         if tiled:
@@ -1659,6 +1662,9 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
             monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_COMPACT_DERIVATIVES', '1')
         if listed:
             monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_COMPACT_BLOCK_LIST', '1')
+        if persistent:
+            monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_PERSISTENT_OWNER', '1')
+            monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_PERSISTENT_CTAS', '16')
         if threshold is None:
             monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT', raising=False)
         else:
@@ -1693,7 +1699,9 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
     fused_owner = run(threshold=2, reuse=True, compact=True, fuse=True)
     tiled_owner = run(threshold=2, reuse=True, compact=True, fuse=True, tiled=True)
     listed_owner = run(threshold=2, reuse=True, compact=True, listed=True)
-    for actual in (hybrid, hybrid_saved, fused_owner, tiled_owner, listed_owner):
+    persistent_owner = run(threshold=2, reuse=True, compact=True, persistent=True)
+    for actual in (hybrid, hybrid_saved, fused_owner, tiled_owner, listed_owner,
+                   persistent_owner):
         assert torch.equal(actual[0], reference[0])
         assert torch.equal(actual[1], reference[1])
         assert torch.equal(actual[2], reference[2])
