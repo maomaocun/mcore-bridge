@@ -578,6 +578,7 @@ class _QSASelectedKVFunction(Function):
         selected_token_group_size: Optional[int],
         dkv_reduction: str,
         route_block_size: int,
+        precomputed_scores: Optional[torch.Tensor],
     ):
         resolved = backend
         if resolved == "triton":
@@ -585,7 +586,8 @@ class _QSASelectedKVFunction(Function):
 
             output, lse = qsa_selected_kv_forward(
                 query, key, value, topk_indices, topk_length, softmax_scale, causal, query_positions,
-                key_position_offset, route_block_size=route_block_size)
+                key_position_offset, route_block_size=route_block_size,
+                saved_scores=precomputed_scores)
         else:
             output, lse = _torch_selected_kv_forward(
                 query, key, value, topk_indices, topk_length, softmax_scale, causal, query_position_offset,
@@ -632,6 +634,7 @@ class _QSASelectedKVFunction(Function):
         ctx.selected_token_group_size = selected_token_group_size
         ctx.dkv_reduction = effective_dkv_reduction
         ctx.route_block_size = route_block_size
+        ctx.precomputed_scores = precomputed_scores
         return output, lse
 
     @staticmethod
@@ -658,6 +661,7 @@ class _QSASelectedKVFunction(Function):
                 selected_token_group_size=ctx.selected_token_group_size,
                 segmented_metadata=ctx.segmented_metadata,
                 dkv_reduction=ctx.dkv_reduction,
+                precomputed_scores=ctx.precomputed_scores,
                 route_block_size=ctx.route_block_size,
             )
         else:
@@ -681,7 +685,7 @@ class _QSASelectedKVFunction(Function):
                 ctx.needs_input_grad[2],
             )
         return (grad_query, grad_key, grad_value, None, None, None, None, None, None, None, None, None, None,
-                None, None, None)
+                None, None, None, None)
 
 
 class _QSASelectedKVPackedFunction(Function):
@@ -833,6 +837,9 @@ def qsa_sparse_forward(
     ``MCORE_BRIDGE_QSA_SEGMENT_COMPACT_DERIVATIVES=1`` additionally stores
     probability and d-score only for owner occurrences in CSR order; this is
     an opt-in diagnostic that uses a bounded owner-sized workspace.
+    ``MCORE_BRIDGE_QSA_SAVE_FORWARD_SCORES=1`` stores the FP32 raw-QK score
+    workspace for the Triton atomic backward diagnostic, avoiding backward
+    QK recomputation at the cost of ``[B,S,Hq,K]`` memory and traffic.
     ``route_block_size > 1`` selects the compact complete-block metadata ABI.
     """
 
@@ -898,6 +905,31 @@ def qsa_sparse_forward(
         query = query.contiguous()
         key = key.contiguous()
         value = value.contiguous()
+    precomputed_scores = None
+    if (actual == 'triton'
+            and os.environ.get('MCORE_BRIDGE_QSA_SAVE_FORWARD_SCORES', '0') != '0'):
+        if effective_dkv_reduction != 'atomic':
+            raise RuntimeError(
+                'QSA forward score reuse currently supports atomic dK/dV only')
+        if query.shape[1] != 1:
+            raise RuntimeError(
+                'QSA forward score reuse currently supports batch size one only')
+        score_k = (
+            topk_indices.shape[-1]
+            if route_block_size == 1
+            else route_block_size * topk_indices.shape[-1] + route_block_size - 1
+        )
+        score_chunk = int(os.environ.get(
+            'MCORE_BRIDGE_QSA_SAVE_FORWARD_SCORE_CHUNK', '1024'))
+        if score_chunk <= 0:
+            raise ValueError(
+                'QSA forward score reuse chunk must be positive')
+        score_chunks = (query.shape[0] + score_chunk - 1) // score_chunk
+        precomputed_scores = torch.empty(
+            (score_chunks, score_chunk, query.shape[2], score_k),
+            device=query.device,
+            dtype=torch.float32,
+        )
     return _QSASelectedKVFunction.apply(
         query,
         key,
@@ -915,6 +947,7 @@ def qsa_sparse_forward(
         selected_token_group_size,
         effective_dkv_reduction,
         route_block_size,
+        precomputed_scores,
     )
 
 

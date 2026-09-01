@@ -1874,13 +1874,20 @@ def test_triton_selected_kv_production_compact_default_dispatch_matches_torch(mo
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
-@pytest.mark.parametrize('dkv_accum_dtype', ('bf16', 'fp32'))
+@pytest.mark.parametrize(
+    'dkv_accum_dtype,save_forward_scores',
+    (('bf16', False), ('fp32', False), ('bf16', True)),
+)
 def test_triton_compact_block_route_forward_backward_matches_token_route(
-        monkeypatch, dkv_accum_dtype):
+        monkeypatch, dkv_accum_dtype, save_forward_scores):
     if torch.cuda.get_device_capability() != (9, 0):
         pytest.skip('requires H100/SM90')
-    if dkv_accum_dtype == 'fp32':
-        monkeypatch.setenv('MCORE_BRIDGE_QSA_BACKWARD_TENSORIZE_FP32_ATOMIC', '1')
+    monkeypatch.setenv(
+        'MCORE_BRIDGE_QSA_BACKWARD_TENSORIZE_FP32_ATOMIC',
+        '1' if dkv_accum_dtype == 'fp32' else '0')
+    monkeypatch.setenv(
+        'MCORE_BRIDGE_QSA_SAVE_FORWARD_SCORES',
+        '1' if save_forward_scores else '0')
     torch.manual_seed(2718)
     device = 'cuda'
     sq, hq, hkv, dim, ratio, block_topk = 35, 12, 2, 64, 4, 8

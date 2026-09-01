@@ -2794,6 +2794,11 @@ if TRITON_AVAILABLE:
         stride_lseb,
         stride_lseh,
         stride_lses,
+        score_ptr,
+        stride_scoreb,
+        stride_scores,
+        stride_scoreh,
+        stride_scorek,
         K: tl.constexpr,
         HEADS_PER_KV: tl.constexpr,
         GROUP_SIZE: tl.constexpr,
@@ -2801,6 +2806,9 @@ if TRITON_AVAILABLE:
         BLOCK_K: tl.constexpr,
         BLOCK_D: tl.constexpr,
         CAUSAL: tl.constexpr,
+        STORE_SCORES: tl.constexpr,
+        SCORE_CHUNK: tl.constexpr,
+        SCORE_CHUNKS: tl.constexpr,
         TRIM_CAUSAL_LOOP: tl.constexpr,
         ROUTE_SLOTS: tl.constexpr,
         ROUTE_BLOCK_SIZE: tl.constexpr,
@@ -2863,6 +2871,22 @@ if TRITON_AVAILABLE:
             ).to(tl.bfloat16)
             scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * softmax_scale
             scores = tl.where(valid[None, :], scores, -float("inf"))
+            if STORE_SCORES:
+                score_chunk_id = query // SCORE_CHUNK
+                score_row = query - score_chunk_id * SCORE_CHUNK
+                score_group = batch * SCORE_CHUNKS + score_chunk_id
+                score_ptrs = (
+                    score_ptr
+                    + tl.cast(score_group, tl.int64) * stride_scoreb
+                    + tl.cast(score_row, tl.int64) * stride_scores
+                    + heads[:, None] * stride_scoreh
+                    + key_offsets[None, :] * stride_scorek
+                )
+                tl.store(
+                    score_ptrs,
+                    scores,
+                    mask=head_valid[:, None] & valid[None, :],
+                )
             tile_max = tl.max(scores, axis=1)
             new_max = tl.maximum(max_value, tile_max)
             old_scale = tl.where(
@@ -3197,6 +3221,7 @@ if TRITON_AVAILABLE:
         COMPUTE_DQ: tl.constexpr,
         COMPACT_DERIVATIVES: tl.constexpr,
         STORE_SCORES: tl.constexpr,
+        LOAD_SAVED_SCORES: tl.constexpr,
         STORE_DERIVATIVES: tl.constexpr,
         SCORE_CHUNK: tl.constexpr,
         SCORE_CHUNKS: tl.constexpr,
@@ -3343,7 +3368,24 @@ if TRITON_AVAILABLE:
                       d_offsets[None, :] * stride_vd)
             k = tl.load(k_ptrs, mask=valid[:, None] & (d_offsets[None, :] < head_dim), other=0.0).to(tl.bfloat16)
             v = tl.load(v_ptrs, mask=valid[:, None] & (d_offsets[None, :] < head_dim), other=0.0).to(tl.bfloat16)
-            scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * softmax_scale
+            if LOAD_SAVED_SCORES:
+                score_chunk_id = query // SCORE_CHUNK
+                score_row = query - score_chunk_id * SCORE_CHUNK
+                score_group = batch * SCORE_CHUNKS + score_chunk_id
+                score_base = (
+                    score_ptr
+                    + tl.cast(score_group, tl.int64) * stride_scoreb
+                    + tl.cast(score_row, tl.int64) * stride_scores
+                )
+                scores = tl.load(
+                    score_base
+                    + heads[:, None] * stride_scoreh
+                    + key_offsets[None, :] * stride_scorek,
+                    mask=head_valid[:, None] & valid[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+            else:
+                scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * softmax_scale
             probabilities = tl.exp2(tl.where(
                 valid[None, :],
                 (scores - lse[:, None]) * 1.4426950408889634,
@@ -8161,7 +8203,8 @@ def qsa_selected_kv_forward(query: torch.Tensor, key: torch.Tensor, value: torch
                             topk_indices: torch.Tensor, topk_length: torch.Tensor,
                             softmax_scale: float, causal: bool = True,
                             query_positions: torch.Tensor = None, key_position_offset: int = 0,
-                            route_block_size: int = 1) -> tuple:
+                            route_block_size: int = 1,
+                            saved_scores: torch.Tensor = None) -> tuple:
     """Launch the Triton selected-KV forward kernel.
 
     The public attention wrapper validates and makes all tensors contiguous
@@ -8196,6 +8239,36 @@ def qsa_selected_kv_forward(query: torch.Tensor, key: torch.Tensor, value: torch
         route_slots
         if route_block_size == 1
         else route_slots * route_block_size + route_block_size - 1
+    )
+    score_workspace = query
+    score_chunk = 1
+    score_chunks = 1
+    if saved_scores is not None:
+        valid_score_shape = (
+            (batch == 1 and saved_scores.ndim == 3
+             and saved_scores.shape == (sq, num_q_heads, k_slots))
+            or (saved_scores.ndim == 4
+                and saved_scores.shape[2:] == (num_q_heads, k_slots)
+                and saved_scores.shape[0] % batch == 0
+                and saved_scores.shape[1] > 0
+                and saved_scores.shape[0] // batch * saved_scores.shape[1] >= sq)
+        )
+        if (saved_scores.device != query.device
+                or saved_scores.dtype != torch.float32
+                or not valid_score_shape):
+            raise ValueError(
+                'QSA saved score workspace must be chunked FP32 [C,S_c,Hq,K]')
+        score_workspace = saved_scores.contiguous()
+        if score_workspace.ndim == 3:
+            score_chunk = sq
+        else:
+            score_chunk = score_workspace.shape[1]
+            score_chunks = score_workspace.shape[0] // batch
+    score_strides = (
+        (0, score_workspace.stride(0), score_workspace.stride(1), score_workspace.stride(2))
+        if score_workspace.ndim == 3 else
+        (score_workspace.stride(0), score_workspace.stride(1),
+         score_workspace.stride(2), score_workspace.stride(3))
     )
 
     output = torch.empty_like(query)
@@ -8296,6 +8369,8 @@ def qsa_selected_kv_forward(query: torch.Tensor, key: torch.Tensor, value: torch
         lse.stride(0),
         lse.stride(1),
         lse.stride(2),
+        score_workspace,
+        *score_strides,
         K=k_slots,
         HEADS_PER_KV=head_tile_size,
         GROUP_SIZE=group_size,
@@ -8303,6 +8378,9 @@ def qsa_selected_kv_forward(query: torch.Tensor, key: torch.Tensor, value: torch
         BLOCK_K=block_k,
         BLOCK_D=block_d,
         CAUSAL=causal,
+        STORE_SCORES=saved_scores is not None,
+        SCORE_CHUNK=score_chunk,
+        SCORE_CHUNKS=score_chunks,
         TRIM_CAUSAL_LOOP=trim_causal_loop,
         ROUTE_SLOTS=route_slots,
         ROUTE_BLOCK_SIZE=route_block_size,
@@ -9406,6 +9484,7 @@ def qsa_selected_kv_backward(
     segmented_metadata=None,
     dkv_reduction: str = 'atomic',
     output: torch.Tensor = None,
+    precomputed_scores: torch.Tensor = None,
     route_block_size: int = 1,
 ) -> tuple:
     """Launch the Triton selected-KV backward kernel.
@@ -9438,6 +9517,9 @@ def qsa_selected_kv_backward(
     controls its size and the path remains opt-in.
     ``MCORE_BRIDGE_QSA_BACKWARD_SPLIT_DKV=1`` is a separate diagnostic that
     launches dQ and dK/dV independently and deliberately recomputes scores.
+    ``precomputed_scores`` is an opt-in FP32 raw-QK workspace produced by the
+    matching forward diagnostic; it removes backward QK recomputation while
+    retaining the original LSE-based probability formula.
     """
 
     if not TRITON_AVAILABLE:
@@ -9468,6 +9550,22 @@ def qsa_selected_kv_backward(
         if route_block_size == 1
         else route_slots * route_block_size + route_block_size - 1
     )
+    if precomputed_scores is not None:
+        valid_score_shape = (
+            (batch == 1 and precomputed_scores.ndim == 3
+             and precomputed_scores.shape == (sq, num_q_heads, logical_k))
+            or (precomputed_scores.ndim == 4
+                and precomputed_scores.shape[2:] == (num_q_heads, logical_k)
+                and precomputed_scores.shape[0] % batch == 0
+                and precomputed_scores.shape[1] > 0
+                and precomputed_scores.shape[0] // batch * precomputed_scores.shape[1] >= sq)
+        )
+        if (precomputed_scores.device != query.device
+                or precomputed_scores.dtype != torch.float32
+                or not valid_score_shape):
+            raise ValueError(
+                'QSA precomputed score workspace must be chunked FP32 [C,S_c,Hq,K]')
+        precomputed_scores = precomputed_scores.contiguous()
     if lse.shape != (batch, num_q_heads, sq):
         raise ValueError(f"QSA LSE shape must be {(batch, num_q_heads, sq)}, got {tuple(lse.shape)}")
     if query_positions is None:
@@ -9521,6 +9619,9 @@ def qsa_selected_kv_backward(
     segment_reduction_requested = os.environ.get(
         "MCORE_BRIDGE_QSA_DKV_REDUCTION", dkv_reduction
     ).lower() == "segmented"
+    if precomputed_scores is not None and segment_reduction_requested:
+        raise RuntimeError(
+            'QSA precomputed score reuse currently supports atomic dK/dV only')
     segment_ratio = None
     hybrid_min_fanout = 0
     use_segmented_reduction = False
@@ -9640,12 +9741,18 @@ def qsa_selected_kv_backward(
         and os.environ.get(
             'MCORE_BRIDGE_QSA_SEGMENT_REUSE_DERIVATIVES', '0') != '0'
     ) or compact_derivatives_requested
-    saved_scores = None
+    saved_scores = precomputed_scores
     saved_d_scores = None
     compact_derivatives = False
     score_chunk = 1
     score_chunks = 1
-    if compact_derivatives_requested:
+    if precomputed_scores is not None:
+        if precomputed_scores.ndim == 3:
+            score_chunk = sq
+        else:
+            score_chunk = precomputed_scores.shape[1]
+            score_chunks = precomputed_scores.shape[0] // batch
+    elif compact_derivatives_requested:
         score_dtype = os.environ.get(
             'MCORE_BRIDGE_QSA_SEGMENT_SCORE_DTYPE', 'bf16').lower()
         if score_dtype not in {'bf16', 'fp32'}:
@@ -9707,6 +9814,13 @@ def qsa_selected_kv_backward(
         )
     score_workspace = saved_scores if saved_scores is not None else query
     d_score_workspace = saved_d_scores if saved_d_scores is not None else query
+    load_saved_scores = precomputed_scores is not None
+    score_strides = (
+        (0, score_workspace.stride(0), score_workspace.stride(1), score_workspace.stride(2))
+        if score_workspace.ndim == 3 else
+        (score_workspace.stride(0), score_workspace.stride(1),
+         score_workspace.stride(2), score_workspace.stride(3))
+    )
     correction = (
         torch.empty((batch, num_q_heads, sq), device=query.device, dtype=torch.float32)
         if use_segmented_reduction else lse
@@ -9873,10 +9987,7 @@ def qsa_selected_kv_backward(
         grad_value.stride(0),
         grad_value.stride(2),
         grad_value.stride(3),
-        score_workspace.stride(0),
-        score_workspace.stride(1),
-        score_workspace.stride(2),
-        score_workspace.stride(3),
+        *score_strides,
         d_score_workspace.stride(0),
         d_score_workspace.stride(1),
         d_score_workspace.stride(2),
@@ -9918,7 +10029,8 @@ def qsa_selected_kv_backward(
         'HYBRID_DKV': hybrid_reduction,
         'COMPUTE_DQ': True,
         'COMPACT_DERIVATIVES': compact_derivatives,
-        'STORE_SCORES': saved_scores is not None,
+        'STORE_SCORES': saved_scores is not None and not load_saved_scores,
+        'LOAD_SAVED_SCORES': load_saved_scores,
         'STORE_DERIVATIVES': saved_d_scores is not None,
         'SCORE_CHUNK': score_chunk,
         'SCORE_CHUNKS': score_chunks,
