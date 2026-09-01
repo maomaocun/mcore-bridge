@@ -23,6 +23,8 @@ from mcore_bridge.model.modules.qsa_triton import (
     qsa_indexer_fused_topk_packed,
     qsa_indexer_fused_topk_with_ratio,
     qsa_indexer_packed_metadata_from_cu,
+    qsa_prepare_segmented_metadata,
+    qsa_prepare_segmented_owner_table_plan,
     qsa_indexer_slab_topk_with_ratio,
 )
 from mcore_bridge.model.gpts.qwen4_exp import Qwen4ExpLayer
@@ -2193,6 +2195,108 @@ def test_triton_packed_compact_block_owned_backward_matches_token_route_on_sm90(
         difference = actual_grad.float() - reference_grad.float()
         assert difference.abs().mean().item() < 2e-2
         assert difference.norm().item() / reference_grad.float().norm().item() < 3e-2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_triton_external_segmented_owner_plan_matches_internal_build_on_sm90(
+        monkeypatch):
+    """Use an indexer-produced segmented plan directly in autograd."""
+
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('requires H100/SM90')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_DKV_REDUCTION', 'segmented')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT', '1')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_REUSE_DERIVATIVES', '0')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_REUSE_SCORES', '0')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_COMPACT_DERIVATIVES', '0')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_FLATTEN_HEADS', '1')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_GROUP_BLOCKS', '2')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_GROUP_BLOCK_D', '64')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_WARPS', '2')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_BLOCK_OCC', '16')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_TABLE_SCAN', '1')
+    monkeypatch.setenv(
+        'MCORE_BRIDGE_QSA_SEGMENT_TABLE_RECOMPUTE_DERIVATIVES', '1')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_RESIDENT_OWNER_MAP', '0')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_RESIDENT_TABLE_PLAN', '0')
+    torch.manual_seed(4242)
+    device = 'cuda'
+    sq, batch, hq, hkv, dim, ratio, block_topk = 32, 1, 8, 2, 64, 4, 4
+    positions = torch.arange(sq, device=device, dtype=torch.int32)
+    indices = torch.full(
+        (batch, sq, block_topk), -1, device=device, dtype=torch.int32)
+    lengths = torch.zeros((batch, sq), device=device, dtype=torch.int32)
+    for query in range(sq):
+        complete = min((query + 1) // ratio, block_topk)
+        if complete:
+            indices[0, query, :complete] = torch.arange(
+                complete, device=device, dtype=torch.int32)
+        lengths[0, query] = (
+            complete * ratio + (query + 1 - complete * ratio))
+    metadata = qsa_prepare_segmented_metadata(
+        indices,
+        lengths,
+        positions,
+        sq,
+        sq,
+        ratio,
+        route_block_size=ratio,
+        owner_min_fanout=1,
+    )
+    owner_map, owner_plan = qsa_prepare_segmented_owner_table_plan(
+        indices,
+        lengths,
+        positions,
+        metadata,
+        batch,
+        sq,
+        sq,
+        ratio,
+        ratio,
+        2,
+    )
+    assert owner_map is not None
+    assert owner_plan is not None
+    external_metadata = (*metadata, owner_map, owner_plan)
+    query_base = torch.randn(
+        sq, batch, hq, dim, device=device, dtype=torch.bfloat16)
+    key_base = torch.randn(
+        sq, batch, hkv, dim, device=device, dtype=torch.bfloat16)
+    value_base = torch.randn_like(key_base)
+    grad_output = torch.randn_like(query_base)
+    grad_lse = torch.randn(
+        batch, hq, sq, device=device, dtype=torch.float32) * 0.01
+
+    def run(plan):
+        query = query_base.detach().clone().requires_grad_()
+        key = key_base.detach().clone().requires_grad_()
+        value = value_base.detach().clone().requires_grad_()
+        output, lse = qsa_sparse_forward(
+            query,
+            key,
+            value,
+            indices,
+            lengths,
+            backend='triton',
+            query_positions=positions,
+            selected_token_group_size=ratio,
+            dkv_reduction='segmented',
+            route_block_size=ratio,
+            segmented_metadata=plan,
+        )
+        ((output.float() * grad_output.float()).sum()
+         + (lse * grad_lse).sum()).backward()
+        return output.detach(), lse.detach(), query.grad, key.grad, value.grad
+
+    internal = run(None)
+    external = run(external_metadata)
+    assert torch.equal(external[0], internal[0])
+    assert torch.equal(external[1], internal[1])
+    assert torch.equal(external[2], internal[2])
+    for external_grad, internal_grad in zip(external[3:], internal[3:]):
+        assert torch.isfinite(external_grad).all()
+        assert torch.allclose(
+            external_grad.float(), internal_grad.float(), atol=0.02, rtol=0.03)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')

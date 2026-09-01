@@ -11966,6 +11966,8 @@ __all__ = [
     "qsa_indexer_score_tile_with_ratio",
     "qsa_indexer_slab_topk_with_ratio",
     "qsa_prepare_segmented_metadata",
+    "qsa_prepare_segmented_owner_occurrence_map",
+    "qsa_prepare_segmented_owner_table_plan",
     "qsa_segmented_dkv_reduce",
     "qsa_selected_kv_backward",
     "qsa_selected_kv_backward_packed",

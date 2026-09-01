@@ -579,6 +579,7 @@ class _QSASelectedKVFunction(Function):
         dkv_reduction: str,
         route_block_size: int,
         precomputed_scores: Optional[torch.Tensor],
+        segmented_metadata,
     ):
         resolved = backend
         if resolved == "triton":
@@ -592,7 +593,7 @@ class _QSASelectedKVFunction(Function):
             output, lse = _torch_selected_kv_forward(
                 query, key, value, topk_indices, topk_length, softmax_scale, causal, query_position_offset,
                 key_position_offset, query_positions, query_tile_size)
-        ctx.segmented_metadata = None
+        ctx.segmented_metadata = segmented_metadata
         effective_dkv_reduction = os.environ.get(
             'MCORE_BRIDGE_QSA_DKV_REDUCTION', dkv_reduction
         ).lower()
@@ -600,8 +601,16 @@ class _QSASelectedKVFunction(Function):
             raise ValueError(
                 f'unsupported QSA dkv_reduction={effective_dkv_reduction!r}; '
                 "choose 'atomic' or 'segmented'")
+        if segmented_metadata is not None:
+            if resolved != 'triton' or effective_dkv_reduction != 'segmented':
+                raise ValueError(
+                    'segmented_metadata requires Triton segmented reduction')
+            if len(segmented_metadata) < 4:
+                raise ValueError(
+                    'segmented_metadata must contain inverse-CSR metadata')
         if (resolved == 'triton' and selected_token_group_size is not None and
-                effective_dkv_reduction == 'segmented'):
+                effective_dkv_reduction == 'segmented'
+                and ctx.segmented_metadata is None):
             from .qsa_triton import qsa_prepare_segmented_metadata
 
             hybrid_min_fanout = int(os.environ.get(
@@ -641,7 +650,7 @@ class _QSASelectedKVFunction(Function):
                 and os.environ.get(
                     'MCORE_BRIDGE_QSA_SEGMENT_TABLE_SCAN', '0') != '0'
             )
-            if resident_owner_map_requested:
+            if resident_owner_map_requested and ctx.segmented_metadata is not None:
                 from .qsa_triton import (
                     qsa_prepare_segmented_owner_occurrence_map,
                     qsa_prepare_segmented_owner_table_plan,
@@ -745,7 +754,7 @@ class _QSASelectedKVFunction(Function):
                 ctx.needs_input_grad[2],
             )
         return (grad_query, grad_key, grad_value, None, None, None, None, None, None, None, None, None, None,
-                None, None, None, None)
+                None, None, None, None, None)
 
 
 class _QSASelectedKVPackedFunction(Function):
@@ -882,6 +891,7 @@ def qsa_sparse_forward(
     selected_token_group_size: Optional[int] = None,
     dkv_reduction: str = 'atomic',
     route_block_size: int = 1,
+    segmented_metadata=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run QSA selected-KV attention.
 
@@ -902,6 +912,9 @@ def qsa_sparse_forward(
     QK recomputation at the cost of ``[B,S,Hq,K]`` memory and traffic.
     ``MCORE_BRIDGE_QSA_SAVE_FORWARD_SCORE_DTYPE`` selects BF16 or FP32 storage.
     ``route_block_size > 1`` selects the compact complete-block metadata ABI.
+    ``segmented_metadata`` optionally supplies a prebuilt inverse-CSR/owner
+    plan from the route producer; when omitted, segmented metadata is built
+    by the Triton autograd forward context as before.
     """
 
     sq, sk, batch, num_q_heads, num_kv_heads, head_dim, topk_indices, topk_length = _validate_inputs(
@@ -1014,6 +1027,7 @@ def qsa_sparse_forward(
         effective_dkv_reduction,
         route_block_size,
         precomputed_scores,
+        segmented_metadata,
     )
 
 
