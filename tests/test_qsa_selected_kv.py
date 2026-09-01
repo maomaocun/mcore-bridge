@@ -1664,6 +1664,8 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
             raising=False)
         monkeypatch.delenv(
             'MCORE_BRIDGE_QSA_SEGMENT_SPLIT_RECOMPUTE_DKV', raising=False)
+        monkeypatch.delenv(
+            'MCORE_BRIDGE_QSA_SEGMENT_COSELECT_ORDER', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_FLATTEN_HEADS', raising=False)
         if fuse:
             monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEAD_TILES', '1')
@@ -2045,21 +2047,23 @@ def test_triton_packed_compact_block_route_matches_token_route():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
 @pytest.mark.parametrize(
-    'transpose_dkv,group_union,table_scan,table_scan_full,table_recompute,split_recompute',
+    'transpose_dkv,group_union,table_scan,table_scan_full,table_recompute,split_recompute,coselect_order',
     (
-        (False, False, False, False, False, False),
-        (True, False, False, False, False, False),
-        (False, True, False, False, False, False),
-        (True, True, False, False, False, False),
-        (False, False, True, False, False, False),
-        (False, False, True, True, False, False),
-        (False, False, True, False, True, False),
-        (False, False, True, False, True, True),
+        (False, False, False, False, False, False, False),
+        (True, False, False, False, False, False, False),
+        (False, True, False, False, False, False, False),
+        (True, True, False, False, False, False, False),
+        (False, False, True, False, False, False, False),
+        (False, False, True, True, False, False, False),
+        (False, False, True, False, True, False, False),
+        (False, False, True, False, True, True, False),
+        (False, False, True, False, False, False, True),
+        (False, False, True, False, True, False, True),
     ),
 )
 def test_triton_packed_compact_block_owned_backward_matches_token_route_on_sm90(
         monkeypatch, transpose_dkv, group_union, table_scan, table_scan_full,
-        table_recompute, split_recompute):
+        table_recompute, split_recompute, coselect_order):
     """Exercise packed block ownership on aligned multi-segment routes."""
 
     if torch.cuda.get_device_capability() != (9, 0):
@@ -2095,6 +2099,9 @@ def test_triton_packed_compact_block_owned_backward_matches_token_route_on_sm90(
     monkeypatch.setenv(
         'MCORE_BRIDGE_QSA_SEGMENT_SPLIT_RECOMPUTE_DKV',
         '1' if split_recompute else '0')
+    monkeypatch.setenv(
+        'MCORE_BRIDGE_QSA_SEGMENT_COSELECT_ORDER',
+        '1' if coselect_order else '0')
     torch.manual_seed(3142)
     device = 'cuda'
     segments = (20, 16)

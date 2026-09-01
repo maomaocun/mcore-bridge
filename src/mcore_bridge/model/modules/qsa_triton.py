@@ -9834,6 +9834,8 @@ def qsa_segmented_dkv_reduce(
     table_recompute = os.environ.get(
         'MCORE_BRIDGE_QSA_SEGMENT_TABLE_RECOMPUTE_DERIVATIVES',
         '0') != '0'
+    co_select_order = os.environ.get(
+        'MCORE_BRIDGE_QSA_SEGMENT_COSELECT_ORDER', '0') != '0'
     flatten_default = (
         is_sm90(query.device)
         and grad_key.dtype == torch.bfloat16
@@ -10029,6 +10031,61 @@ def qsa_segmented_dkv_reduce(
             table_scan = False
         else:
             active_view = group_active.view(batch * table_group_count, sq)
+            if co_select_order and group_blocks > 1:
+                # Diagnostic only: measure owner query-set overlap after the
+                # device table build, then greedily pack the most compatible
+                # owner columns together.  The small host plan is deliberate
+                # here; production must carry this order from route creation
+                # instead of synchronizing during backward.
+                owner_active = (
+                    owner_occurrence_table.view(batch * sq, owner_count) >= 0)
+                overlap = torch.matmul(
+                    owner_active.transpose(0, 1).to(torch.float32),
+                    owner_active.to(torch.float32),
+                ).cpu()
+                remaining = list(range(owner_count))
+                ordered_columns = []
+                while remaining:
+                    seed = max(
+                        remaining,
+                        key=lambda index: int(overlap[index, remaining].max()),
+                    )
+                    remaining.remove(seed)
+                    group_columns = [seed]
+                    for _ in range(group_blocks - 1):
+                        if not remaining:
+                            break
+                        candidate = max(
+                            remaining,
+                            key=lambda index: sum(
+                                int(overlap[index, member])
+                                for member in group_columns
+                            ),
+                        )
+                        remaining.remove(candidate)
+                        group_columns.append(candidate)
+                    ordered_columns.extend(group_columns)
+                order = torch.tensor(
+                    ordered_columns, device=query.device, dtype=torch.long)
+                owner_block_ids = owner_block_ids.index_select(0, order)
+                owner_occurrence_table = (
+                    owner_occurrence_table.view(batch * sq, owner_count)
+                    .index_select(1, order)
+                    .reshape(-1)
+                    .contiguous()
+                )
+                owner_active = (
+                    owner_occurrence_table.view(batch * sq, owner_count) >= 0)
+                padded_active = torch.zeros(
+                    (batch * sq, table_group_count * group_blocks),
+                    device=query.device,
+                    dtype=torch.bool,
+                )
+                padded_active[:, :owner_count] = owner_active
+                group_active = padded_active.view(
+                    batch, sq, table_group_count, group_blocks
+                ).any(dim=3).permute(0, 2, 1).reshape(-1).to(torch.int32)
+                active_view = group_active.view(batch * table_group_count, sq)
             group_counts = active_view.sum(dim=1, dtype=torch.int32)
             group_starts = torch.empty(
                 batch * table_group_count + 1,
