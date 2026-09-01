@@ -638,7 +638,7 @@ class _QSASelectedKVFunction(Function):
 
 
 class _QSASelectedKVPackedFunction(Function):
-    """Autograd bridge for the single-launch packed THD Triton path."""
+    """Autograd bridge for the fixed-grid packed THD Triton path."""
 
     @staticmethod
     def forward(
@@ -890,8 +890,10 @@ def qsa_sparse_forward_packed(
     ``topk_indices`` contains segment-local token IDs, or compact complete-
     block IDs when ``route_block_size > 1``, as produced by
     ``QSAIndexer.select_topk_packed``.  The Triton/atomic path uses one varlen
-    launch for all segments; the torch and segmented-reduction paths retain the
-    auditable per-segment fallback until their metadata contracts are fused.
+    grid for all segments, or two device-filtered grids when a large pack
+    mixes short and long segments.  The torch and segmented-reduction paths
+    retain the auditable per-segment fallback until their metadata contracts
+    are fused.
     """
 
     if query.ndim == 3:

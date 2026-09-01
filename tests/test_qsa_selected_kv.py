@@ -1803,3 +1803,78 @@ def test_triton_packed_compact_block_route_matches_token_route():
     )
     assert torch.allclose(actual[0].float(), reference[0].float(), atol=2e-2, rtol=2e-2)
     assert torch.allclose(actual[1], reference[1], atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_triton_packed_segment_dispatch_matches_single_grid_on_sm90(monkeypatch):
+    """Guard device-side short/long routing in a large mixed THD pack."""
+
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('requires H100/SM90')
+    torch.manual_seed(1618)
+    device = 'cuda'
+    # logical K=19 gives the auto-trim boundary 8*K=152.  The total pack and
+    # second document exceed it, while the first document stays below it, so
+    # both filtered launches own real rows.
+    segments = (31, 160)
+    total = sum(segments)
+    hq, hkv, dim, ratio, block_topk = 12, 2, 64, 4, 4
+    cu = torch.tensor(
+        [0, segments[0], total], device=device, dtype=torch.int32)
+    local_positions = torch.cat(tuple(
+        torch.arange(length, device=device, dtype=torch.int32)
+        for length in segments
+    ))
+    blocks = torch.full(
+        (1, total, block_topk), -1, device=device, dtype=torch.int32)
+    lengths = torch.zeros((1, total), device=device, dtype=torch.int32)
+    for token, position in enumerate(local_positions.tolist()):
+        complete = (position + 1) // ratio
+        selected_count = min(complete, block_topk)
+        if selected_count:
+            blocks[0, token, :selected_count] = torch.arange(
+                selected_count, device=device, dtype=torch.int32)
+        lengths[0, token] = (
+            selected_count * ratio + (position + 1 - complete * ratio))
+
+    query_base = torch.randn(
+        total, hq, dim, device=device, dtype=torch.bfloat16)
+    key_base = torch.randn(
+        total, hkv, dim, device=device, dtype=torch.bfloat16)
+    value_base = torch.randn_like(key_base)
+    grad_output = torch.randn_like(query_base)
+    grad_lse = torch.randn(
+        1, hq, total, device=device, dtype=torch.float32) * 0.01
+
+    def run(enabled):
+        monkeypatch.setenv(
+            'MCORE_BRIDGE_QSA_PACKED_SEGMENT_DISPATCH', str(int(enabled)))
+        query = query_base.detach().clone().requires_grad_()
+        key = key_base.detach().clone().requires_grad_()
+        value = value_base.detach().clone().requires_grad_()
+        output, lse = qsa_sparse_forward_packed(
+            query,
+            key,
+            value,
+            blocks,
+            lengths,
+            cu,
+            cu,
+            backend='triton',
+            require_backend=True,
+            selected_token_group_size=ratio,
+            route_block_size=ratio,
+        )
+        ((output.float() * grad_output.float()).sum()
+         + (lse * grad_lse).sum()).backward()
+        return output.detach(), lse.detach(), query.grad, key.grad, value.grad
+
+    single_grid = run(False)
+    dispatched = run(True)
+    assert torch.equal(dispatched[0], single_grid[0])
+    assert torch.equal(dispatched[1], single_grid[1])
+    assert torch.equal(dispatched[2], single_grid[2])
+    for actual_grad, reference_grad in zip(dispatched[3:], single_grid[3:]):
+        difference = actual_grad.float() - reference_grad.float()
+        assert difference.abs().mean().item() < 2e-2
+        assert difference.norm().item() / reference_grad.float().norm().item() < 2e-2

@@ -2888,12 +2888,26 @@ if TRITON_AVAILABLE:
         BLOCK_D: tl.constexpr,
         CAUSAL: tl.constexpr,
         TRIM_CAUSAL_LOOP: tl.constexpr,
+        SEGMENT_FILTER: tl.constexpr,
         ROUTE_SLOTS: tl.constexpr,
         ROUTE_BLOCK_SIZE: tl.constexpr,
     ):
         """Packed-THD selected-KV forward with one launch for all segments."""
 
         token = tl.program_id(0)
+        key_length = tl.load(
+            key_length_ptr + token * stride_klt).to(tl.int32)
+        # In a large THD pack, total_q does not describe any individual
+        # document.  Auto mode launches two fixed grids: short segments take
+        # the runtime causal bound, while long segments retain the pipelined
+        # static loop.  Filter before Q/K/V loads so the non-owning grid is a
+        # metadata-only exit and remains CUDA Graph capturable.
+        if SEGMENT_FILTER == 1:
+            if key_length > 8 * K:
+                return
+        elif SEGMENT_FILTER == 2:
+            if key_length <= 8 * K:
+                return
         head_tile_program = tl.program_id(1)
         kv_head = head_tile_program // NUM_HEAD_TILES
         head_tile = head_tile_program % NUM_HEAD_TILES
@@ -2917,7 +2931,6 @@ if TRITON_AVAILABLE:
         ).to(tl.bfloat16)
         length = tl.load(length_ptr + token * stride_lt).to(tl.int32)
         key_start = tl.load(key_start_ptr + token * stride_kst).to(tl.int32)
-        key_length = tl.load(key_length_ptr + token * stride_klt).to(tl.int32)
         query_position = tl.load(query_position_ptr + token * stride_qpt).to(tl.int32)
         max_value = tl.full((HEADS_PER_KV,), -float("inf"), tl.float32)
         denominator = tl.zeros((HEADS_PER_KV,), dtype=tl.float32)
@@ -3450,12 +3463,21 @@ if TRITON_AVAILABLE:
         DKV_ACCUM_BF16: tl.constexpr,
         TENSORIZE_DERIVATIVES: tl.constexpr,
         TRIM_CAUSAL_LOOP: tl.constexpr,
+        SEGMENT_FILTER: tl.constexpr,
         ROUTE_SLOTS: tl.constexpr,
         ROUTE_BLOCK_SIZE: tl.constexpr,
     ):
         """Packed-THD backward with recompute and relaxed dK/dV atomics."""
 
         token = tl.program_id(0)
+        key_length = tl.load(
+            key_length_ptr + token * stride_klt).to(tl.int32)
+        if SEGMENT_FILTER == 1:
+            if key_length > 8 * K:
+                return
+        elif SEGMENT_FILTER == 2:
+            if key_length <= 8 * K:
+                return
         head_tile_program = tl.program_id(1)
         kv_head = head_tile_program // NUM_HEAD_TILES
         head_tile = head_tile_program % NUM_HEAD_TILES
@@ -3493,7 +3515,6 @@ if TRITON_AVAILABLE:
         query_position = tl.load(query_position_ptr + token * stride_qpt).to(tl.int32)
         length = tl.load(length_ptr + token * stride_lt).to(tl.int32)
         key_start = tl.load(key_start_ptr + token * stride_kst).to(tl.int32)
-        key_length = tl.load(key_length_ptr + token * stride_klt).to(tl.int32)
         lse = tl.load(
             lse_ptr + heads * stride_lseh + token * stride_lset,
             mask=head_valid,
@@ -7037,7 +7058,7 @@ def qsa_selected_kv_forward_packed(
     key_position_offset: int = 0,
     route_block_size: int = 1,
 ) -> tuple:
-    """Launch one selected-KV forward kernel over all packed THD segments."""
+    """Launch fixed-grid selected-KV forward over packed THD segments."""
 
     if not TRITON_AVAILABLE:
         raise RuntimeError("QSA Triton kernels require triton to be installed")
@@ -7121,12 +7142,24 @@ def qsa_selected_kv_forward_packed(
     }
     if forward_maxnreg:
         launch_options['maxnreg'] = forward_maxnreg
-    # As in packed backward, total_q is conservative and avoids reading a
-    # GPU-resident maximum document length onto the host.
+    # A total-token heuristic is valid only when the whole THD pack behaves
+    # like one document.  In auto mode, a large pack may still contain many
+    # short documents.  Split it with device-side per-token segment filters
+    # instead of synchronizing on max(key_lengths): the short launch trims its
+    # loop, while the long launch preserves the static software pipeline.
     trim_causal_loop = _qsa_trim_causal_loop(causal, total_q, logical_k)
-    _qsa_selected_kv_forward_packed_grouped_kernel[
-        (total_q, num_kv_heads * num_head_tiles)
-    ](
+    causal_loop_mode = os.environ.get(
+        'MCORE_BRIDGE_QSA_TRIM_CAUSAL_LOOP',
+        os.environ.get('MCORE_BRIDGE_QSA_BACKWARD_TRIM_CAUSAL_LOOP', 'auto'),
+    ).lower()
+    segment_dispatch = (
+        causal
+        and causal_loop_mode == 'auto'
+        and not trim_causal_loop
+        and os.environ.get(
+            'MCORE_BRIDGE_QSA_PACKED_SEGMENT_DISPATCH', '1') != '0'
+    )
+    kernel_args = (
         query,
         key,
         value,
@@ -7164,18 +7197,32 @@ def qsa_selected_kv_forward_packed(
         output.stride(2),
         lse.stride(0),
         lse.stride(1),
-        K=logical_k,
-        HEADS_PER_KV=head_tile_size,
-        GROUP_SIZE=group_size,
-        NUM_HEAD_TILES=num_head_tiles,
-        BLOCK_K=block_k,
-        BLOCK_D=block_d,
-        CAUSAL=causal,
-        TRIM_CAUSAL_LOOP=trim_causal_loop,
-        ROUTE_SLOTS=route_slots,
-        ROUTE_BLOCK_SIZE=route_block_size,
-        **launch_options,
     )
+
+    def launch(trim_loop: bool, segment_filter: int) -> None:
+        _qsa_selected_kv_forward_packed_grouped_kernel[
+            (total_q, num_kv_heads * num_head_tiles)
+        ](
+            *kernel_args,
+            K=logical_k,
+            HEADS_PER_KV=head_tile_size,
+            GROUP_SIZE=group_size,
+            NUM_HEAD_TILES=num_head_tiles,
+            BLOCK_K=block_k,
+            BLOCK_D=block_d,
+            CAUSAL=causal,
+            TRIM_CAUSAL_LOOP=trim_loop,
+            SEGMENT_FILTER=segment_filter,
+            ROUTE_SLOTS=route_slots,
+            ROUTE_BLOCK_SIZE=route_block_size,
+            **launch_options,
+        )
+
+    if segment_dispatch:
+        launch(True, 1)
+        launch(False, 2)
+    else:
+        launch(trim_causal_loop, 0)
     return output, lse
 
 
@@ -8095,7 +8142,7 @@ def qsa_selected_kv_backward_packed(
     output: torch.Tensor = None,
     route_block_size: int = 1,
 ) -> tuple:
-    """Launch one packed-THD selected-KV backward with relaxed dK/dV atomics.
+    """Launch packed-THD selected-KV backward with relaxed dK/dV atomics.
 
     ``output`` enables the same allocation-free output-delta correction used
     by the unpacked launcher.
@@ -8223,13 +8270,19 @@ def qsa_selected_kv_backward_packed(
         'MCORE_BRIDGE_QSA_BACKWARD_STAGES', str(default_num_stages)))
     if num_warps not in {1, 2, 4, 8} or num_stages not in {1, 2, 3, 4}:
         raise ValueError('QSA packed backward tuning has invalid warps/stages')
-    # total_q is a conservative proxy for the longest packed document.  It
-    # enables the profitable short-document variant without synchronizing on
-    # GPU-resident per-token key lengths.
     trim_causal_loop = _qsa_trim_causal_loop(causal, total_q, logical_k)
-    _qsa_selected_kv_backward_packed_grouped_kernel[
-        (total_q, num_kv_heads * num_head_tiles)
-    ](
+    causal_loop_mode = os.environ.get(
+        'MCORE_BRIDGE_QSA_TRIM_CAUSAL_LOOP',
+        os.environ.get('MCORE_BRIDGE_QSA_BACKWARD_TRIM_CAUSAL_LOOP', 'auto'),
+    ).lower()
+    segment_dispatch = (
+        causal
+        and causal_loop_mode == 'auto'
+        and not trim_causal_loop
+        and os.environ.get(
+            'MCORE_BRIDGE_QSA_PACKED_SEGMENT_DISPATCH', '1') != '0'
+    )
+    kernel_args = (
         query,
         key,
         value,
@@ -8286,25 +8339,39 @@ def qsa_selected_kv_backward_packed(
         key_starts.stride(0),
         key_lengths.stride(0),
         query_positions.stride(0),
-        K=logical_k,
-        HEADS_PER_KV=head_tile_size,
-        GROUP_SIZE=group_size,
-        NUM_HEAD_TILES=num_head_tiles,
-        BLOCK_K=block_k,
-        CORRECTION_BLOCK_K=correction_block_k,
-        BLOCK_D=block_d,
-        CAUSAL=causal,
-        HAS_GRAD_OUTPUT=grad_output_present,
-        HAS_GRAD_LSE=grad_lse_present,
-        USE_OUTPUT_DELTA=use_output_delta,
-        DKV_ACCUM_BF16=dkv_accum_dtype == 'bf16',
-        TENSORIZE_DERIVATIVES=tensorize_derivatives,
-        TRIM_CAUSAL_LOOP=trim_causal_loop,
-        ROUTE_SLOTS=route_slots,
-        ROUTE_BLOCK_SIZE=route_block_size,
-        num_warps=num_warps,
-        num_stages=num_stages,
     )
+
+    def launch(trim_loop: bool, segment_filter: int) -> None:
+        _qsa_selected_kv_backward_packed_grouped_kernel[
+            (total_q, num_kv_heads * num_head_tiles)
+        ](
+            *kernel_args,
+            K=logical_k,
+            HEADS_PER_KV=head_tile_size,
+            GROUP_SIZE=group_size,
+            NUM_HEAD_TILES=num_head_tiles,
+            BLOCK_K=block_k,
+            CORRECTION_BLOCK_K=correction_block_k,
+            BLOCK_D=block_d,
+            CAUSAL=causal,
+            HAS_GRAD_OUTPUT=grad_output_present,
+            HAS_GRAD_LSE=grad_lse_present,
+            USE_OUTPUT_DELTA=use_output_delta,
+            DKV_ACCUM_BF16=dkv_accum_dtype == 'bf16',
+            TENSORIZE_DERIVATIVES=tensorize_derivatives,
+            TRIM_CAUSAL_LOOP=trim_loop,
+            SEGMENT_FILTER=segment_filter,
+            ROUTE_SLOTS=route_slots,
+            ROUTE_BLOCK_SIZE=route_block_size,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+
+    if segment_dispatch:
+        launch(True, 1)
+        launch(False, 2)
+    else:
+        launch(trim_causal_loop, 0)
     return grad_query.to(query.dtype), grad_key.to(key.dtype), grad_value.to(value.dtype)
 
 
