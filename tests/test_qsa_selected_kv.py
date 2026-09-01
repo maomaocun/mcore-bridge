@@ -1617,7 +1617,7 @@ def test_triton_segmented_dkv_matches_relaxed_atomic_on_sm90(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
-@pytest.mark.parametrize('block_occ', (2, 4))
+@pytest.mark.parametrize('block_occ', (1, 2, 4))
 @pytest.mark.parametrize('block_list', (False, True))
 def test_triton_flat_head_owner_matches_reference_on_sm90(
         monkeypatch, block_occ, block_list):
