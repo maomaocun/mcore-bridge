@@ -4330,6 +4330,7 @@ if TRITON_AVAILABLE:
         HAS_GRAD_OUTPUT: tl.constexpr,
         HAS_GRAD_LSE: tl.constexpr,
         DKV_ACCUM_BF16: tl.constexpr,
+        TRANSPOSE_DKV: tl.constexpr,
         BATCH_ONE: tl.constexpr,
         SPLIT_HEADS: tl.constexpr,
         USE_SAVED_SCORES: tl.constexpr,
@@ -4397,8 +4398,12 @@ if TRITON_AVAILABLE:
                 mask=key_mask[:, None] & (d_offsets[None, :] < head_dim),
                 other=0.0,
             )
-        grad_key_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
-        grad_value_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
+        if TRANSPOSE_DKV:
+            grad_key_acc = tl.zeros((BLOCK_D, RATIO), dtype=tl.float32)
+            grad_value_acc = tl.zeros((BLOCK_D, RATIO), dtype=tl.float32)
+        else:
+            grad_key_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
+            grad_value_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
 
         for occurrence_offset in tl.range(
             0, segment_end - segment_start, BLOCK_OCC
@@ -4635,7 +4640,30 @@ if TRITON_AVAILABLE:
                     grad_score,
                     0.0,
                 )
-                if DKV_ACCUM_BF16:
+                if TRANSPOSE_DKV:
+                    if DKV_ACCUM_BF16:
+                        grad_key_acc += tl.dot(
+                            tl.trans(q_value_raw),
+                            grad_score.to(tl.bfloat16),
+                            out_dtype=tl.float32,
+                        ) * softmax_scale
+                        grad_value_acc += tl.dot(
+                            tl.trans(grad_output_raw),
+                            probability.to(tl.bfloat16),
+                            out_dtype=tl.float32,
+                        )
+                    else:
+                        q_value = q_value_raw.to(tl.float32)
+                        grad_output = grad_output_raw.to(tl.float32)
+                        grad_key_acc += tl.sum(
+                            q_value[:, :, None] * grad_score[:, None, :],
+                            axis=0,
+                        ) * softmax_scale
+                        grad_value_acc += tl.sum(
+                            grad_output[:, :, None] * probability[:, None, :],
+                            axis=0,
+                        )
+                elif DKV_ACCUM_BF16:
                     grad_key_acc += tl.dot(
                         tl.trans(grad_score.to(tl.bfloat16)),
                         q_value_raw,
@@ -4675,30 +4703,36 @@ if TRITON_AVAILABLE:
             + d_offsets[None, :] * stride_dvd
         )
         output_mask = key_mask[:, None] & (d_offsets[None, :] < head_dim)
+        if TRANSPOSE_DKV:
+            grad_key_output = tl.trans(grad_key_acc)
+            grad_value_output = tl.trans(grad_value_acc)
+        else:
+            grad_key_output = grad_key_acc
+            grad_value_output = grad_value_acc
         if SPLIT_HEADS:
             if DKV_ACCUM_BF16:
                 tl.atomic_add(
                     key_output_ptrs,
-                    grad_key_acc.to(tl.bfloat16),
+                    grad_key_output.to(tl.bfloat16),
                     mask=output_mask,
                     sem="relaxed",
                 )
                 tl.atomic_add(
                     value_output_ptrs,
-                    grad_value_acc.to(tl.bfloat16),
+                    grad_value_output.to(tl.bfloat16),
                     mask=output_mask,
                     sem="relaxed",
                 )
             else:
                 tl.atomic_add(
                     key_output_ptrs,
-                    grad_key_acc,
+                    grad_key_output,
                     mask=output_mask,
                     sem="relaxed",
                 )
                 tl.atomic_add(
                     value_output_ptrs,
-                    grad_value_acc,
+                    grad_value_output,
                     mask=output_mask,
                     sem="relaxed",
                 )
@@ -4712,22 +4746,22 @@ if TRITON_AVAILABLE:
             existing_value = tl.load(
                 value_output_ptrs, mask=output_mask, other=0.0
             ).to(tl.float32)
-            grad_key_acc += existing_key
-            grad_value_acc += existing_value
+            grad_key_output += existing_key
+            grad_value_output += existing_value
             if DKV_ACCUM_BF16:
                 tl.store(
                     key_output_ptrs,
-                    grad_key_acc.to(tl.bfloat16),
+                    grad_key_output.to(tl.bfloat16),
                     mask=output_mask,
                 )
                 tl.store(
                     value_output_ptrs,
-                    grad_value_acc.to(tl.bfloat16),
+                    grad_value_output.to(tl.bfloat16),
                     mask=output_mask,
                 )
             else:
-                tl.store(key_output_ptrs, grad_key_acc, mask=output_mask)
-                tl.store(value_output_ptrs, grad_value_acc, mask=output_mask)
+                tl.store(key_output_ptrs, grad_key_output, mask=output_mask)
+                tl.store(value_output_ptrs, grad_value_output, mask=output_mask)
 
     @triton.jit
     def _qsa_segmented_dkv_reduce_flattened_kernel(
@@ -4805,6 +4839,7 @@ if TRITON_AVAILABLE:
         HAS_GRAD_OUTPUT: tl.constexpr,
         HAS_GRAD_LSE: tl.constexpr,
         DKV_ACCUM_BF16: tl.constexpr,
+        TRANSPOSE_DKV: tl.constexpr,
         BATCH_ONE: tl.constexpr,
         SPLIT_HEADS: tl.constexpr,
         USE_SAVED_SCORES: tl.constexpr,
@@ -4868,8 +4903,12 @@ if TRITON_AVAILABLE:
                 mask=key_mask[:, None] & (d_offsets[None, :] < head_dim),
                 other=0.0,
             )
-        grad_key_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
-        grad_value_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
+        if TRANSPOSE_DKV:
+            grad_key_acc = tl.zeros((BLOCK_D, RATIO), dtype=tl.float32)
+            grad_value_acc = tl.zeros((BLOCK_D, RATIO), dtype=tl.float32)
+        else:
+            grad_key_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
+            grad_value_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
         flat_offsets = tl.arange(0, BLOCK_M)
         occurrence_lanes = flat_offsets // HEAD_TILE
         head_lanes = flat_offsets - occurrence_lanes * HEAD_TILE
@@ -5061,7 +5100,30 @@ if TRITON_AVAILABLE:
                 grad_score,
                 0.0,
             )
-            if DKV_ACCUM_BF16:
+            if TRANSPOSE_DKV:
+                if DKV_ACCUM_BF16:
+                    grad_key_acc += tl.dot(
+                        tl.trans(q_value_raw),
+                        grad_score.to(tl.bfloat16),
+                        out_dtype=tl.float32,
+                    ) * softmax_scale
+                    grad_value_acc += tl.dot(
+                        tl.trans(grad_output_raw),
+                        probability.to(tl.bfloat16),
+                        out_dtype=tl.float32,
+                    )
+                else:
+                    q_value = q_value_raw.to(tl.float32)
+                    grad_output = grad_output_raw.to(tl.float32)
+                    grad_key_acc += tl.sum(
+                        q_value[:, :, None] * grad_score[:, None, :],
+                        axis=0,
+                    ) * softmax_scale
+                    grad_value_acc += tl.sum(
+                        grad_output[:, :, None] * probability[:, None, :],
+                        axis=0,
+                    )
+            elif DKV_ACCUM_BF16:
                 grad_key_acc += tl.dot(
                     tl.trans(grad_score.to(tl.bfloat16)),
                     q_value_raw,
@@ -5101,30 +5163,36 @@ if TRITON_AVAILABLE:
             + d_offsets[None, :] * stride_dvd
         )
         output_mask = key_mask[:, None] & (d_offsets[None, :] < head_dim)
+        if TRANSPOSE_DKV:
+            grad_key_output = tl.trans(grad_key_acc)
+            grad_value_output = tl.trans(grad_value_acc)
+        else:
+            grad_key_output = grad_key_acc
+            grad_value_output = grad_value_acc
         if SPLIT_HEADS:
             if DKV_ACCUM_BF16:
                 tl.atomic_add(
                     key_output_ptrs,
-                    grad_key_acc.to(tl.bfloat16),
+                    grad_key_output.to(tl.bfloat16),
                     mask=output_mask,
                     sem="relaxed",
                 )
                 tl.atomic_add(
                     value_output_ptrs,
-                    grad_value_acc.to(tl.bfloat16),
+                    grad_value_output.to(tl.bfloat16),
                     mask=output_mask,
                     sem="relaxed",
                 )
             else:
                 tl.atomic_add(
                     key_output_ptrs,
-                    grad_key_acc,
+                    grad_key_output,
                     mask=output_mask,
                     sem="relaxed",
                 )
                 tl.atomic_add(
                     value_output_ptrs,
-                    grad_value_acc,
+                    grad_value_output,
                     mask=output_mask,
                     sem="relaxed",
                 )
@@ -5136,22 +5204,22 @@ if TRITON_AVAILABLE:
             existing_value = tl.load(
                 value_output_ptrs, mask=output_mask, other=0.0
             ).to(tl.float32)
-            grad_key_acc += existing_key
-            grad_value_acc += existing_value
+            grad_key_output += existing_key
+            grad_value_output += existing_value
             if DKV_ACCUM_BF16:
                 tl.store(
                     key_output_ptrs,
-                    grad_key_acc.to(tl.bfloat16),
+                    grad_key_output.to(tl.bfloat16),
                     mask=output_mask,
                 )
                 tl.store(
                     value_output_ptrs,
-                    grad_value_acc.to(tl.bfloat16),
+                    grad_value_output.to(tl.bfloat16),
                     mask=output_mask,
                 )
             else:
-                tl.store(key_output_ptrs, grad_key_acc, mask=output_mask)
-                tl.store(value_output_ptrs, grad_value_acc, mask=output_mask)
+                tl.store(key_output_ptrs, grad_key_output, mask=output_mask)
+                tl.store(value_output_ptrs, grad_value_output, mask=output_mask)
 
     @triton.jit
     def _qsa_segmented_dkv_reduce_persistent_kernel(
@@ -8999,6 +9067,10 @@ def qsa_segmented_dkv_reduce(
     if flatten_heads and grad_key.dtype != torch.bfloat16:
         raise ValueError(
             'QSA flattened segmented reducer currently requires BF16 dK/dV accumulation')
+    transpose_dkv = (
+        flatten_heads
+        and os.environ.get('MCORE_BRIDGE_QSA_SEGMENT_TRANSPOSE_DKV', '0') != '0'
+    )
     owner_block_list_workspace = (
         owner_block_list if owner_block_list is not None else starts)
     owner_group_count = (
@@ -9159,6 +9231,7 @@ def qsa_segmented_dkv_reduce(
         'HAS_GRAD_OUTPUT': True,
         'HAS_GRAD_LSE': grad_lse is not lse,
         'DKV_ACCUM_BF16': grad_key.dtype == torch.bfloat16,
+        'TRANSPOSE_DKV': transpose_dkv,
         'BATCH_ONE': batch == 1,
         'SPLIT_HEADS': num_segment_head_tiles > 1,
         'BLOCK_TOPK': block_topk,

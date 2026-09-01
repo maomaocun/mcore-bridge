@@ -2000,7 +2000,9 @@ def test_triton_packed_compact_block_route_matches_token_route():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
-def test_triton_packed_compact_block_owned_backward_matches_token_route_on_sm90(monkeypatch):
+@pytest.mark.parametrize('transpose_dkv', (False, True))
+def test_triton_packed_compact_block_owned_backward_matches_token_route_on_sm90(
+        monkeypatch, transpose_dkv):
     """Exercise packed block ownership on aligned multi-segment routes."""
 
     if torch.cuda.get_device_capability() != (9, 0):
@@ -2009,6 +2011,9 @@ def test_triton_packed_compact_block_owned_backward_matches_token_route_on_sm90(
     monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_REUSE_DERIVATIVES', '1')
     monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_SCORE_DTYPE', 'bf16')
     monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_D_SCORE_DTYPE', 'bf16')
+    monkeypatch.setenv(
+        'MCORE_BRIDGE_QSA_SEGMENT_TRANSPOSE_DKV',
+        '1' if transpose_dkv else '0')
     torch.manual_seed(3142)
     device = 'cuda'
     segments = (20, 16)
