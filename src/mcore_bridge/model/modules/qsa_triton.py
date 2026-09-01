@@ -9336,6 +9336,38 @@ def qsa_prepare_segmented_metadata(
     return occurrences, starts, block_topk, num_blocks, owner_mask
 
 
+def qsa_prepare_segmented_owner_occurrence_map(
+    segmented_metadata,
+    batch: int,
+    seq_len_q: int,
+):
+    """Build the compact owner reverse map for forward/backward reuse."""
+
+    if not TRITON_AVAILABLE:
+        raise RuntimeError('QSA Triton kernels require triton to be installed')
+    occurrences, starts, block_topk, _ = segmented_metadata[:4]
+    total_occurrences = int(starts[-1].item())
+    if total_occurrences <= 0:
+        return None
+    occurrence_map = torch.full(
+        (batch * seq_len_q * block_topk,),
+        -1,
+        device=occurrences.device,
+        dtype=torch.int32,
+    )
+    reverse_grid = triton.cdiv(batch * seq_len_q * block_topk, 256)
+    _qsa_segment_reverse_blocks_kernel[(reverse_grid,)](
+        occurrences,
+        occurrence_map,
+        total_occurrences,
+        block_topk,
+        BLOCK_SIZE=256,
+        num_warps=4,
+        num_stages=1,
+    )
+    return occurrence_map
+
+
 def _qsa_prepare_segmented_query_union(
     segmented_metadata,
     batch: int,
@@ -10879,6 +10911,13 @@ def qsa_selected_kv_backward(
     owner_block_mask = None
     owner_occurrence_map = None
     owner_occurrence_count = 0
+    resident_owner_occurrence_map = (
+        segmented_metadata[5]
+        if segmented_metadata is not None
+        and len(segmented_metadata) >= 6
+        and torch.is_tensor(segmented_metadata[5])
+        else None
+    )
     compact_derivatives_requested = (
         use_segmented_reduction
         and os.environ.get(
@@ -10917,7 +10956,16 @@ def qsa_selected_kv_backward(
                 raise RuntimeError(
                     'QSA compact derivative reuse requires a compact block route')
             owner_occurrence_count = int(segmented_metadata[1][-1].item())
-            if owner_occurrence_count > 0:
+            if resident_owner_occurrence_map is not None:
+                expected_map_shape = (
+                    batch * sq * segmented_metadata[2],)
+                if (resident_owner_occurrence_map.shape != expected_map_shape
+                        or resident_owner_occurrence_map.device != query.device
+                        or resident_owner_occurrence_map.dtype != torch.int32):
+                    raise ValueError(
+                        'QSA resident owner occurrence map shape/device/dtype mismatch')
+                owner_occurrence_map = resident_owner_occurrence_map
+            elif owner_occurrence_count > 0:
                 owner_occurrence_map = torch.full(
                     (batch * sq * segmented_metadata[2],),
                     -1,

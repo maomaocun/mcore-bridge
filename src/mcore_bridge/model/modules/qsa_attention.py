@@ -620,6 +620,32 @@ class _QSASelectedKVFunction(Function):
                 route_block_size=route_block_size,
                 owner_min_fanout=hybrid_min_fanout,
             )
+            resident_owner_map = (
+                os.environ.get(
+                    'MCORE_BRIDGE_QSA_SEGMENT_RESIDENT_OWNER_MAP', '0')
+                != '0'
+                and (
+                    os.environ.get(
+                        'MCORE_BRIDGE_QSA_SEGMENT_COMPACT_DERIVATIVES',
+                        '0') != '0'
+                    or os.environ.get(
+                        'MCORE_BRIDGE_QSA_SEGMENT_TABLE_RECOMPUTE_DERIVATIVES',
+                        '0') != '0'
+                )
+            )
+            if resident_owner_map:
+                from .qsa_triton import (
+                    qsa_prepare_segmented_owner_occurrence_map)
+
+                owner_occurrence_map = (
+                    qsa_prepare_segmented_owner_occurrence_map(
+                        ctx.segmented_metadata,
+                        query.shape[1],
+                        query.shape[0],
+                    ))
+                if owner_occurrence_map is not None:
+                    ctx.segmented_metadata = (
+                        *ctx.segmented_metadata, owner_occurrence_map)
         # Backward can recover the softmax correction as ``sum(output *
         # grad_output)``.  Saving the already-materialized output avoids a
         # second full selected-K/V scan without allocating another tensor.
