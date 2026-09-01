@@ -461,7 +461,7 @@ class Qwen4ExpLayer(TransformerLayer):
         use_compact_block_route = (
             bool(getattr(self.config, 'qsa_compact_block_route', True))
             and resolved.actual == 'triton'
-            and effective_dkv_reduction == 'atomic'
+            and effective_dkv_reduction in {'atomic', 'segmented'}
             and indexer.compress_ratio > 1
         )
         qsa_route_block_size = (

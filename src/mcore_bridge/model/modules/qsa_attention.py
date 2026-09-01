@@ -609,6 +609,7 @@ class _QSASelectedKVFunction(Function):
                 query.shape[0],
                 key.shape[0],
                 int(selected_token_group_size),
+                route_block_size=route_block_size,
             )
         # Backward can recover the softmax correction as ``sum(output *
         # grad_output)``.  Saving the already-materialized output avoids a
@@ -817,7 +818,8 @@ def qsa_sparse_forward(
     ``torch`` backend has identical selected-index semantics and is used for
     parity tests and explicit fallback.  The function never constructs a
     dense attention mask or a full score matrix.  ``dkv_reduction='segmented'``
-    is an experimental inverse-CSR path; ``atomic`` is the tuned default.
+    enables the experimental hybrid/block-owned inverse-CSR dK/dV path; the
+    causal tail remains additive, while ``atomic`` is the tuned default.
     ``route_block_size > 1`` selects the compact complete-block metadata ABI.
     """
 
@@ -850,9 +852,6 @@ def qsa_sparse_forward(
             and int(selected_token_group_size) != route_block_size):
         raise ValueError(
             'QSA compact route block size must match selected_token_group_size')
-    if route_block_size > 1 and effective_dkv_reduction == 'segmented':
-        raise ValueError(
-            'QSA compact block route currently requires atomic dK/dV reduction')
     if route_block_size > 1 and (not causal or int(key_position_offset) != 0):
         raise ValueError(
             'QSA compact block route currently requires causal attention and '
@@ -930,9 +929,9 @@ def qsa_sparse_forward_packed(
     block IDs when ``route_block_size > 1``, as produced by
     ``QSAIndexer.select_topk_packed``.  The Triton/atomic path uses one varlen
     grid for all segments, or two device-filtered grids when a large pack
-    mixes short and long segments.  The torch and segmented-reduction paths
-    retain the auditable per-segment fallback until their metadata contracts
-    are fused.
+    mixes short and long segments.  Aligned packed segmented routes reuse the
+    block-owner schedule in one global launch; other segment layouts retain
+    the auditable per-segment fallback.
     """
 
     if query.ndim == 3:
@@ -993,9 +992,6 @@ def qsa_sparse_forward_packed(
             and int(selected_token_group_size) != route_block_size):
         raise ValueError(
             'QSA packed compact route block size must match selected_token_group_size')
-    if route_block_size > 1 and effective_dkv_reduction != 'atomic':
-        raise ValueError(
-            'QSA packed compact block route currently requires atomic dK/dV reduction')
     if route_block_size > 1 and not causal:
         raise ValueError(
             'QSA packed compact block route currently requires causal attention')
@@ -1051,6 +1047,56 @@ def qsa_sparse_forward_packed(
     key_starts = key_starts.to(torch.int32).contiguous()
     key_lengths = key_lengths.to(torch.int32).contiguous()
     local_positions = local_positions.to(torch.int32).contiguous()
+
+    # A packed segmented reduction can reuse the unpacked block-owner
+    # implementation when Q and KV segments have identical, ratio-aligned
+    # boundaries.  In that case local token/block IDs have a unique global
+    # physical mapping, and global query positions preserve the causal order.
+    # The guard is structural (validated by _packed_boundaries), so it does
+    # not introduce a device-to-host synchronization into graph capture.
+    packed_block_owned = (
+        resolved.actual == 'triton'
+        and effective_dkv_reduction == 'segmented'
+        and selected_token_group_size is not None
+        and q_boundaries == kv_boundaries
+        and all(
+            boundary % int(selected_token_group_size) == 0
+            for boundary in kv_boundaries
+        )
+    )
+    if packed_block_owned:
+        ratio = int(selected_token_group_size)
+        global_positions = key_starts + local_positions
+        if route_block_size > 1:
+            global_indices = torch.where(
+                packed_indices >= 0,
+                packed_indices + key_starts[:, None] // ratio,
+                torch.full_like(packed_indices, -1),
+            )
+        else:
+            global_indices = torch.where(
+                packed_indices >= 0,
+                packed_indices + key_starts[:, None],
+                torch.full_like(packed_indices, -1),
+            )
+        packed_output, packed_lse = qsa_sparse_forward(
+            query_thd,
+            key_thd,
+            value_thd,
+            global_indices.unsqueeze(0),
+            packed_lengths.unsqueeze(0),
+            softmax_scale=softmax_scale,
+            causal=causal,
+            backend='triton',
+            query_positions=global_positions,
+            require_backend=require_backend,
+            dkv_accum_dtype=dkv_accum_dtype,
+            selected_token_group_size=ratio,
+            dkv_reduction='segmented',
+            route_block_size=route_block_size,
+        )
+        output = packed_output
+        return (output.squeeze(1) if squeeze_batch else output), packed_lse
 
     if resolved.actual == 'triton' and effective_dkv_reduction == 'atomic':
         scale = _normalise_scale(softmax_scale, query_thd.shape[-1])

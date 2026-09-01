@@ -3100,6 +3100,8 @@ if TRITON_AVAILABLE:
         grad_q_ptr,
         grad_k_ptr,
         grad_v_ptr,
+        score_ptr,
+        d_score_ptr,
         seq_len_q,
         seq_len_k,
         num_q_heads,
@@ -3152,6 +3154,14 @@ if TRITON_AVAILABLE:
         stride_dvs,
         stride_dvh,
         stride_dvd,
+        stride_scoreb,
+        stride_scores,
+        stride_scoreh,
+        stride_scorek,
+        stride_dscoreb,
+        stride_dscores,
+        stride_dscoreh,
+        stride_dscorek,
         correction_ptr,
         stride_cb,
         stride_ch,
@@ -3177,6 +3187,10 @@ if TRITON_AVAILABLE:
         STORE_CORRECTION: tl.constexpr,
         TAIL_ONLY: tl.constexpr,
         EMIT_DKV: tl.constexpr,
+        STORE_SCORES: tl.constexpr,
+        STORE_DERIVATIVES: tl.constexpr,
+        SCORE_CHUNK: tl.constexpr,
+        SCORE_CHUNKS: tl.constexpr,
     ):
         """Grouped backward with one configurable atomic dK/dV update per GQA head tile."""
 
@@ -3325,6 +3339,26 @@ if TRITON_AVAILABLE:
                 (scores - lse[:, None]) * 1.4426950408889634,
                 -float("inf"),
             ))
+            if STORE_SCORES or STORE_DERIVATIVES:
+                score_chunk_id = query // SCORE_CHUNK
+                score_row = query - score_chunk_id * SCORE_CHUNK
+                score_group = batch * SCORE_CHUNKS + score_chunk_id
+            if STORE_SCORES:
+                score_base = (
+                    score_ptr
+                    + tl.cast(score_group, tl.int64) * stride_scoreb
+                    + tl.cast(score_row, tl.int64) * stride_scores
+                )
+                score_ptrs = (
+                    score_base
+                    + heads[:, None] * stride_scoreh
+                    + key_offsets[None, :] * stride_scorek
+                )
+                tl.store(
+                    score_ptrs,
+                    probabilities,
+                    mask=head_valid[:, None] & valid[None, :],
+                )
             d_probability = tl.dot(
                 grad_output.to(tl.bfloat16),
                 tl.trans(v),
@@ -3333,6 +3367,22 @@ if TRITON_AVAILABLE:
             d_score = probabilities * (d_probability - correction[:, None]) + grad_lse[:, None] * probabilities
             d_score = tl.where(
                 valid[None, :] & head_valid[:, None], d_score, 0.0)
+            if STORE_DERIVATIVES:
+                d_score_base = (
+                    d_score_ptr
+                    + tl.cast(score_group, tl.int64) * stride_dscoreb
+                    + tl.cast(score_row, tl.int64) * stride_dscores
+                )
+                d_score_ptrs = (
+                    d_score_base
+                    + heads[:, None] * stride_dscoreh
+                    + key_offsets[None, :] * stride_dscorek
+                )
+                tl.store(
+                    d_score_ptrs,
+                    d_score,
+                    mask=head_valid[:, None] & valid[None, :],
+                )
             if TENSORIZE_DERIVATIVES:
                 grad_q += tl.dot(
                     d_score.to(tl.bfloat16), k, out_dtype=tl.float32
@@ -3903,6 +3953,7 @@ if TRITON_AVAILABLE:
         HAS_GRAD_LSE: tl.constexpr,
         DKV_ACCUM_BF16: tl.constexpr,
         USE_TOKEN_IDS: tl.constexpr,
+        COMPACT_ROUTE: tl.constexpr,
     ):
         """Accumulate only the causal tail left out of segmented dK/dV.
 
@@ -3988,25 +4039,39 @@ if TRITON_AVAILABLE:
             other=0.0,
         ).to(tl.float32)
 
-        tail_start = tl.minimum(
-            (query_position + 1) // RATIO, SEGMENT_BLOCK_TOPK
-        ) * RATIO
         tail_offsets = tl.arange(0, BLOCK_TAIL)
-        slots = tail_start + tail_offsets
-        selected = tl.load(
-            index_ptr
-            + batch * stride_ib
-            + query * stride_is
-            + slots * stride_ik,
-            mask=slots < K,
-            other=-1,
-        ).to(tl.int32)
-        valid = (
-            (slots < length)
-            & (slots < K)
-            & (selected >= 0)
-            & (selected < seq_len_k)
-        )
+        if COMPACT_ROUTE:
+            # Compact metadata contains complete block IDs only.  The tail is
+            # the incomplete part of the query's current causal block and is
+            # therefore reconstructed from the query position rather than
+            # loaded from a token-route slot.
+            tail_start = ((query_position + 1) // RATIO) * RATIO
+            selected = tail_start + tail_offsets
+            tail_length = length % RATIO
+            valid = (
+                (tail_offsets < tail_length)
+                & (selected >= 0)
+                & (selected < seq_len_k)
+            )
+        else:
+            tail_start = tl.minimum(
+                (query_position + 1) // RATIO, SEGMENT_BLOCK_TOPK
+            ) * RATIO
+            slots = tail_start + tail_offsets
+            selected = tl.load(
+                index_ptr
+                + batch * stride_ib
+                + query * stride_is
+                + slots * stride_ik,
+                mask=slots < K,
+                other=-1,
+            ).to(tl.int32)
+            valid = (
+                (slots < length)
+                & (slots < K)
+                & (selected >= 0)
+                & (selected < seq_len_k)
+            )
         if CAUSAL:
             valid = valid & (
                 selected + key_position_offset <= query_position
@@ -4111,6 +4176,8 @@ if TRITON_AVAILABLE:
         correction_ptr,
         occurrence_query_ptr,
         segment_start_ptr,
+        score_ptr,
+        d_score_ptr,
         grad_key_ptr,
         grad_value_ptr,
         seq_len_q,
@@ -4153,18 +4220,31 @@ if TRITON_AVAILABLE:
         stride_dvs,
         stride_dvh,
         stride_dvd,
+        stride_scoreb,
+        stride_scores,
+        stride_scoreh,
+        stride_scorek,
+        stride_dscoreb,
+        stride_dscores,
+        stride_dscoreh,
+        stride_dscorek,
         RATIO: tl.constexpr,
         GROUP_SIZE: tl.constexpr,
         BLOCK_H: tl.constexpr,
         HEAD_TILE: tl.constexpr,
         NUM_HEAD_TILES: tl.constexpr,
         BLOCK_OCC: tl.constexpr,
+        BLOCK_TOPK: tl.constexpr,
         BLOCK_D: tl.constexpr,
         HAS_GRAD_OUTPUT: tl.constexpr,
         HAS_GRAD_LSE: tl.constexpr,
         DKV_ACCUM_BF16: tl.constexpr,
         BATCH_ONE: tl.constexpr,
         SPLIT_HEADS: tl.constexpr,
+        USE_SAVED_SCORES: tl.constexpr,
+        USE_SAVED_DERIVATIVES: tl.constexpr,
+        SCORE_CHUNK: tl.constexpr,
+        SCORE_CHUNKS: tl.constexpr,
     ):
         """Matrix-tiled inverse-CSR reduction with one owner CTA per head tile.
 
@@ -4201,11 +4281,12 @@ if TRITON_AVAILABLE:
             + kv_head * stride_kh
             + d_offsets[None, :] * stride_kd
         )
-        key_value_raw = tl.load(
-            key_ptrs,
-            mask=key_mask[:, None] & (d_offsets[None, :] < head_dim),
-            other=0.0,
-        )
+        if not USE_SAVED_DERIVATIVES:
+            key_value_raw = tl.load(
+                key_ptrs,
+                mask=key_mask[:, None] & (d_offsets[None, :] < head_dim),
+                other=0.0,
+            )
         value_ptrs = (
             value_ptr
             + batch * stride_vb
@@ -4213,11 +4294,12 @@ if TRITON_AVAILABLE:
             + kv_head * stride_vh
             + d_offsets[None, :] * stride_vd
         )
-        value_value_raw = tl.load(
-            value_ptrs,
-            mask=key_mask[:, None] & (d_offsets[None, :] < head_dim),
-            other=0.0,
-        )
+        if not USE_SAVED_DERIVATIVES:
+            value_value_raw = tl.load(
+                value_ptrs,
+                mask=key_mask[:, None] & (d_offsets[None, :] < head_dim),
+                other=0.0,
+            )
         grad_key_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
         grad_value_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
 
@@ -4229,11 +4311,13 @@ if TRITON_AVAILABLE:
                 + occurrence_offset
                 + tl.arange(0, BLOCK_OCC)
             )
-            row = tl.load(
+            encoded = tl.load(
                 occurrence_query_ptr + occurrence,
                 mask=occurrence < segment_end,
                 other=0,
             ).to(tl.int32)
+            row = encoded // BLOCK_TOPK
+            occurrence_slot = encoded - row * BLOCK_TOPK
             if BATCH_ONE:
                 query_batch = tl.zeros((BLOCK_OCC,), dtype=tl.int32)
                 query = row
@@ -4326,42 +4410,94 @@ if TRITON_AVAILABLE:
                     & HAS_GRAD_OUTPUT,
                     other=0.0,
                 )
-                lse = tl.load(
-                    lse_ptrs,
-                    mask=same_batch & head_valid,
-                    other=0.0,
-                ).to(tl.float32)
-                score = tl.dot(
-                    q_value_raw,
-                    tl.trans(key_value_raw),
-                    out_dtype=tl.float32,
-                ) * softmax_scale
-                probability = tl.exp2(
-                    tl.where(
-                        same_batch[:, None] & head_valid & key_mask[None, :],
-                        (score - lse[:, None]) * 1.4426950408889634,
-                        -float("inf"),
+                if not USE_SAVED_DERIVATIVES:
+                    lse = tl.load(
+                        lse_ptrs,
+                        mask=same_batch & head_valid,
+                        other=0.0,
+                    ).to(tl.float32)
+                    correction = tl.load(
+                        correction_ptrs,
+                        mask=same_batch & head_valid,
+                        other=0.0,
+                    ).to(tl.float32)
+                    grad_lse = tl.load(
+                        grad_lse_ptrs,
+                        mask=same_batch & head_valid & HAS_GRAD_LSE,
+                        other=0.0,
+                    ).to(tl.float32)
+                if USE_SAVED_DERIVATIVES:
+                    score_positions = (
+                        occurrence_slot[:, None] * RATIO
+                        + tl.arange(0, RATIO)[None, :]
                     )
-                )
-                correction = tl.load(
-                    correction_ptrs,
-                    mask=same_batch & head_valid,
-                    other=0.0,
-                ).to(tl.float32)
-                grad_lse = tl.load(
-                    grad_lse_ptrs,
-                    mask=same_batch & head_valid & HAS_GRAD_LSE,
-                    other=0.0,
-                ).to(tl.float32)
-                d_probability = tl.dot(
-                    grad_output_raw,
-                    tl.trans(value_value_raw),
-                    out_dtype=tl.float32,
-                )
-                grad_score = (
-                    probability * (d_probability - correction[:, None])
-                    + grad_lse[:, None] * probability
-                )
+                    score_chunk_id = query // SCORE_CHUNK
+                    score_row = query - score_chunk_id * SCORE_CHUNK
+                    score_group = query_batch * SCORE_CHUNKS + score_chunk_id
+                    score_base = (
+                        score_ptr
+                        + tl.cast(score_group[:, None], tl.int64) * stride_scoreb
+                        + tl.cast(score_row[:, None], tl.int64) * stride_scores
+                    )
+                    probability = tl.load(
+                        score_base
+                        + head * stride_scoreh
+                        + score_positions * stride_scorek,
+                        mask=same_batch[:, None] & head_valid & key_mask[None, :],
+                        other=0.0,
+                    ).to(tl.float32)
+                    grad_score = tl.load(
+                        d_score_ptr
+                        + tl.cast(score_group[:, None], tl.int64) * stride_dscoreb
+                        + tl.cast(score_row[:, None], tl.int64) * stride_dscores
+                        + head * stride_dscoreh
+                        + score_positions * stride_dscorek,
+                        mask=same_batch[:, None] & head_valid & key_mask[None, :],
+                        other=0.0,
+                    ).to(tl.float32)
+                else:
+                    if USE_SAVED_SCORES:
+                        score_positions = (
+                            occurrence_slot[:, None] * RATIO
+                            + tl.arange(0, RATIO)[None, :]
+                        )
+                        score_chunk_id = query // SCORE_CHUNK
+                        score_row = query - score_chunk_id * SCORE_CHUNK
+                        score_group = query_batch * SCORE_CHUNKS + score_chunk_id
+                        score_base = (
+                            score_ptr
+                            + tl.cast(score_group[:, None], tl.int64) * stride_scoreb
+                            + tl.cast(score_row[:, None], tl.int64) * stride_scores
+                        )
+                        probability = tl.load(
+                            score_base
+                            + head * stride_scoreh
+                            + score_positions * stride_scorek,
+                            mask=same_batch[:, None] & head_valid & key_mask[None, :],
+                            other=0.0,
+                        ).to(tl.float32)
+                    else:
+                        score = tl.dot(
+                            q_value_raw,
+                            tl.trans(key_value_raw),
+                            out_dtype=tl.float32,
+                        ) * softmax_scale
+                        probability = tl.exp2(
+                            tl.where(
+                                same_batch[:, None] & head_valid & key_mask[None, :],
+                                (score - lse[:, None]) * 1.4426950408889634,
+                                -float("inf"),
+                            )
+                        )
+                    d_probability = tl.dot(
+                        grad_output_raw,
+                        tl.trans(value_value_raw),
+                        out_dtype=tl.float32,
+                    )
+                    grad_score = (
+                        probability * (d_probability - correction[:, None])
+                        + grad_lse[:, None] * probability
+                    )
                 grad_score = tl.where(
                     same_batch[:, None]
                     & head_valid
@@ -4474,6 +4610,8 @@ if TRITON_AVAILABLE:
         correction_ptr,
         occurrence_query_ptr,
         segment_start_ptr,
+        score_ptr,
+        d_score_ptr,
         grad_key_ptr,
         grad_value_ptr,
         seq_len_q,
@@ -4516,6 +4654,14 @@ if TRITON_AVAILABLE:
         stride_dvs,
         stride_dvh,
         stride_dvd,
+        stride_scoreb,
+        stride_scores,
+        stride_scoreh,
+        stride_scorek,
+        stride_dscoreb,
+        stride_dscores,
+        stride_dscoreh,
+        stride_dscorek,
         RATIO: tl.constexpr,
         GROUP_SIZE: tl.constexpr,
         BLOCK_H: tl.constexpr,
@@ -4523,12 +4669,17 @@ if TRITON_AVAILABLE:
         NUM_HEAD_TILES: tl.constexpr,
         BLOCK_OCC: tl.constexpr,
         BLOCK_M: tl.constexpr,
+        BLOCK_TOPK: tl.constexpr,
         BLOCK_D: tl.constexpr,
         HAS_GRAD_OUTPUT: tl.constexpr,
         HAS_GRAD_LSE: tl.constexpr,
         DKV_ACCUM_BF16: tl.constexpr,
         BATCH_ONE: tl.constexpr,
         SPLIT_HEADS: tl.constexpr,
+        USE_SAVED_SCORES: tl.constexpr,
+        USE_SAVED_DERIVATIVES: tl.constexpr,
+        SCORE_CHUNK: tl.constexpr,
+        SCORE_CHUNKS: tl.constexpr,
     ):
         """Reduce a block with occurrence and GQA-head rows fused into one MMA tile.
 
@@ -4569,16 +4720,17 @@ if TRITON_AVAILABLE:
             + kv_head * stride_vh
             + d_offsets[None, :] * stride_vd
         )
-        key_value_raw = tl.load(
-            key_ptrs,
-            mask=key_mask[:, None] & (d_offsets[None, :] < head_dim),
-            other=0.0,
-        )
-        value_value_raw = tl.load(
-            value_ptrs,
-            mask=key_mask[:, None] & (d_offsets[None, :] < head_dim),
-            other=0.0,
-        )
+        if not USE_SAVED_DERIVATIVES:
+            key_value_raw = tl.load(
+                key_ptrs,
+                mask=key_mask[:, None] & (d_offsets[None, :] < head_dim),
+                other=0.0,
+            )
+            value_value_raw = tl.load(
+                value_ptrs,
+                mask=key_mask[:, None] & (d_offsets[None, :] < head_dim),
+                other=0.0,
+            )
         grad_key_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
         grad_value_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
         flat_offsets = tl.arange(0, BLOCK_M)
@@ -4592,11 +4744,13 @@ if TRITON_AVAILABLE:
             0, segment_end - segment_start, BLOCK_OCC
         ):
             occurrence = segment_start + occurrence_offset + occurrence_lanes
-            row = tl.load(
+            encoded = tl.load(
                 occurrence_query_ptr + occurrence,
                 mask=occurrence < segment_end,
                 other=0,
             ).to(tl.int32)
+            row = encoded // BLOCK_TOPK
+            occurrence_slot = encoded - row * BLOCK_TOPK
             if BATCH_ONE:
                 query_batch = tl.zeros((BLOCK_M,), dtype=tl.int32)
                 query = row
@@ -4635,51 +4789,103 @@ if TRITON_AVAILABLE:
                 & HAS_GRAD_OUTPUT,
                 other=0.0,
             )
-            lse = tl.load(
-                lse_ptr
-                + query_batch * stride_lseb
-                + heads * stride_lseh
-                + query * stride_lses,
-                mask=row_valid,
-                other=0.0,
-            ).to(tl.float32)
-            correction = tl.load(
-                correction_ptr
-                + query_batch * stride_cb
-                + heads * stride_ch
-                + query * stride_cs,
-                mask=row_valid,
-                other=0.0,
-            ).to(tl.float32)
-            grad_lse = tl.load(
-                grad_lse_ptr
-                + query_batch * stride_glseb
-                + heads * stride_glseh
-                + query * stride_glses,
-                mask=row_valid & HAS_GRAD_LSE,
-                other=0.0,
-            ).to(tl.float32)
-            score = tl.dot(
-                q_value_raw,
-                tl.trans(key_value_raw),
-                out_dtype=tl.float32,
-            ) * softmax_scale
-            probability = tl.exp2(
-                tl.where(
-                    row_valid[:, None] & key_mask[None, :],
-                    (score - lse[:, None]) * 1.4426950408889634,
-                    -float("inf"),
+            if not USE_SAVED_DERIVATIVES:
+                lse = tl.load(
+                    lse_ptr
+                    + query_batch * stride_lseb
+                    + heads * stride_lseh
+                    + query * stride_lses,
+                    mask=row_valid,
+                    other=0.0,
+                ).to(tl.float32)
+                correction = tl.load(
+                    correction_ptr
+                    + query_batch * stride_cb
+                    + heads * stride_ch
+                    + query * stride_cs,
+                    mask=row_valid,
+                    other=0.0,
+                ).to(tl.float32)
+                grad_lse = tl.load(
+                    grad_lse_ptr
+                    + query_batch * stride_glseb
+                    + heads * stride_glseh
+                    + query * stride_glses,
+                    mask=row_valid & HAS_GRAD_LSE,
+                    other=0.0,
+                ).to(tl.float32)
+            if USE_SAVED_DERIVATIVES:
+                score_positions = (
+                    occurrence_slot[:, None] * RATIO
+                    + tl.arange(0, RATIO)[None, :]
                 )
-            )
-            d_probability = tl.dot(
-                grad_output_raw,
-                tl.trans(value_value_raw),
-                out_dtype=tl.float32,
-            )
-            grad_score = (
-                probability * (d_probability - correction[:, None])
-                + grad_lse[:, None] * probability
-            )
+                score_chunk_id = query // SCORE_CHUNK
+                score_row = query - score_chunk_id * SCORE_CHUNK
+                score_group = query_batch * SCORE_CHUNKS + score_chunk_id
+                score_base = (
+                    score_ptr
+                    + tl.cast(score_group[:, None], tl.int64) * stride_scoreb
+                    + tl.cast(score_row[:, None], tl.int64) * stride_scores
+                )
+                probability = tl.load(
+                    score_base
+                    + heads[:, None] * stride_scoreh
+                    + score_positions * stride_scorek,
+                    mask=row_valid[:, None] & key_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                grad_score = tl.load(
+                    d_score_ptr
+                    + tl.cast(score_group[:, None], tl.int64) * stride_dscoreb
+                    + tl.cast(score_row[:, None], tl.int64) * stride_dscores
+                    + heads[:, None] * stride_dscoreh
+                    + score_positions * stride_dscorek,
+                    mask=row_valid[:, None] & key_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+            else:
+                if USE_SAVED_SCORES:
+                    score_positions = (
+                        occurrence_slot[:, None] * RATIO
+                        + tl.arange(0, RATIO)[None, :]
+                    )
+                    score_chunk_id = query // SCORE_CHUNK
+                    score_row = query - score_chunk_id * SCORE_CHUNK
+                    score_group = query_batch * SCORE_CHUNKS + score_chunk_id
+                    score_base = (
+                        score_ptr
+                        + tl.cast(score_group[:, None], tl.int64) * stride_scoreb
+                        + tl.cast(score_row[:, None], tl.int64) * stride_scores
+                    )
+                    probability = tl.load(
+                        score_base
+                        + heads[:, None] * stride_scoreh
+                        + score_positions * stride_scorek,
+                        mask=row_valid[:, None] & key_mask[None, :],
+                        other=0.0,
+                    ).to(tl.float32)
+                else:
+                    score = tl.dot(
+                        q_value_raw,
+                        tl.trans(key_value_raw),
+                        out_dtype=tl.float32,
+                    ) * softmax_scale
+                    probability = tl.exp2(
+                        tl.where(
+                            row_valid[:, None] & key_mask[None, :],
+                            (score - lse[:, None]) * 1.4426950408889634,
+                            -float("inf"),
+                        )
+                    )
+                d_probability = tl.dot(
+                    grad_output_raw,
+                    tl.trans(value_value_raw),
+                    out_dtype=tl.float32,
+                )
+                grad_score = (
+                    probability * (d_probability - correction[:, None])
+                    + grad_lse[:, None] * probability
+                )
             grad_score = tl.where(
                 row_valid[:, None] & key_mask[None, :],
                 grad_score,
@@ -4793,6 +4999,7 @@ if TRITON_AVAILABLE:
         stride_ls,
         BLOCK_TOPK: tl.constexpr,
         RATIO: tl.constexpr,
+        COMPACT_ROUTE: tl.constexpr,
     ):
         """Count complete selected QSA blocks per ``(batch, key block)``."""
 
@@ -4804,32 +5011,51 @@ if TRITON_AVAILABLE:
             num_blocks, (query_position + 1) // RATIO
         ).to(tl.int32)
         block_count = tl.minimum(complete_blocks, BLOCK_TOPK).to(tl.int32)
-        slots = tl.arange(0, BLOCK_TOPK)
-        token_starts = slots * RATIO
-        first = tl.load(
-            index_ptr
-            + batch * stride_ib
-            + query * stride_is
-            + token_starts * stride_ik,
-        ).to(tl.int32)
         length = tl.load(length_ptr + batch * stride_lb + query * stride_ls).to(tl.int32)
-        block_ids = first // RATIO
-        valid = (
-            (slots < block_count)
-            & (token_starts + RATIO <= length)
-            & (first >= 0)
-            & (first < seq_len_k)
-            & (block_ids >= 0)
-            & (block_ids < num_blocks)
-        )
-        for token_offset in tl.static_range(0, RATIO):
-            token = tl.load(
+        slots = tl.arange(0, BLOCK_TOPK)
+        if COMPACT_ROUTE:
+            block_ids = tl.load(
                 index_ptr
                 + batch * stride_ib
                 + query * stride_is
-                + (token_starts + token_offset) * stride_ik,
+                + slots * stride_ik,
             ).to(tl.int32)
-            valid = valid & (token == block_ids * RATIO + token_offset)
+            first = block_ids * RATIO
+            valid = (
+                (slots < block_count)
+                & (slots * RATIO + RATIO <= length)
+                & (first >= 0)
+                & (first < seq_len_k)
+                & (first + RATIO - 1 <= query_position)
+                & (block_ids >= 0)
+                & (block_ids < num_blocks)
+            )
+        else:
+            token_starts = slots * RATIO
+            first = tl.load(
+                index_ptr
+                + batch * stride_ib
+                + query * stride_is
+                + token_starts * stride_ik,
+            ).to(tl.int32)
+            block_ids = first // RATIO
+            valid = (
+                (slots < block_count)
+                & (token_starts + RATIO <= length)
+                & (first >= 0)
+                & (first < seq_len_k)
+                & (first + RATIO - 1 <= query_position)
+                & (block_ids >= 0)
+                & (block_ids < num_blocks)
+            )
+            for token_offset in tl.static_range(0, RATIO):
+                token = tl.load(
+                    index_ptr
+                    + batch * stride_ib
+                    + query * stride_is
+                    + (token_starts + token_offset) * stride_ik,
+                ).to(tl.int32)
+                valid = valid & (token == block_ids * RATIO + token_offset)
         keys = batch * num_blocks + block_ids
         tl.atomic_add(counts_ptr + keys, 1, mask=valid)
 
@@ -4850,6 +5076,7 @@ if TRITON_AVAILABLE:
         stride_ls,
         BLOCK_TOPK: tl.constexpr,
         RATIO: tl.constexpr,
+        COMPACT_ROUTE: tl.constexpr,
     ):
         """Fill inverse block CSR lists with flattened query-row owners."""
 
@@ -4861,37 +5088,56 @@ if TRITON_AVAILABLE:
             num_blocks, (query_position + 1) // RATIO
         ).to(tl.int32)
         block_count = tl.minimum(complete_blocks, BLOCK_TOPK).to(tl.int32)
-        slots = tl.arange(0, BLOCK_TOPK)
-        token_starts = slots * RATIO
-        first = tl.load(
-            index_ptr
-            + batch * stride_ib
-            + query * stride_is
-            + token_starts * stride_ik,
-        ).to(tl.int32)
         length = tl.load(length_ptr + batch * stride_lb + query * stride_ls).to(tl.int32)
-        block_ids = first // RATIO
-        valid = (
-            (slots < block_count)
-            & (token_starts + RATIO <= length)
-            & (first >= 0)
-            & (first < seq_len_k)
-            & (block_ids >= 0)
-            & (block_ids < num_blocks)
-        )
-        for token_offset in tl.static_range(0, RATIO):
-            token = tl.load(
+        slots = tl.arange(0, BLOCK_TOPK)
+        if COMPACT_ROUTE:
+            block_ids = tl.load(
                 index_ptr
                 + batch * stride_ib
                 + query * stride_is
-                + (token_starts + token_offset) * stride_ik,
+                + slots * stride_ik,
             ).to(tl.int32)
-            valid = valid & (token == block_ids * RATIO + token_offset)
+            first = block_ids * RATIO
+            valid = (
+                (slots < block_count)
+                & (slots * RATIO + RATIO <= length)
+                & (first >= 0)
+                & (first < seq_len_k)
+                & (first + RATIO - 1 <= query_position)
+                & (block_ids >= 0)
+                & (block_ids < num_blocks)
+            )
+        else:
+            token_starts = slots * RATIO
+            first = tl.load(
+                index_ptr
+                + batch * stride_ib
+                + query * stride_is
+                + token_starts * stride_ik,
+            ).to(tl.int32)
+            block_ids = first // RATIO
+            valid = (
+                (slots < block_count)
+                & (token_starts + RATIO <= length)
+                & (first >= 0)
+                & (first < seq_len_k)
+                & (first + RATIO - 1 <= query_position)
+                & (block_ids >= 0)
+                & (block_ids < num_blocks)
+            )
+            for token_offset in tl.static_range(0, RATIO):
+                token = tl.load(
+                    index_ptr
+                    + batch * stride_ib
+                    + query * stride_is
+                    + (token_starts + token_offset) * stride_ik,
+                ).to(tl.int32)
+                valid = valid & (token == block_ids * RATIO + token_offset)
         keys = batch * num_blocks + block_ids
         destinations = tl.atomic_add(cursor_ptr + keys, 1, mask=valid)
         tl.store(
             occurrence_query_ptr + destinations,
-            row,
+            row * BLOCK_TOPK + slots,
             mask=valid,
         )
 
@@ -7492,19 +7738,37 @@ def qsa_prepare_segmented_metadata(
     seq_len_q: int,
     seq_len_k: int,
     ratio: int,
+    route_block_size: int = 1,
 ):
-    """Build the reusable inverse CSR map for QSA complete blocks."""
+    """Build a reusable inverse CSR map for QSA complete blocks.
+
+    ``route_block_size == 1`` consumes the compatibility token route.  When
+    it equals ``ratio``, the input is the compact block-ID route and the
+    inverse map reads one block ID per slot.  Occurrences encode both the
+    flattened query row and its route slot so a later owner can consume saved
+    probability derivatives without another route search.
+    """
 
     if ratio < 2 or (ratio & (ratio - 1)):
         raise ValueError(
             "QSA segmented dK/dV reduction requires a power-of-two ratio >= 2")
-    batch, sq, k_slots = topk_indices.shape
-    block_topk_numerator = k_slots - (ratio - 1)
-    if block_topk_numerator <= 0 or block_topk_numerator % ratio:
+    route_block_size = int(route_block_size)
+    if route_block_size not in {1, ratio}:
         raise ValueError(
-            "QSA segmented dK/dV reduction requires token slots to equal "
-            "block_topk*ratio + ratio - 1")
-    block_topk = block_topk_numerator // ratio
+            "QSA segmented dK/dV reduction route_block_size must be 1 or ratio")
+    batch, sq, k_slots = topk_indices.shape
+    if route_block_size == ratio:
+        # Compact route metadata stores one complete block ID per slot.  The
+        # public token count still carries the selected complete-block count
+        # and the incomplete causal tail length.
+        block_topk = k_slots
+    else:
+        block_topk_numerator = k_slots - (ratio - 1)
+        if block_topk_numerator <= 0 or block_topk_numerator % ratio:
+            raise ValueError(
+                "QSA segmented dK/dV reduction requires token slots to equal "
+                "block_topk*ratio + ratio - 1")
+        block_topk = block_topk_numerator // ratio
     if block_topk <= 0 or (block_topk & (block_topk - 1)):
         raise ValueError(
             "QSA segmented dK/dV reduction currently requires a power-of-two block_topk")
@@ -7527,6 +7791,7 @@ def qsa_prepare_segmented_metadata(
         topk_length.stride(1),
         BLOCK_TOPK=block_topk,
         RATIO=ratio,
+        COMPACT_ROUTE=route_block_size == ratio,
         num_warps=4,
         num_stages=1,
     )
@@ -7558,6 +7823,7 @@ def qsa_prepare_segmented_metadata(
         topk_length.stride(1),
         BLOCK_TOPK=block_topk,
         RATIO=ratio,
+        COMPACT_ROUTE=route_block_size == ratio,
         num_warps=4,
         num_stages=1,
     )
@@ -7580,9 +7846,19 @@ def qsa_segmented_dkv_tail(
     query_positions: torch.Tensor,
     ratio: int,
     block_topk: int,
+    route_block_size: int = 1,
 ) -> None:
-    """Atomically add only the incomplete causal block for segmented dK/dV."""
+    """Atomically add only the incomplete causal block for segmented dK/dV.
 
+    Complete blocks are written by the inverse-CSR owner.  Compact routes do
+    not contain tail IDs, so this launch reconstructs them from the query
+    position and the logical selected-token count.
+    """
+
+    route_block_size = int(route_block_size)
+    if route_block_size not in {1, ratio}:
+        raise ValueError(
+            'QSA segmented dK/dV tail route_block_size must be 1 or ratio')
     sq, batch, num_q_heads, head_dim = query.shape
     _, _, num_kv_heads, _ = key.shape
     group_size = num_q_heads // num_kv_heads
@@ -7691,6 +7967,7 @@ def qsa_segmented_dkv_tail(
         HAS_GRAD_LSE=grad_lse is not lse,
         DKV_ACCUM_BF16=grad_key.dtype == torch.bfloat16,
         USE_TOKEN_IDS=use_tail_dispatch,
+        COMPACT_ROUTE=route_block_size == ratio,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -7712,6 +7989,9 @@ def qsa_segmented_dkv_reduce(
     query_positions: torch.Tensor,
     ratio: int,
     segmented_metadata=None,
+    route_block_size: int = 1,
+    saved_scores: torch.Tensor = None,
+    saved_d_scores: torch.Tensor = None,
 ) -> None:
     """Build a block-level inverse CSR map and reduce dK/dV by segment.
 
@@ -7720,6 +8000,9 @@ def qsa_segmented_dkv_reduce(
     ``ratio`` compared with sorting every selected token.  The caller handles
     the at-most ``ratio - 1`` causal-tail tokens with the regular atomic path.
     This function writes into already-zeroed ``grad_key`` and ``grad_value``.
+    When saved probability and ``d_score`` buffers are supplied, the owner
+    skips QK/dP recomputation and consumes the derivative scalars from the
+    query-owned producer.
     """
 
     if ratio < 2 or (ratio & (ratio - 1)):
@@ -7727,13 +8010,20 @@ def qsa_segmented_dkv_reduce(
             "QSA segmented dK/dV reduction requires a power-of-two ratio >= 2")
     sq, batch, num_q_heads, head_dim = query.shape
     sk, key_batch, num_kv_heads, value_dim = key.shape
-    k_slots = topk_indices.shape[-1]
-    block_topk_numerator = k_slots - (ratio - 1)
-    if block_topk_numerator <= 0 or block_topk_numerator % ratio:
+    route_block_size = int(route_block_size)
+    if route_block_size not in {1, ratio}:
         raise ValueError(
-            "QSA segmented dK/dV reduction requires token slots to equal "
-            "block_topk*ratio + ratio - 1")
-    block_topk = block_topk_numerator // ratio
+            "QSA segmented dK/dV reduction route_block_size must be 1 or ratio")
+    k_slots = topk_indices.shape[-1]
+    if route_block_size == ratio:
+        block_topk = k_slots
+    else:
+        block_topk_numerator = k_slots - (ratio - 1)
+        if block_topk_numerator <= 0 or block_topk_numerator % ratio:
+            raise ValueError(
+                "QSA segmented dK/dV reduction requires token slots to equal "
+                "block_topk*ratio + ratio - 1")
+        block_topk = block_topk_numerator // ratio
     if block_topk <= 0 or (block_topk & (block_topk - 1)):
         raise ValueError(
             "QSA segmented dK/dV reduction currently requires a power-of-two block_topk")
@@ -7741,9 +8031,46 @@ def qsa_segmented_dkv_reduce(
         raise ValueError("QSA segmented dK/dV reduction received incompatible Q/K/V shapes")
     if topk_indices.shape[:2] != (batch, sq) or topk_length.shape != (batch, sq):
         raise ValueError("QSA segmented dK/dV reduction received incompatible index shapes")
+    use_saved_scores = saved_scores is not None
+    use_saved_derivatives = saved_d_scores is not None
+    if use_saved_derivatives and not use_saved_scores:
+        raise ValueError(
+            "QSA segmented d_score reuse requires probability reuse as well")
+    logical_k = (
+        topk_indices.shape[-1]
+        if route_block_size == 1
+        else route_block_size * topk_indices.shape[-1] + route_block_size - 1
+    )
+    if use_saved_scores:
+        if saved_scores.ndim != 4 or saved_scores.shape[2:] != (num_q_heads, logical_k):
+            raise ValueError(
+                "QSA segmented dK/dV reduction saved probability shape does not match route")
+        score_chunk = int(saved_scores.shape[1])
+        if score_chunk <= 0 or saved_scores.shape[0] % batch:
+            raise ValueError(
+                "QSA segmented dK/dV reduction saved probability chunk shape is invalid")
+        if saved_scores.stride(0) >= 2**31:
+            raise ValueError(
+                "QSA segmented saved probability chunk stride exceeds the Triton ABI")
+        score_chunks = saved_scores.shape[0] // batch
+        if score_chunks * score_chunk < sq:
+            raise ValueError(
+                "QSA segmented dK/dV reduction saved probability workspace is too small")
+    else:
+        score_chunk = 1
+        score_chunks = 1
+    if use_saved_derivatives and saved_d_scores.shape != saved_scores.shape:
+        raise ValueError(
+            "QSA segmented dK/dV reduction saved d_score shape does not match probability")
     if segmented_metadata is None:
         segmented_metadata = qsa_prepare_segmented_metadata(
-            topk_indices, topk_length, query_positions, sq, sk, ratio
+            topk_indices,
+            topk_length,
+            query_positions,
+            sq,
+            sk,
+            ratio,
+            route_block_size=route_block_size,
         )
     occurrences, starts, block_topk, num_blocks = segmented_metadata
     group_size = num_q_heads // num_kv_heads
@@ -7751,8 +8078,8 @@ def qsa_segmented_dkv_reduce(
     # Real score-selected routes have a heavier occurrence tail than the
     # uniform synthetic fixture; BLOCK_OCC=16 is the stable SM90 compromise.
     block_occ = int(os.environ.get('MCORE_BRIDGE_QSA_SEGMENT_BLOCK_OCC', '16'))
-    if block_occ not in {16, 32, 64}:
-        raise ValueError('QSA segmented BLOCK_OCC expects one of {16,32,64}')
+    if block_occ not in {4, 8, 16, 32, 64}:
+        raise ValueError('QSA segmented BLOCK_OCC expects one of {4,8,16,32,64}')
     flatten_default = (
         is_sm90(query.device)
         and grad_key.dtype == torch.bfloat16
@@ -7794,6 +8121,8 @@ def qsa_segmented_dkv_reduce(
         correction,
         occurrences,
         starts,
+        saved_scores if use_saved_scores else query,
+        saved_d_scores if use_saved_derivatives else query,
         grad_key,
         grad_value,
         sq,
@@ -7836,6 +8165,14 @@ def qsa_segmented_dkv_reduce(
         grad_value.stride(0),
         grad_value.stride(2),
         grad_value.stride(3),
+        (saved_scores if use_saved_scores else query).stride(0),
+        (saved_scores if use_saved_scores else query).stride(1),
+        (saved_scores if use_saved_scores else query).stride(2),
+        (saved_scores if use_saved_scores else query).stride(3),
+        (saved_d_scores if use_saved_derivatives else query).stride(0),
+        (saved_d_scores if use_saved_derivatives else query).stride(1),
+        (saved_d_scores if use_saved_derivatives else query).stride(2),
+        (saved_d_scores if use_saved_derivatives else query).stride(3),
     )
     kernel_options = {
         'RATIO': ratio,
@@ -7850,6 +8187,11 @@ def qsa_segmented_dkv_reduce(
         'DKV_ACCUM_BF16': grad_key.dtype == torch.bfloat16,
         'BATCH_ONE': batch == 1,
         'SPLIT_HEADS': num_segment_head_tiles > 1,
+        'BLOCK_TOPK': block_topk,
+        'USE_SAVED_SCORES': use_saved_scores,
+        'USE_SAVED_DERIVATIVES': use_saved_derivatives,
+        'SCORE_CHUNK': score_chunk,
+        'SCORE_CHUNKS': score_chunks,
         'num_warps': segmented_num_warps,
         'num_stages': 1,
     }
@@ -7896,9 +8238,13 @@ def qsa_selected_kv_backward(
     ``MCORE_BRIDGE_QSA_BACKWARD_OUTPUT_DELTA=0`` to recompute it from K/V.
     Additive dK/dV atomics use relaxed memory ordering because no consumer
     observes a partial gradient before the kernel completes.
-    ``MCORE_BRIDGE_QSA_DKV_REDUCTION=segmented`` enables the QSA production
+    ``MCORE_BRIDGE_QSA_DKV_REDUCTION=segmented`` enables the experimental
     block-level inverse-CSR reduction when ``selected_token_group_size`` is
-    supplied; the causal tail remains on a small atomic path.
+    supplied; the causal tail remains on a small atomic path.  Setting
+    ``MCORE_BRIDGE_QSA_SEGMENT_REUSE_DERIVATIVES=1`` additionally saves the
+    query-owned probability and d-score scalars so the owner skips QK/dP
+    recomputation.  This opt-in mode uses O(B*S*Hq*K) scalar workspace and is
+    not the default atomic production path.
     """
 
     if not TRITON_AVAILABLE:
@@ -7982,14 +8328,16 @@ def qsa_selected_kv_backward(
     segment_reduction_requested = os.environ.get(
         "MCORE_BRIDGE_QSA_DKV_REDUCTION", dkv_reduction
     ).lower() == "segmented"
-    if route_block_size > 1 and segment_reduction_requested:
-        raise RuntimeError(
-            'QSA compact block route currently requires atomic dK/dV reduction')
     segment_ratio = None
     use_segmented_reduction = False
     if segment_reduction_requested and selected_token_group_size is not None:
         segment_ratio = int(selected_token_group_size)
-        block_topk_numerator = topk_indices.shape[-1] - (segment_ratio - 1)
+        compact_route = route_block_size > 1
+        block_topk_numerator = (
+            topk_indices.shape[-1]
+            if compact_route
+            else topk_indices.shape[-1] - (segment_ratio - 1)
+        )
         supported = (
             causal
             and key_position_offset == 0
@@ -7999,19 +8347,22 @@ def qsa_selected_kv_backward(
             and value.dtype == torch.bfloat16
             and segment_ratio >= 2
             and (segment_ratio & (segment_ratio - 1)) == 0
+            and (not compact_route or route_block_size == segment_ratio)
             and block_topk_numerator > 0
-            and block_topk_numerator % segment_ratio == 0
+            and (compact_route or block_topk_numerator % segment_ratio == 0)
             and (
-                (block_topk_numerator // segment_ratio) &
-                ((block_topk_numerator // segment_ratio) - 1)
+                (block_topk_numerator if compact_route else
+                 block_topk_numerator // segment_ratio) &
+                ((block_topk_numerator if compact_route else
+                  block_topk_numerator // segment_ratio) - 1)
             ) == 0
         )
         if not supported:
             raise RuntimeError(
                 "QSA segmented dK/dV reduction requires causal BF16 Q/K/V, "
                 "key_position_offset=0, a supplied grad_output, a "
-                "power-of-two compression ratio, and a power-of-two "
-                "block_topk token layout"
+                "power-of-two compression ratio, a matching compact route "
+                "when used, and a power-of-two block_topk layout"
             )
         use_segmented_reduction = True
     if grad_output is None:
@@ -8028,6 +8379,55 @@ def qsa_selected_kv_backward(
     # to the input dtype before returning through autograd.
     grad_key = torch.zeros_like(key) if dkv_accum_dtype == 'bf16' else torch.zeros_like(key, dtype=torch.float32)
     grad_value = torch.zeros_like(value) if dkv_accum_dtype == 'bf16' else torch.zeros_like(value, dtype=torch.float32)
+    reuse_scores = (
+        use_segmented_reduction
+        and os.environ.get('MCORE_BRIDGE_QSA_SEGMENT_REUSE_SCORES', '0') != '0'
+    )
+    reuse_derivatives = (
+        use_segmented_reduction
+        and os.environ.get(
+            'MCORE_BRIDGE_QSA_SEGMENT_REUSE_DERIVATIVES', '0') != '0'
+    )
+    saved_scores = None
+    saved_d_scores = None
+    score_chunk = 1
+    score_chunks = 1
+    if reuse_scores or reuse_derivatives:
+        requested_score_chunk = int(os.environ.get(
+            'MCORE_BRIDGE_QSA_SEGMENT_SCORE_CHUNK', '1024'))
+        if requested_score_chunk <= 0:
+            raise ValueError(
+                'QSA segmented score chunk must be positive')
+        score_chunk = min(requested_score_chunk, max(1, sq))
+        if score_chunk * num_q_heads * logical_k >= 2**31:
+            raise ValueError(
+                'QSA segmented score chunk is too large for the Triton stride ABI')
+        score_chunks = triton.cdiv(sq, score_chunk)
+        score_dtype = os.environ.get(
+            'MCORE_BRIDGE_QSA_SEGMENT_SCORE_DTYPE', 'fp32').lower()
+        if score_dtype not in {'bf16', 'fp32'}:
+            raise ValueError(
+                'QSA segmented score dtype expects bf16 or fp32')
+        saved_scores = torch.empty(
+            (batch * score_chunks, score_chunk, num_q_heads, logical_k),
+            device=query.device,
+            dtype=torch.bfloat16 if score_dtype == 'bf16' else torch.float32,
+        )
+    if reuse_derivatives:
+        d_score_dtype = os.environ.get(
+            'MCORE_BRIDGE_QSA_SEGMENT_D_SCORE_DTYPE',
+            os.environ.get('MCORE_BRIDGE_QSA_SEGMENT_SCORE_DTYPE', 'fp32'),
+        ).lower()
+        if d_score_dtype not in {'bf16', 'fp32'}:
+            raise ValueError(
+                'QSA segmented d_score dtype expects bf16 or fp32')
+        saved_d_scores = torch.empty(
+            (batch * score_chunks, score_chunk, num_q_heads, logical_k),
+            device=query.device,
+            dtype=torch.bfloat16 if d_score_dtype == 'bf16' else torch.float32,
+        )
+    score_workspace = saved_scores if saved_scores is not None else query
+    d_score_workspace = saved_d_scores if saved_d_scores is not None else query
     correction = (
         torch.empty((batch, num_q_heads, sq), device=query.device, dtype=torch.float32)
         if use_segmented_reduction else lse
@@ -8120,6 +8520,8 @@ def qsa_selected_kv_backward(
         grad_query,
         grad_key,
         grad_value,
+        score_workspace,
+        d_score_workspace,
         sq,
         sk,
         num_q_heads,
@@ -8172,6 +8574,14 @@ def qsa_selected_kv_backward(
         grad_value.stride(0),
         grad_value.stride(2),
         grad_value.stride(3),
+        score_workspace.stride(0),
+        score_workspace.stride(1),
+        score_workspace.stride(2),
+        score_workspace.stride(3),
+        d_score_workspace.stride(0),
+        d_score_workspace.stride(1),
+        d_score_workspace.stride(2),
+        d_score_workspace.stride(3),
         correction,
         correction.stride(0),
         correction.stride(1),
@@ -8189,7 +8599,8 @@ def qsa_selected_kv_backward(
         USE_OUTPUT_DELTA=use_output_delta,
         DKV_ACCUM_BF16=dkv_accum_dtype == 'bf16',
         SEGMENT_BLOCK_TOPK=(
-            (topk_indices.shape[-1] - (segment_ratio - 1)) // segment_ratio
+            (topk_indices.shape[-1] if route_block_size > 1 else
+             (topk_indices.shape[-1] - (segment_ratio - 1)) // segment_ratio)
             if use_segmented_reduction else 1
         ),
         RATIO=segment_ratio if use_segmented_reduction else 2,
@@ -8200,6 +8611,10 @@ def qsa_selected_kv_backward(
         # dedicated tail launch below; keeping EMIT_DKV false here removes
         # the otherwise duplicated complete-block reductions.
         EMIT_DKV=not use_segmented_reduction,
+        STORE_SCORES=saved_scores is not None,
+        STORE_DERIVATIVES=saved_d_scores is not None,
+        SCORE_CHUNK=score_chunk,
+        SCORE_CHUNKS=score_chunks,
         TENSORIZE_DERIVATIVES=tensorize_derivatives,
         TRIM_CAUSAL_LOOP=trim_causal_loop,
         ROUTE_SLOTS=route_slots,
@@ -8223,7 +8638,9 @@ def qsa_selected_kv_backward(
             softmax_scale,
             query_positions,
             segment_ratio,
-            (topk_indices.shape[-1] - (segment_ratio - 1)) // segment_ratio,
+            (topk_indices.shape[-1] if route_block_size > 1 else
+             (topk_indices.shape[-1] - (segment_ratio - 1)) // segment_ratio),
+            route_block_size=route_block_size,
         )
         qsa_segmented_dkv_reduce(
             query,
@@ -8241,6 +8658,9 @@ def qsa_selected_kv_backward(
             query_positions,
             segment_ratio,
             segmented_metadata=segmented_metadata,
+            route_block_size=route_block_size,
+            saved_scores=saved_scores,
+            saved_d_scores=saved_d_scores,
         )
     return grad_query.to(query.dtype), grad_key.to(key.dtype), grad_value.to(value.dtype)
 

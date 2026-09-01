@@ -919,7 +919,7 @@ def test_triton_compact_route_expansion_matches_torch_with_padding():
     assert torch.equal(actual, expected)
 
 
-def test_compact_block_route_rejects_effective_segmented_override(monkeypatch):
+def test_compact_block_route_accepts_segmented_override(monkeypatch):
     query = torch.randn(5, 1, 4, 8)
     key = torch.randn(5, 1, 2, 8)
     value = torch.randn_like(key)
@@ -928,17 +928,18 @@ def test_compact_block_route_rejects_effective_segmented_override(monkeypatch):
     ], dtype=torch.int32)
     lengths = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int32)
     monkeypatch.setenv('MCORE_BRIDGE_QSA_DKV_REDUCTION', 'segmented')
-    with pytest.raises(ValueError, match='compact block route.*atomic'):
-        qsa_sparse_forward(
-            query,
-            key,
-            value,
-            blocks,
-            lengths,
-            backend='torch',
-            selected_token_group_size=4,
-            route_block_size=4,
-        )
+    output, lse = qsa_sparse_forward(
+        query,
+        key,
+        value,
+        blocks,
+        lengths,
+        backend='torch',
+        selected_token_group_size=4,
+        route_block_size=4,
+    )
+    assert output.shape == query.shape
+    assert lse.shape == (1, query.shape[2], query.shape[0])
 
 
 @pytest.mark.parametrize(
@@ -1099,7 +1100,9 @@ def test_qsa_selection_zeroes_packed_alignment_tail_without_labels():
     assert torch.equal(indices[0, 12:], torch.full((4, 5), -1, dtype=torch.int32))
 
 
-def test_qwen4_exp_selection_uses_compact_route_for_triton_atomic(monkeypatch):
+@pytest.mark.parametrize('reduction', ('atomic', 'segmented'))
+def test_qwen4_exp_selection_uses_compact_route_for_triton_reduction(
+        monkeypatch, reduction):
     class FakeIndexer:
         compress_ratio = 4
         return_block_ids = None
@@ -1131,7 +1134,7 @@ def test_qwen4_exp_selection_uses_compact_route_for_triton_atomic(monkeypatch):
         tensor_model_parallel_size=1, sequence_parallel=False,
         hidden_size=4, context_parallel_size=1, qsa_cp_mode='disabled',
         cp_partition_mode='zigzag', qsa_indexer_query_tile_size=8,
-        qsa_indexer_key_tile_size=8, qsa_dkv_reduction='atomic',
+        qsa_indexer_key_tile_size=8, qsa_dkv_reduction=reduction,
         qsa_compact_block_route=True)
     hidden = torch.randn(16, 1, 4)
     selected = layer._qsa_select_topk(
@@ -1842,6 +1845,83 @@ def test_triton_packed_compact_block_route_matches_token_route():
     )
     assert torch.allclose(actual[0].float(), reference[0].float(), atol=2e-2, rtol=2e-2)
     assert torch.allclose(actual[1], reference[1], atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_triton_packed_compact_block_owned_backward_matches_token_route_on_sm90(monkeypatch):
+    """Exercise packed block ownership on aligned multi-segment routes."""
+
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('requires H100/SM90')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_DKV_REDUCTION', 'segmented')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_REUSE_DERIVATIVES', '1')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_SCORE_DTYPE', 'bf16')
+    monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_D_SCORE_DTYPE', 'bf16')
+    torch.manual_seed(3142)
+    device = 'cuda'
+    segments = (20, 16)
+    total = sum(segments)
+    hq, hkv, dim, ratio, block_topk = 12, 2, 64, 4, 4
+    cu = torch.tensor(
+        [0, segments[0], total], device=device, dtype=torch.int32)
+    local_positions = torch.cat(tuple(
+        torch.arange(length, device=device, dtype=torch.int32)
+        for length in segments
+    ))
+    blocks = torch.full(
+        (1, total, block_topk), -1, device=device, dtype=torch.int32)
+    lengths = torch.zeros((1, total), device=device, dtype=torch.int32)
+    for token, position in enumerate(local_positions.tolist()):
+        complete = (position + 1) // ratio
+        selected_count = min(complete, block_topk)
+        if selected_count:
+            blocks[0, token, :selected_count] = torch.arange(
+                selected_count - 1, -1, -1, device=device, dtype=torch.int32)
+        lengths[0, token] = (
+            selected_count * ratio + (position + 1 - complete * ratio))
+    tokens = qsa_expand_block_route(
+        blocks, lengths, local_positions, ratio)
+
+    query_base = torch.randn(
+        total, hq, dim, device=device, dtype=torch.bfloat16)
+    key_base = torch.randn(
+        total, hkv, dim, device=device, dtype=torch.bfloat16)
+    value_base = torch.randn_like(key_base)
+    grad_output = torch.randn_like(query_base)
+    grad_lse = torch.randn(
+        1, hq, total, device=device, dtype=torch.float32) * 0.01
+
+    def run(route, backend, route_size):
+        query = query_base.detach().clone().requires_grad_()
+        key = key_base.detach().clone().requires_grad_()
+        value = value_base.detach().clone().requires_grad_()
+        output, lse = qsa_sparse_forward_packed(
+            query,
+            key,
+            value,
+            route,
+            lengths,
+            cu,
+            cu,
+            backend=backend,
+            require_backend=backend == 'triton',
+            selected_token_group_size=ratio,
+            dkv_reduction='segmented',
+            route_block_size=route_size,
+        )
+        ((output.float() * grad_output.float()).sum()
+         + (lse * grad_lse).sum()).backward()
+        return output.detach(), lse.detach(), query.grad, key.grad, value.grad
+
+    reference = run(tokens, 'torch', 1)
+    actual = run(blocks, 'triton', ratio)
+    assert torch.allclose(actual[0].float(), reference[0].float(), atol=2e-2, rtol=2e-2)
+    assert torch.allclose(actual[1], reference[1], atol=2e-2, rtol=2e-2)
+    assert torch.allclose(actual[2].float(), reference[2].float(), atol=0.1, rtol=0.1)
+    for actual_grad, reference_grad in zip(actual[3:], reference[3:]):
+        difference = actual_grad.float() - reference_grad.float()
+        assert difference.abs().mean().item() < 2e-2
+        assert difference.norm().item() / reference_grad.float().norm().item() < 3e-2
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
