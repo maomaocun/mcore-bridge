@@ -18,6 +18,7 @@ from mcore_bridge.model.modules.qsa_attention import (qsa_expand_block_route, qs
 from mcore_bridge.model.modules.qsa_cp_exchange import _build_owner_plan, qsa_exchange_selected_kv
 from mcore_bridge.model.modules.qsa_indexer import QSAIndexer
 from mcore_bridge.model.modules.qsa_triton import (
+    qsa_attention_packed_metadata_from_cu,
     qsa_expand_compact_route_triton,
     qsa_indexer_fused_topk_packed,
     qsa_indexer_fused_topk_with_ratio,
@@ -125,6 +126,22 @@ def test_selected_kv_packed_segments_are_isolated():
         expected_lse.append(lse)
     assert torch.allclose(actual, torch.cat(expected_outputs), atol=1e-6, rtol=1e-6)
     assert torch.allclose(actual_lse, torch.cat(expected_lse, dim=2), atol=1e-6, rtol=1e-6)
+
+
+def test_packed_boundary_validation_cache_tracks_inplace_mutation():
+    total, hq, hkv, dim, slots = 4, 2, 1, 3, 2
+    query = torch.randn(total, hq, dim)
+    key = torch.randn(total, hkv, dim)
+    value = torch.randn_like(key)
+    indices = torch.zeros((1, total, slots), dtype=torch.int32)
+    lengths = torch.ones((1, total), dtype=torch.int32)
+    cu = torch.tensor([0, 2, total], dtype=torch.int32)
+    qsa_sparse_forward_packed(
+        query, key, value, indices, lengths, cu, cu, backend='torch')
+    cu[1] = total + 1
+    with pytest.raises(ValueError, match='non-decreasing'):
+        qsa_sparse_forward_packed(
+            query, key, value, indices, lengths, cu, cu, backend='torch')
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
@@ -321,6 +338,28 @@ def test_triton_packed_metadata_from_cu_resets_segments_on_sm90(boundaries):
         expected_positions[start:end] = torch.arange(
             end - start, device='cuda', dtype=torch.int32)
     expected = (expected_starts, expected_counts, expected_positions)
+    assert all(torch.equal(got, want) for got, want in zip(actual, expected))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+@pytest.mark.parametrize('dtype', (torch.int32, torch.int64))
+def test_triton_attention_packed_metadata_supports_distinct_q_kv_on_sm90(dtype):
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('requires H100/SM90')
+    # The empty middle query segment exercises duplicate q boundaries; its KV
+    # segment may still be non-empty. Query and KV lengths are intentionally
+    # different so this cannot accidentally reuse self-attention offsets.
+    cu_q = torch.tensor([0, 3, 3, 8], device='cuda', dtype=dtype)
+    cu_kv = torch.tensor([0, 5, 7, 9], device='cuda', dtype=dtype)
+    actual = qsa_attention_packed_metadata_from_cu(cu_q, cu_kv, 8)
+    expected = (
+        torch.tensor(
+            [0, 0, 0, 7, 7, 7, 7, 7], device='cuda', dtype=torch.int32),
+        torch.tensor(
+            [5, 5, 5, 2, 2, 2, 2, 2], device='cuda', dtype=torch.int32),
+        torch.tensor(
+            [0, 1, 2, 0, 1, 2, 3, 4], device='cuda', dtype=torch.int32),
+    )
     assert all(torch.equal(got, want) for got, want in zip(actual, expected))
 
 
@@ -1878,3 +1917,90 @@ def test_triton_packed_segment_dispatch_matches_single_grid_on_sm90(monkeypatch)
         difference = actual_grad.float() - reference_grad.float()
         assert difference.abs().mean().item() < 2e-2
         assert difference.norm().item() / reference_grad.float().norm().item() < 2e-2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_triton_packed_training_is_cuda_graph_capturable_on_sm90():
+    """Prevent host metadata synchronization from returning to packed THD."""
+
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('requires H100/SM90')
+    torch.manual_seed(20260902)
+    device = 'cuda'
+    segments = (31, 160)
+    total = sum(segments)
+    hq, hkv, dim, slots = 4, 2, 16, 19
+    query = torch.randn(
+        total, hq, dim, device=device, dtype=torch.bfloat16,
+        requires_grad=True)
+    key = torch.randn(
+        total, hkv, dim, device=device, dtype=torch.bfloat16,
+        requires_grad=True)
+    value = torch.randn_like(key, requires_grad=True)
+    grad_output = torch.randn_like(query)
+    grad_lse = torch.randn(
+        1, hq, total, device=device, dtype=torch.float32) * 0.01
+    cu = torch.tensor(
+        [0, segments[0], total], device=device, dtype=torch.int32)
+    indices = torch.full(
+        (1, total, slots), -1, device=device, dtype=torch.int32)
+    lengths = torch.zeros((1, total), device=device, dtype=torch.int32)
+    for start, segment_length in (
+            (0, segments[0]), (segments[0], segments[1])):
+        for position in range(segment_length):
+            count = min(position + 1, slots)
+            indices[0, start + position, :count] = torch.arange(
+                count, device=device, dtype=torch.int32)
+            lengths[0, start + position] = count
+
+    def step():
+        output, lse = qsa_sparse_forward_packed(
+            query,
+            key,
+            value,
+            indices,
+            lengths,
+            cu,
+            cu,
+            backend='triton',
+            require_backend=True,
+        )
+        loss = ((output.float() * grad_output.float()).sum()
+                + (lse * grad_lse).sum())
+        loss.backward()
+        return output, lse, loss
+
+    current_stream = torch.cuda.current_stream()
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(current_stream)
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(2):
+            query.grad = key.grad = value.grad = None
+            eager_output, eager_lse, eager_loss = step()
+    current_stream.wait_stream(warmup_stream)
+    torch.cuda.synchronize()
+    eager_grads = tuple(
+        tensor.grad.detach().clone() for tensor in (query, key, value))
+    del eager_output, eager_lse, eager_loss
+    query.grad.zero_()
+    key.grad.zero_()
+    value.grad.zero_()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        query.grad.zero_()
+        key.grad.zero_()
+        value.grad.zero_()
+        graph_output, graph_lse, graph_loss = step()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(graph_loss)
+    assert torch.isfinite(graph_output).all()
+    assert torch.isfinite(graph_lse).all()
+    graph_grads = (query.grad, key.grad, value.grad)
+    assert torch.equal(graph_grads[0], eager_grads[0])
+    for actual, expected in zip(graph_grads[1:], eager_grads[1:]):
+        difference = actual.float() - expected.float()
+        assert difference.abs().mean().item() < 2e-2
+        assert difference.norm().item() / expected.float().norm().item() < 2e-2

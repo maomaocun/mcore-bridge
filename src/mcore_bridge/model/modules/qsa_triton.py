@@ -399,6 +399,66 @@ if TRITON_AVAILABLE:
         )
 
     @triton.jit
+    def _qsa_attention_packed_metadata_from_cu_kernel(
+        cu_seqlens_q_ptr,
+        cu_seqlens_kv_ptr,
+        key_start_out_ptr,
+        key_length_out_ptr,
+        local_position_out_ptr,
+        total_q,
+        NUM_SEGMENTS: tl.constexpr,
+        SEARCH_STEPS: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+    ):
+        """Map packed query tokens to their query and KV segments."""
+
+        positions = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+        valid = positions < total_q
+        low = tl.zeros((BLOCK_T,), dtype=tl.int32)
+        high = tl.full((BLOCK_T,), NUM_SEGMENTS, dtype=tl.int32)
+        for _ in tl.static_range(0, SEARCH_STEPS):
+            middle = (low + high) // 2
+            safe_middle = tl.minimum(middle, NUM_SEGMENTS - 1)
+            segment_end = tl.load(
+                cu_seqlens_q_ptr + safe_middle + 1,
+                mask=valid,
+                other=total_q,
+            ).to(tl.int32)
+            move_right = positions >= segment_end
+            low = tl.where(move_right, safe_middle + 1, low)
+            high = tl.where(move_right, high, safe_middle)
+        # The public wrapper validates that cu_seqlens_q covers total_q.  The
+        # clamp is still important defense in depth: malformed metadata must
+        # not turn a diagnostic into an out-of-bounds device read.
+        segment = tl.minimum(low, NUM_SEGMENTS - 1)
+        query_start = tl.load(
+            cu_seqlens_q_ptr + segment,
+            mask=valid,
+            other=0,
+        ).to(tl.int32)
+        key_start = tl.load(
+            cu_seqlens_kv_ptr + segment,
+            mask=valid,
+            other=0,
+        ).to(tl.int32)
+        key_end = tl.load(
+            cu_seqlens_kv_ptr + segment + 1,
+            mask=valid,
+            other=0,
+        ).to(tl.int32)
+        tl.store(key_start_out_ptr + positions, key_start, mask=valid)
+        tl.store(
+            key_length_out_ptr + positions,
+            key_end - key_start,
+            mask=valid,
+        )
+        tl.store(
+            local_position_out_ptr + positions,
+            positions - query_start,
+            mask=valid,
+        )
+
+    @triton.jit
     def _qsa_indexer_score_kernel(
         q_ptr,
         block_key_ptr,
@@ -5172,6 +5232,69 @@ def qsa_indexer_packed_metadata_from_cu(
             NUM_SEGMENTS=num_segments,
             # ``high`` is an exclusive bound.  Powers of two therefore need
             # one more comparison than ``(N - 1).bit_length()``.
+            SEARCH_STEPS=num_segments.bit_length(),
+            BLOCK_T=256,
+            num_warps=4,
+            num_stages=1,
+        )
+    return outputs
+
+
+def qsa_attention_packed_metadata_from_cu(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    total_q: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build packed attention metadata with one device launch.
+
+    The returned tensors are per-query ``key_start``, ``key_length``, and
+    query-local position.  Q and KV segment lengths may differ, but their
+    segment counts must match.  Boundary value validation remains in the
+    public attention wrapper so this helper never synchronizes the host.
+    """
+
+    if not TRITON_AVAILABLE:
+        raise RuntimeError('QSA packed attention metadata requires Triton')
+    for name, cu_seqlens in (
+            ('cu_seqlens_q', cu_seqlens_q),
+            ('cu_seqlens_kv', cu_seqlens_kv)):
+        if not cu_seqlens.is_cuda or cu_seqlens.dtype not in {
+                torch.int32, torch.int64}:
+            raise ValueError(
+                f'QSA packed {name} must be CUDA int32 or int64')
+        if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
+            raise ValueError(
+                f'QSA packed {name} must have shape [num_segments+1]')
+    if cu_seqlens_q.device != cu_seqlens_kv.device:
+        raise ValueError('QSA packed Q/KV cu_seqlens must share one CUDA device')
+    if cu_seqlens_q.numel() != cu_seqlens_kv.numel():
+        raise ValueError('QSA packed Q/KV cu_seqlens must have matching shapes')
+    total_q = int(total_q)
+    if total_q < 0 or total_q > torch.iinfo(torch.int32).max:
+        raise ValueError(
+            'QSA packed attention total_q must fit a non-negative int32')
+    cu_seqlens_q = cu_seqlens_q.contiguous()
+    cu_seqlens_kv = cu_seqlens_kv.contiguous()
+    outputs = tuple(
+        torch.empty(
+            (total_q,),
+            device=cu_seqlens_q.device,
+            dtype=torch.int32,
+        )
+        for _ in range(3)
+    )
+    if total_q:
+        num_segments = cu_seqlens_q.numel() - 1
+        _qsa_attention_packed_metadata_from_cu_kernel[
+            (triton.cdiv(total_q, 256),)
+        ](
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            outputs[0],
+            outputs[1],
+            outputs[2],
+            total_q,
+            NUM_SEGMENTS=num_segments,
             SEARCH_STEPS=num_segments.bit_length(),
             BLOCK_T=256,
             num_warps=4,

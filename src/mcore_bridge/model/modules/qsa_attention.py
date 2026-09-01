@@ -22,7 +22,7 @@ dense-mask fallback: its largest attention scratch tensor is bounded by
 ``query_tile * K * heads_per_kv``.  The custom autograd functions recompute
 those tiles during backward and scatter-add duplicate selected K/V entries,
 so training never saves an ``S x S`` probability matrix.  Packed THD inputs
-use O(T) segment metadata and a single varlen Triton launch on the production
+use O(T) segment metadata and fixed-grid Triton launches on the production
 atomic path.
 """
 
@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import math
 import os
+import weakref
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -118,6 +119,44 @@ class QSAResolvedBackend:
     requested: str
     actual: str
     fallback_reason: Optional[str] = None
+
+
+# Packed cu_seqlens is structural batch metadata and is normally shared by
+# every QSA layer. Retain the validated host tuple while that exact tensor is
+# alive, but key it by object identity instead of Tensor equality (which is
+# elementwise) and invalidate it on PyTorch-tracked in-place mutations.
+_PACKED_BOUNDARY_CACHE = {}
+
+
+def _packed_boundaries(cu_seqlens: torch.Tensor) -> tuple[int, ...]:
+    cache_key = id(cu_seqlens)
+    try:
+        version = int(cu_seqlens._version)
+    except RuntimeError:
+        # Inference tensors intentionally have no version counter. They are
+        # still safe to cache under the packed contract that cu_seqlens is
+        # immutable structural metadata; ordinary training tensors retain
+        # mutation-aware invalidation through the version comparison.
+        version = None
+    cached = _PACKED_BOUNDARY_CACHE.get(cache_key)
+    if (cached is not None and cached[0]() is cu_seqlens
+            and cached[1] == version):
+        return cached[2]
+    if cu_seqlens.is_cuda and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            'QSA packed cu_seqlens must be validated by one warmup call '
+            'before CUDA Graph capture')
+    boundaries = tuple(
+        cu_seqlens.detach().to(device='cpu', dtype=torch.long).tolist())
+
+    def drop(reference, key=cache_key):
+        entry = _PACKED_BOUNDARY_CACHE.get(key)
+        if entry is not None and entry[0] is reference:
+            _PACKED_BOUNDARY_CACHE.pop(key, None)
+
+    reference = weakref.ref(cu_seqlens, drop)
+    _PACKED_BOUNDARY_CACHE[cache_key] = (reference, version, boundaries)
+    return boundaries
 
 
 def _device_capability(device: torch.device) -> str:
@@ -914,8 +953,8 @@ def qsa_sparse_forward_packed(
             cu_seqlens_q.numel() != cu_seqlens_kv.numel() or
             cu_seqlens_q.numel() < 2):
         raise ValueError('QSA packed attention requires matching cu_seqlens_q/cu_seqlens_kv')
-    q_boundaries = cu_seqlens_q.to(device='cpu', dtype=torch.long).tolist()
-    kv_boundaries = cu_seqlens_kv.to(device='cpu', dtype=torch.long).tolist()
+    q_boundaries = _packed_boundaries(cu_seqlens_q)
+    kv_boundaries = _packed_boundaries(cu_seqlens_kv)
     if q_boundaries[0] != 0 or kv_boundaries[0] != 0:
         raise ValueError('QSA packed cu_seqlens must start at zero')
     if q_boundaries[-1] != query_thd.shape[0] or kv_boundaries[-1] != key_thd.shape[0]:
@@ -961,23 +1000,42 @@ def qsa_sparse_forward_packed(
         raise ValueError(
             'QSA packed compact block route currently requires causal attention')
 
-    # Build compact device metadata once.  repeat_interleave is O(T) and
-    # replaces the previous Python launch loop; all selected IDs remain local
-    # to their document and are rebased inside the packed Triton kernel.
+    # The production atomic path maps every query token to its Q/KV segment
+    # with one bandwidth-only device launch.  The fallback remains available
+    # for A/B and for backends whose attention itself still loops by segment.
     cu_q = cu_seqlens_q.to(device=query_thd.device, dtype=torch.int32).contiguous()
     cu_kv = cu_seqlens_kv.to(device=query_thd.device, dtype=torch.int32).contiguous()
-    num_segments = cu_q.numel() - 1
-    segment_ids = torch.repeat_interleave(
-        torch.arange(num_segments, device=query_thd.device, dtype=torch.long),
-        (cu_q[1:] - cu_q[:-1]).to(torch.long),
+    fused_attention_metadata = (
+        resolved.actual == 'triton'
+        and effective_dkv_reduction == 'atomic'
+        and os.environ.get(
+            'MCORE_BRIDGE_QSA_PACKED_ATTENTION_METADATA_FUSED', '1') != '0'
     )
-    if segment_ids.numel() != total_q:
-        raise ValueError('QSA packed cu_seqlens query lengths do not cover all query tokens')
-    q_segment_starts = cu_q[:-1].to(torch.long).index_select(0, segment_ids)
-    key_starts = cu_kv[:-1].to(torch.long).index_select(0, segment_ids)
-    key_lengths = (cu_kv[1:] - cu_kv[:-1]).to(torch.long).index_select(0, segment_ids)
-    local_positions = torch.arange(
-        total_q, device=query_thd.device, dtype=torch.long) - q_segment_starts
+    if fused_attention_metadata:
+        from .qsa_triton import qsa_attention_packed_metadata_from_cu
+
+        key_starts, key_lengths, local_positions = (
+            qsa_attention_packed_metadata_from_cu(cu_q, cu_kv, total_q))
+    else:
+        num_segments = cu_q.numel() - 1
+        segment_ids = torch.repeat_interleave(
+            torch.arange(
+                num_segments, device=query_thd.device, dtype=torch.long),
+            (cu_q[1:] - cu_q[:-1]).to(torch.long),
+        )
+        if segment_ids.numel() != total_q:
+            raise ValueError(
+                'QSA packed cu_seqlens query lengths do not cover all query tokens')
+        q_segment_starts = cu_q[:-1].to(torch.long).index_select(
+            0, segment_ids)
+        key_starts = cu_kv[:-1].to(torch.long).index_select(0, segment_ids)
+        key_lengths = (cu_kv[1:] - cu_kv[:-1]).to(torch.long).index_select(
+            0, segment_ids)
+        local_positions = torch.arange(
+            total_q,
+            device=query_thd.device,
+            dtype=torch.long,
+        ) - q_segment_starts
     if route_block_size > 1 and resolved.actual != 'triton':
         topk_indices = qsa_expand_block_route(
             topk_indices,
