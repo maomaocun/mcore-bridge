@@ -602,6 +602,12 @@ class _QSASelectedKVFunction(Function):
                 effective_dkv_reduction == 'segmented'):
             from .qsa_triton import qsa_prepare_segmented_metadata
 
+            hybrid_min_fanout = int(os.environ.get(
+                'MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT', '0'))
+            if hybrid_min_fanout < 0:
+                raise ValueError(
+                    'QSA segmented hybrid fanout threshold must be non-negative')
+
             ctx.segmented_metadata = qsa_prepare_segmented_metadata(
                 topk_indices,
                 topk_length,
@@ -610,6 +616,7 @@ class _QSASelectedKVFunction(Function):
                 key.shape[0],
                 int(selected_token_group_size),
                 route_block_size=route_block_size,
+                owner_min_fanout=hybrid_min_fanout,
             )
         # Backward can recover the softmax correction as ``sum(output *
         # grad_output)``.  Saving the already-materialized output avoids a
@@ -818,8 +825,11 @@ def qsa_sparse_forward(
     ``torch`` backend has identical selected-index semantics and is used for
     parity tests and explicit fallback.  The function never constructs a
     dense attention mask or a full score matrix.  ``dkv_reduction='segmented'``
-    enables the experimental hybrid/block-owned inverse-CSR dK/dV path; the
-    causal tail remains additive, while ``atomic`` is the tuned default.
+    enables the experimental block-owned inverse-CSR dK/dV path; the causal
+    tail remains additive, while ``atomic`` is the tuned default.  Setting
+    ``MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT`` to a positive value makes
+    only complete blocks with at least that many query occurrences owner-owned;
+    the remaining blocks stay on the query-side atomic path for A/B studies.
     ``route_block_size > 1`` selects the compact complete-block metadata ABI.
     """
 

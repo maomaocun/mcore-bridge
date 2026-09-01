@@ -3102,6 +3102,7 @@ if TRITON_AVAILABLE:
         grad_v_ptr,
         score_ptr,
         d_score_ptr,
+        owner_block_mask_ptr,
         seq_len_q,
         seq_len_k,
         num_q_heads,
@@ -3162,6 +3163,8 @@ if TRITON_AVAILABLE:
         stride_dscores,
         stride_dscoreh,
         stride_dscorek,
+        stride_omb,
+        stride_oms,
         correction_ptr,
         stride_cb,
         stride_ch,
@@ -3187,6 +3190,8 @@ if TRITON_AVAILABLE:
         STORE_CORRECTION: tl.constexpr,
         TAIL_ONLY: tl.constexpr,
         EMIT_DKV: tl.constexpr,
+        HYBRID_DKV: tl.constexpr,
+        COMPUTE_DQ: tl.constexpr,
         STORE_SCORES: tl.constexpr,
         STORE_DERIVATIVES: tl.constexpr,
         SCORE_CHUNK: tl.constexpr,
@@ -3306,7 +3311,8 @@ if TRITON_AVAILABLE:
             )
             tl.store(correction_ptrs, correction, mask=head_valid)
 
-        grad_q = tl.zeros((HEADS_PER_KV, BLOCK_D), dtype=tl.float32)
+        if COMPUTE_DQ:
+            grad_q = tl.zeros((HEADS_PER_KV, BLOCK_D), dtype=tl.float32)
         loop_end = K
         if TRIM_CAUSAL_LOOP:
             loop_end = tl.minimum(length, K)
@@ -3343,6 +3349,21 @@ if TRITON_AVAILABLE:
                 score_chunk_id = query // SCORE_CHUNK
                 score_row = query - score_chunk_id * SCORE_CHUNK
                 score_group = batch * SCORE_CHUNKS + score_chunk_id
+                score_store_mask = valid
+                if HYBRID_DKV:
+                    complete_token_count = (length // RATIO) * RATIO
+                    owner_block = safe_selected // RATIO
+                    owner_mask = tl.load(
+                        owner_block_mask_ptr
+                        + batch * stride_omb
+                        + owner_block * stride_oms,
+                        mask=valid & (key_offsets < complete_token_count),
+                        other=0,
+                    )
+                    # Sparse derivative reuse is only needed by the owner
+                    # side.  Avoid writing the cold route into the large
+                    # logical score slab; its dK/dV remains query-owned.
+                    score_store_mask = valid & (key_offsets < complete_token_count) & (owner_mask != 0)
             if STORE_SCORES:
                 score_base = (
                     score_ptr
@@ -3357,7 +3378,7 @@ if TRITON_AVAILABLE:
                 tl.store(
                     score_ptrs,
                     probabilities,
-                    mask=head_valid[:, None] & valid[None, :],
+                    mask=head_valid[:, None] & score_store_mask[None, :],
                 )
             d_probability = tl.dot(
                 grad_output.to(tl.bfloat16),
@@ -3381,16 +3402,17 @@ if TRITON_AVAILABLE:
                 tl.store(
                     d_score_ptrs,
                     d_score,
-                    mask=head_valid[:, None] & valid[None, :],
+                    mask=head_valid[:, None] & score_store_mask[None, :],
                 )
-            if TENSORIZE_DERIVATIVES:
-                grad_q += tl.dot(
-                    d_score.to(tl.bfloat16), k, out_dtype=tl.float32
-                ) * softmax_scale
-            else:
-                grad_q += tl.sum(
-                    d_score[:, :, None] * k[None, :, :], axis=1
-                ) * softmax_scale
+            if COMPUTE_DQ:
+                if TENSORIZE_DERIVATIVES:
+                    grad_q += tl.dot(
+                        d_score.to(tl.bfloat16), k, out_dtype=tl.float32
+                    ) * softmax_scale
+                else:
+                    grad_q += tl.sum(
+                        d_score[:, :, None] * k[None, :, :], axis=1
+                    ) * softmax_scale
 
             if EMIT_DKV:
                 emit_mask = valid
@@ -3404,6 +3426,21 @@ if TRITON_AVAILABLE:
                 # this dQ/correction kernel.  The small causal tail has a
                 # dedicated kernel below; otherwise the segmented reducer is
                 # the sole producer of complete-block dK/dV.
+                if HYBRID_DKV:
+                    complete_token_count = (length // RATIO) * RATIO
+                    owner_block = safe_selected // RATIO
+                    owner_mask = tl.load(
+                        owner_block_mask_ptr
+                        + batch * stride_omb
+                        + owner_block * stride_oms,
+                        mask=emit_mask & (key_offsets < complete_token_count),
+                        other=0,
+                    )
+                    # Complete blocks selected by the inverse-CSR owner are
+                    # removed from this query-side atomic stream.  The
+                    # incomplete causal tail remains atomic because it is not
+                    # represented in the complete-block owner list.
+                    emit_mask = emit_mask & (owner_mask == 0)
                 if TENSORIZE_DERIVATIVES and BLOCK_K == 64:
                     _qsa_emit_split64_dkv(
                         q,
@@ -3497,9 +3534,10 @@ if TRITON_AVAILABLE:
                             sem="relaxed",
                         )
 
-        grad_q_ptrs = (grad_q_ptr + batch * stride_dqb + query * stride_dqs + heads[:, None] * stride_dqh +
-                       d_offsets[None, :] * stride_dqd)
-        tl.store(grad_q_ptrs, grad_q, mask=head_valid[:, None] & (d_offsets[None, :] < head_dim))
+        if COMPUTE_DQ:
+            grad_q_ptrs = (grad_q_ptr + batch * stride_dqb + query * stride_dqs + heads[:, None] * stride_dqh +
+                           d_offsets[None, :] * stride_dqd)
+            tl.store(grad_q_ptrs, grad_q, mask=head_valid[:, None] & (d_offsets[None, :] < head_dim))
 
     @triton.jit
     def _qsa_selected_kv_backward_packed_grouped_kernel(
@@ -5066,6 +5104,7 @@ if TRITON_AVAILABLE:
         query_position_ptr,
         cursor_ptr,
         occurrence_query_ptr,
+        owner_block_mask_ptr,
         seq_len,
         seq_len_k,
         num_blocks,
@@ -5077,6 +5116,7 @@ if TRITON_AVAILABLE:
         BLOCK_TOPK: tl.constexpr,
         RATIO: tl.constexpr,
         COMPACT_ROUTE: tl.constexpr,
+        FILTER_OWNER: tl.constexpr,
     ):
         """Fill inverse block CSR lists with flattened query-row owners."""
 
@@ -5134,6 +5174,13 @@ if TRITON_AVAILABLE:
                 ).to(tl.int32)
                 valid = valid & (token == block_ids * RATIO + token_offset)
         keys = batch * num_blocks + block_ids
+        if FILTER_OWNER:
+            owner = tl.load(
+                owner_block_mask_ptr + keys,
+                mask=valid,
+                other=0,
+            )
+            valid = valid & (owner != 0)
         destinations = tl.atomic_add(cursor_ptr + keys, 1, mask=valid)
         tl.store(
             occurrence_query_ptr + destinations,
@@ -7739,6 +7786,7 @@ def qsa_prepare_segmented_metadata(
     seq_len_k: int,
     ratio: int,
     route_block_size: int = 1,
+    owner_min_fanout: int = 0,
 ):
     """Build a reusable inverse CSR map for QSA complete blocks.
 
@@ -7746,12 +7794,18 @@ def qsa_prepare_segmented_metadata(
     it equals ``ratio``, the input is the compact block-ID route and the
     inverse map reads one block ID per slot.  Occurrences encode both the
     flattened query row and its route slot so a later owner can consume saved
-    probability derivatives without another route search.
+    probability derivatives without another route search.  When
+    ``owner_min_fanout`` is positive, only complete blocks with at least that
+    many query occurrences are placed in the owner map; the remaining blocks
+    stay on the query-side atomic path.
     """
 
     if ratio < 2 or (ratio & (ratio - 1)):
         raise ValueError(
             "QSA segmented dK/dV reduction requires a power-of-two ratio >= 2")
+    owner_min_fanout = int(owner_min_fanout)
+    if owner_min_fanout < 0:
+        raise ValueError("QSA segmented owner_min_fanout must be non-negative")
     route_block_size = int(route_block_size)
     if route_block_size not in {1, ratio}:
         raise ValueError(
@@ -7802,6 +7856,10 @@ def qsa_prepare_segmented_metadata(
         (counts.numel() + 1,), device=topk_indices.device, dtype=torch.int32
     )
     starts[0] = 0
+    owner_mask = None
+    if owner_min_fanout > 0:
+        owner_mask = (counts >= owner_min_fanout).to(torch.int8)
+        counts = torch.where(owner_mask != 0, counts, torch.zeros_like(counts))
     starts[1:] = counts.cumsum(0).to(torch.int32)
     cursor = starts[:-1].clone()
     occurrences = torch.empty(
@@ -7813,6 +7871,7 @@ def qsa_prepare_segmented_metadata(
         query_positions,
         cursor,
         occurrences,
+        owner_mask if owner_mask is not None else counts,
         seq_len_q,
         seq_len_k,
         num_blocks,
@@ -7824,10 +7883,13 @@ def qsa_prepare_segmented_metadata(
         BLOCK_TOPK=block_topk,
         RATIO=ratio,
         COMPACT_ROUTE=route_block_size == ratio,
+        FILTER_OWNER=owner_mask is not None,
         num_warps=4,
         num_stages=1,
     )
-    return occurrences, starts, block_topk, num_blocks
+    if owner_mask is None:
+        return occurrences, starts, block_topk, num_blocks
+    return occurrences, starts, block_topk, num_blocks, owner_mask
 
 
 def qsa_segmented_dkv_tail(
@@ -8062,7 +8124,13 @@ def qsa_segmented_dkv_reduce(
     if use_saved_derivatives and saved_d_scores.shape != saved_scores.shape:
         raise ValueError(
             "QSA segmented dK/dV reduction saved d_score shape does not match probability")
-    if segmented_metadata is None:
+    hybrid_min_fanout = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT', '0'))
+    if hybrid_min_fanout < 0:
+        raise ValueError(
+            'QSA segmented hybrid fanout threshold must be non-negative')
+    if (segmented_metadata is None or
+            (hybrid_min_fanout > 0 and len(segmented_metadata) < 5)):
         segmented_metadata = qsa_prepare_segmented_metadata(
             topk_indices,
             topk_length,
@@ -8071,8 +8139,12 @@ def qsa_segmented_dkv_reduce(
             sk,
             ratio,
             route_block_size=route_block_size,
+            owner_min_fanout=hybrid_min_fanout,
         )
-    occurrences, starts, block_topk, num_blocks = segmented_metadata
+    occurrences, starts, block_topk, num_blocks = segmented_metadata[:4]
+    if hybrid_min_fanout > 0 and len(segmented_metadata) < 5:
+        raise RuntimeError(
+            'QSA hybrid segmented reduction requires an owner block mask')
     group_size = num_q_heads // num_kv_heads
     block_d = max(16, triton.next_power_of_2(head_dim))
     # Real score-selected routes have a heavier occurrence tail than the
@@ -8245,6 +8317,10 @@ def qsa_selected_kv_backward(
     query-owned probability and d-score scalars so the owner skips QK/dP
     recomputation.  This opt-in mode uses O(B*S*Hq*K) scalar workspace and is
     not the default atomic production path.
+    ``MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT`` restricts that owner map to
+    complete blocks with a sufficient fan-out; cold blocks remain atomic.
+    ``MCORE_BRIDGE_QSA_BACKWARD_SPLIT_DKV=1`` is a separate diagnostic that
+    launches dQ and dK/dV independently and deliberately recomputes scores.
     """
 
     if not TRITON_AVAILABLE:
@@ -8329,9 +8405,15 @@ def qsa_selected_kv_backward(
         "MCORE_BRIDGE_QSA_DKV_REDUCTION", dkv_reduction
     ).lower() == "segmented"
     segment_ratio = None
+    hybrid_min_fanout = 0
     use_segmented_reduction = False
     if segment_reduction_requested and selected_token_group_size is not None:
         segment_ratio = int(selected_token_group_size)
+        hybrid_min_fanout = int(os.environ.get(
+            'MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT', '0'))
+        if hybrid_min_fanout < 0:
+            raise ValueError(
+                'QSA segmented hybrid fanout threshold must be non-negative')
         compact_route = route_block_size > 1
         block_topk_numerator = (
             topk_indices.shape[-1]
@@ -8432,6 +8514,32 @@ def qsa_selected_kv_backward(
         torch.empty((batch, num_q_heads, sq), device=query.device, dtype=torch.float32)
         if use_segmented_reduction else lse
     )
+    owner_block_mask = None
+    if use_segmented_reduction:
+        if (segmented_metadata is None or
+                (hybrid_min_fanout > 0 and len(segmented_metadata) < 5)):
+            segmented_metadata = qsa_prepare_segmented_metadata(
+                topk_indices,
+                topk_length,
+                query_positions,
+                sq,
+                sk,
+                segment_ratio,
+                route_block_size=route_block_size,
+                owner_min_fanout=hybrid_min_fanout,
+            )
+        owner_block_mask = (
+            segmented_metadata[4]
+            if len(segmented_metadata) >= 5 else None
+        )
+        if hybrid_min_fanout > 0 and owner_block_mask is None:
+            raise RuntimeError(
+                'QSA hybrid segmented reduction requires an owner block mask')
+    hybrid_reduction = hybrid_min_fanout > 0
+    owner_mask_workspace = owner_block_mask if owner_block_mask is not None else query
+    owner_mask_stride_batch = (
+        owner_block_mask.numel() // batch if owner_block_mask is not None else 0)
+    owner_mask_stride_block = 1 if owner_block_mask is not None else 0
     group_size = num_q_heads // num_kv_heads
     tensorized_default = (
         group_size >= 5
@@ -8507,7 +8615,7 @@ def qsa_selected_kv_backward(
     if backward_num_warps not in {1, 2, 4, 8} or backward_num_stages not in {1, 2, 3, 4}:
         raise ValueError(
             'QSA backward tuning expects warps in {1,2,4,8} and stages in {1,2,3,4}')
-    _qsa_selected_kv_backward_grouped_kernel[grid](
+    kernel_args = (
         query,
         key,
         value,
@@ -8522,6 +8630,7 @@ def qsa_selected_kv_backward(
         grad_value,
         score_workspace,
         d_score_workspace,
+        owner_mask_workspace,
         sq,
         sk,
         num_q_heads,
@@ -8582,47 +8691,72 @@ def qsa_selected_kv_backward(
         d_score_workspace.stride(1),
         d_score_workspace.stride(2),
         d_score_workspace.stride(3),
+        owner_mask_stride_batch,
+        owner_mask_stride_block,
         correction,
         correction.stride(0),
         correction.stride(1),
         correction.stride(2),
-        K=logical_k,
-        HEADS_PER_KV=head_tile_size,
-        GROUP_SIZE=group_size,
-        NUM_HEAD_TILES=num_head_tiles,
-        BLOCK_K=block_k,
-        CORRECTION_BLOCK_K=correction_block_k,
-        BLOCK_D=block_d,
-        CAUSAL=causal,
-        HAS_GRAD_OUTPUT=grad_output_present,
-        HAS_GRAD_LSE=grad_lse_present,
-        USE_OUTPUT_DELTA=use_output_delta,
-        DKV_ACCUM_BF16=dkv_accum_dtype == 'bf16',
-        SEGMENT_BLOCK_TOPK=(
+    )
+    kernel_options = {
+        'K': logical_k,
+        'HEADS_PER_KV': head_tile_size,
+        'GROUP_SIZE': group_size,
+        'NUM_HEAD_TILES': num_head_tiles,
+        'BLOCK_K': block_k,
+        'CORRECTION_BLOCK_K': correction_block_k,
+        'BLOCK_D': block_d,
+        'CAUSAL': causal,
+        'HAS_GRAD_OUTPUT': grad_output_present,
+        'HAS_GRAD_LSE': grad_lse_present,
+        'USE_OUTPUT_DELTA': use_output_delta,
+        'DKV_ACCUM_BF16': dkv_accum_dtype == 'bf16',
+        'SEGMENT_BLOCK_TOPK': (
             (topk_indices.shape[-1] if route_block_size > 1 else
              (topk_indices.shape[-1] - (segment_ratio - 1)) // segment_ratio)
             if use_segmented_reduction else 1
         ),
-        RATIO=segment_ratio if use_segmented_reduction else 2,
-        STORE_CORRECTION=use_segmented_reduction,
-        TAIL_ONLY=use_segmented_reduction,
-        # Segmented mode computes complete-block dK/dV exactly once in the
-        # inverse-CSR reducer.  Its tiny causal tail is emitted by the
-        # dedicated tail launch below; keeping EMIT_DKV false here removes
-        # the otherwise duplicated complete-block reductions.
-        EMIT_DKV=not use_segmented_reduction,
-        STORE_SCORES=saved_scores is not None,
-        STORE_DERIVATIVES=saved_d_scores is not None,
-        SCORE_CHUNK=score_chunk,
-        SCORE_CHUNKS=score_chunks,
-        TENSORIZE_DERIVATIVES=tensorize_derivatives,
-        TRIM_CAUSAL_LOOP=trim_causal_loop,
-        ROUTE_SLOTS=route_slots,
-        ROUTE_BLOCK_SIZE=route_block_size,
-        num_warps=backward_num_warps,
-        num_stages=backward_num_stages,
+        'RATIO': segment_ratio if use_segmented_reduction else 2,
+        'STORE_CORRECTION': use_segmented_reduction,
+        'TAIL_ONLY': use_segmented_reduction and not hybrid_reduction,
+        # Full segmented mode computes complete-block dK/dV exactly once in
+        # the inverse-CSR reducer.  Hybrid mode keeps cold blocks in this
+        # query-side producer and masks only owner-selected complete blocks.
+        'EMIT_DKV': (not use_segmented_reduction) or hybrid_reduction,
+        'HYBRID_DKV': hybrid_reduction,
+        'COMPUTE_DQ': True,
+        'STORE_SCORES': saved_scores is not None,
+        'STORE_DERIVATIVES': saved_d_scores is not None,
+        'SCORE_CHUNK': score_chunk,
+        'SCORE_CHUNKS': score_chunks,
+        'TENSORIZE_DERIVATIVES': tensorize_derivatives,
+        'TRIM_CAUSAL_LOOP': trim_causal_loop,
+        'ROUTE_SLOTS': route_slots,
+        'ROUTE_BLOCK_SIZE': route_block_size,
+        'num_warps': backward_num_warps,
+        'num_stages': backward_num_stages,
+    }
+    split_dkv = (
+        not use_segmented_reduction
+        and os.environ.get('MCORE_BRIDGE_QSA_BACKWARD_SPLIT_DKV', '0') != '0'
     )
-    if use_segmented_reduction:
+    if split_dkv:
+        # Diagnostic split: the first launch owns dQ and the second owns
+        # dK/dV.  It removes the dQ accumulator from the atomic launch, but
+        # intentionally recomputes the selected scores; keep it opt-in until
+        # its extra arithmetic beats the fused baseline on real routes.
+        dquery_options = kernel_options.copy()
+        dquery_options.update(EMIT_DKV=False, COMPUTE_DQ=True)
+        dkv_options = kernel_options.copy()
+        dkv_options.update(EMIT_DKV=True, COMPUTE_DQ=False)
+        _qsa_selected_kv_backward_grouped_kernel[grid](
+            *kernel_args, **dquery_options)
+        _qsa_selected_kv_backward_grouped_kernel[grid](
+            *kernel_args, **dkv_options)
+    else:
+        _qsa_selected_kv_backward_grouped_kernel[grid](
+            *kernel_args, **kernel_options)
+    if use_segmented_reduction and not hybrid_reduction:
         qsa_segmented_dkv_tail(
             query,
             key,
@@ -8642,6 +8776,7 @@ def qsa_selected_kv_backward(
              (topk_indices.shape[-1] - (segment_ratio - 1)) // segment_ratio),
             route_block_size=route_block_size,
         )
+    if use_segmented_reduction:
         qsa_segmented_dkv_reduce(
             query,
             key,

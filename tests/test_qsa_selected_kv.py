@@ -1616,6 +1616,129 @@ def test_triton_segmented_dkv_matches_relaxed_atomic_on_sm90(monkeypatch):
     assert torch.allclose(segmented[4].float(), atomic[4].float(), atol=0.125, rtol=0.05)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatch):
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('requires H100/SM90')
+    torch.manual_seed(2026)
+    device = 'cuda'
+    sq, batch, hq, hkv, dim, ratio, block_topk = 64, 1, 24, 2, 256, 4, 4
+    positions = torch.arange(sq, device=device, dtype=torch.int32)
+    indices = torch.full(
+        (batch, sq, block_topk), -1, device=device, dtype=torch.int32)
+    lengths = torch.zeros((batch, sq), device=device, dtype=torch.int32)
+    for query in range(sq):
+        complete = min((query + 1) // ratio, block_topk)
+        tail = (query + 1) - ((query + 1) // ratio) * ratio
+        if complete:
+            block_ids = torch.arange(
+                complete, device=device, dtype=torch.int32)
+            if query % 2:
+                block_ids = block_ids.flip(0)
+            if complete >= 3 and query % 3 == 0:
+                block_ids[-1] = 0
+            indices[0, query, :complete] = block_ids
+        lengths[0, query] = complete * ratio + tail
+    q0 = torch.randn(sq, batch, hq, dim, device=device, dtype=torch.bfloat16)
+    k0 = torch.randn(sq, batch, hkv, dim, device=device, dtype=torch.bfloat16)
+    v0 = torch.randn_like(k0)
+    grad_out = torch.randn_like(q0)
+    grad_lse = torch.randn(batch, hq, sq, device=device, dtype=torch.float32) * 0.01
+
+    def run(threshold=None, reuse=False):
+        monkeypatch.setenv('MCORE_BRIDGE_QSA_DKV_REDUCTION', 'segmented')
+        if threshold is None:
+            monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT', raising=False)
+        else:
+            monkeypatch.setenv(
+                'MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT', str(threshold))
+        if reuse:
+            monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_REUSE_DERIVATIVES', '1')
+            monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_SCORE_DTYPE', 'bf16')
+            monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_D_SCORE_DTYPE', 'bf16')
+        else:
+            monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_REUSE_DERIVATIVES', raising=False)
+            monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_SCORE_DTYPE', raising=False)
+            monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_D_SCORE_DTYPE', raising=False)
+        q = q0.detach().clone().requires_grad_()
+        k = k0.detach().clone().requires_grad_()
+        v = v0.detach().clone().requires_grad_()
+        output, lse = qsa_sparse_forward(
+            q, k, v, indices, lengths, backend='triton',
+            query_positions=positions, selected_token_group_size=ratio,
+            dkv_reduction='segmented', route_block_size=ratio)
+        ((output.float() * grad_out.float()).sum()
+         + (lse * grad_lse).sum()).backward()
+        result = (
+            output.detach(), lse.detach(), q.grad.detach(),
+            k.grad.detach(), v.grad.detach())
+        del q, k, v, output, lse
+        return result
+
+    reference = run()
+    hybrid = run(threshold=2)
+    hybrid_saved = run(threshold=2, reuse=True)
+    for actual in (hybrid, hybrid_saved):
+        assert torch.equal(actual[0], reference[0])
+        assert torch.equal(actual[1], reference[1])
+        assert torch.equal(actual[2], reference[2])
+        for actual_grad, reference_grad in zip(actual[3:], reference[3:]):
+            assert torch.isfinite(actual_grad).all()
+            assert torch.allclose(
+                actual_grad.float(), reference_grad.float(), atol=0.125, rtol=0.05)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_triton_split_dkv_backward_matches_fused_on_sm90(monkeypatch):
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('requires H100/SM90')
+    torch.manual_seed(2027)
+    device = 'cuda'
+    sq, batch, hq, hkv, dim, ratio, block_topk = 64, 1, 24, 2, 256, 4, 4
+    positions = torch.arange(sq, device=device, dtype=torch.int32)
+    indices = torch.full(
+        (batch, sq, block_topk), -1, device=device, dtype=torch.int32)
+    lengths = torch.zeros((batch, sq), device=device, dtype=torch.int32)
+    for query in range(sq):
+        complete = min((query + 1) // ratio, block_topk)
+        tail = (query + 1) - ((query + 1) // ratio) * ratio
+        if complete:
+            indices[0, query, :complete] = torch.arange(
+                complete, device=device, dtype=torch.int32)
+        lengths[0, query] = complete * ratio + tail
+    q0 = torch.randn(sq, batch, hq, dim, device=device, dtype=torch.bfloat16)
+    k0 = torch.randn(sq, batch, hkv, dim, device=device, dtype=torch.bfloat16)
+    v0 = torch.randn_like(k0)
+    grad_out = torch.randn_like(q0)
+    grad_lse = torch.randn(batch, hq, sq, device=device, dtype=torch.float32) * 0.01
+
+    def run(split):
+        monkeypatch.delenv('MCORE_BRIDGE_QSA_DKV_REDUCTION', raising=False)
+        monkeypatch.delenv('MCORE_BRIDGE_QSA_BACKWARD_SPLIT_DKV', raising=False)
+        if split:
+            monkeypatch.setenv('MCORE_BRIDGE_QSA_BACKWARD_SPLIT_DKV', '1')
+        q = q0.detach().clone().requires_grad_()
+        k = k0.detach().clone().requires_grad_()
+        v = v0.detach().clone().requires_grad_()
+        output, lse = qsa_sparse_forward(
+            q, k, v, indices, lengths, backend='triton',
+            query_positions=positions, selected_token_group_size=ratio,
+            route_block_size=ratio)
+        ((output.float() * grad_out.float()).sum()
+         + (lse * grad_lse).sum()).backward()
+        result = (q.grad.detach(), k.grad.detach(), v.grad.detach())
+        del q, k, v, output, lse
+        return result
+
+    fused = run(False)
+    split = run(True)
+    assert torch.equal(fused[0], split[0])
+    for split_grad, fused_grad in zip(split[1:], fused[1:]):
+        assert torch.isfinite(split_grad).all()
+        assert torch.allclose(
+            split_grad.float(), fused_grad.float(), atol=0.5, rtol=0.05)
+
+
 @pytest.mark.parametrize('output_delta', ('1', '0'))
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
 def test_triton_selected_kv_backward_matches_torch_on_sm90(monkeypatch, output_delta):
