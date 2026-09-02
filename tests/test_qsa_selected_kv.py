@@ -1743,7 +1743,8 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
             listed=False, persistent=False, grouped_blocks=None,
             grouped_union=False, table_scan=False, table_recompute=False,
             split_recompute=False, resident_owner_map=False,
-            resident_table_plan=False, owner_slot=False):
+            resident_table_plan=False, owner_slot=False,
+            recompute_owner=False):
         monkeypatch.setenv('MCORE_BRIDGE_QSA_DKV_REDUCTION', 'segmented')
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEAD_TILES', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEAD_TILES_TILED', raising=False)
@@ -1753,6 +1754,8 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_PERSISTENT_CTAS', raising=False)
         monkeypatch.delenv(
             'MCORE_BRIDGE_QSA_SEGMENT_OWNER_SLOT_DERIVATIVES', raising=False)
+        monkeypatch.delenv(
+            'MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_RECOMPUTE', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_GROUP_BLOCKS', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_GROUP_UNION', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_SEGMENT_TABLE_SCAN', raising=False)
@@ -1785,6 +1788,9 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
                 'MCORE_BRIDGE_QSA_SEGMENT_OWNER_SLOT_DERIVATIVES', '1')
             monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_FLAT', '1')
             monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_COMPACT_BLOCK_LIST', '1')
+        if recompute_owner:
+            monkeypatch.setenv(
+                'MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_RECOMPUTE', '1')
         if listed:
             monkeypatch.setenv('MCORE_BRIDGE_QSA_SEGMENT_COMPACT_BLOCK_LIST', '1')
         if persistent:
@@ -1844,6 +1850,7 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
     grouped_union_duplicate = run(
         threshold=2, reuse=True, compact=True, grouped_blocks=4,
         grouped_union=True)
+    recompute_owner = run(threshold=2, recompute_owner=True)
     owner_slot = run(threshold=2, reuse=True, owner_slot=True)
     table_scan_duplicate = run(
         threshold=2, reuse=True, compact=True, grouped_blocks=4,
@@ -1854,7 +1861,8 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
     for actual in (hybrid, hybrid_saved, fused_owner, tiled_owner, listed_owner,
                    persistent_owner, grouped_owner2, grouped_owner4,
                    grouped_union_duplicate, table_scan_duplicate,
-                   resident_table_scan_duplicate, owner_slot):
+                   resident_table_scan_duplicate, recompute_owner,
+                   owner_slot):
         assert torch.equal(actual[0], reference[0])
         assert torch.equal(actual[1], reference[1])
         assert torch.equal(actual[2], reference[2])
@@ -1899,7 +1907,22 @@ def test_triton_owner_slot_derivatives_batch_two_matches_reference_on_sm90(monke
     grad_output = torch.randn_like(q0)
     grad_lse = torch.randn(batch, hq, sq, device=device, dtype=torch.float32) * 0.01
 
-    def run(route, route_size, backend):
+    def run(route, route_size, backend, recompute_owner=False):
+        if recompute_owner:
+            monkeypatch.delenv(
+                'MCORE_BRIDGE_QSA_SEGMENT_OWNER_SLOT_DERIVATIVES',
+                raising=False)
+            monkeypatch.delenv(
+                'MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_FLAT', raising=False)
+            monkeypatch.delenv(
+                'MCORE_BRIDGE_QSA_SEGMENT_COMPACT_BLOCK_LIST', raising=False)
+            monkeypatch.delenv(
+                'MCORE_BRIDGE_QSA_SEGMENT_COMPACT_DERIVATIVES', raising=False)
+            monkeypatch.setenv(
+                'MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_RECOMPUTE', '1')
+        else:
+            monkeypatch.delenv(
+                'MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_RECOMPUTE', raising=False)
         query = q0.detach().clone().requires_grad_()
         key = k0.detach().clone().requires_grad_()
         value = v0.detach().clone().requires_grad_()
@@ -1924,13 +1947,15 @@ def test_triton_owner_slot_derivatives_batch_two_matches_reference_on_sm90(monke
 
     reference = run(tokens, 1, 'torch')
     actual = run(blocks, ratio, 'triton')
-    assert torch.allclose(actual[0].float(), reference[0].float(), atol=2e-2, rtol=2e-2)
-    assert torch.allclose(actual[1], reference[1], atol=2e-5, rtol=2e-5)
-    assert torch.allclose(actual[2].float(), reference[2].float(), atol=5e-2, rtol=5e-2)
-    for actual_grad, reference_grad in zip(actual[3:], reference[3:]):
-        assert torch.isfinite(actual_grad).all()
-        assert torch.allclose(
-            actual_grad.float(), reference_grad.float(), atol=0.125, rtol=0.05)
+    recompute_owner = run(blocks, ratio, 'triton', recompute_owner=True)
+    for candidate in (actual, recompute_owner):
+        assert torch.allclose(candidate[0].float(), reference[0].float(), atol=2e-2, rtol=2e-2)
+        assert torch.allclose(candidate[1], reference[1], atol=2e-5, rtol=2e-5)
+        assert torch.allclose(candidate[2].float(), reference[2].float(), atol=5e-2, rtol=5e-2)
+        for actual_grad, reference_grad in zip(candidate[3:], reference[3:]):
+            assert torch.isfinite(actual_grad).all()
+            assert torch.allclose(
+                actual_grad.float(), reference_grad.float(), atol=0.125, rtol=0.05)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
