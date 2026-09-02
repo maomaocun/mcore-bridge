@@ -12864,14 +12864,30 @@ def qsa_selected_kv_backward(
         and sq <= 8 * logical_k
         and is_sm90(query.device)
     )
+    auto_hybrid_long = (
+        auto_hybrid
+        and use_segmented_reduction
+        and hybrid_min_fanout == 12288
+        and sq >= 262144
+        and is_sm90(query.device)
+        and dkv_accum_dtype == 'bf16'
+        and tensorized_tile
+        and head_tile_size == 16
+        and group_size == 12
+        and head_dim == 256
+        and route_block_size == 4
+    )
     # K32 is the stable Hopper derivative tile.  The former short-sequence
     # K64 path reduced loop overhead but required four warps and generated a
     # wider burst of reductions into hot KV rows.  A two-warp K32 launch is
     # faster when the causal runtime bound is active and retains K32's
-    # bounded derivative/atomic tile.  Token-route compatibility and other
+    # bounded derivative/atomic tile.  The maximum-context auto hybrid is a
+    # separate measured K16 geometry; token-route compatibility and other
     # shapes retain the previously tuned K64 short-prefix dispatch.
     default_block_k = (
-        32
+        16
+        if auto_hybrid_long
+        else 32
         if hopper_short_compact
         else 64
         if (
@@ -12917,17 +12933,7 @@ def qsa_selected_kv_backward(
     auto_hybrid_maxnreg = (
         224
         if (
-            auto_hybrid
-            and use_segmented_reduction
-            and hybrid_min_fanout == 12288
-            and sq >= 262144
-            and is_sm90(query.device)
-            and dkv_accum_dtype == 'bf16'
-            and tensorized_tile
-            and head_tile_size == 16
-            and group_size == 12
-            and head_dim == 256
-            and route_block_size == 4
+            auto_hybrid_long
         )
         else 0
     )
