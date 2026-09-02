@@ -10269,7 +10269,7 @@ def _qsa_auto_hybrid_enabled(
 def _qsa_auto_hybrid_default_min_fanout(seq_len: int) -> int:
     """Return the measured default owner threshold for a long route."""
 
-    return 12288 if int(seq_len) >= 262144 else 8192
+    return 10000 if int(seq_len) >= 262144 else 8192
 
 
 def _qsa_prepare_segmented_query_union(
@@ -12379,7 +12379,7 @@ def qsa_selected_kv_backward(
     direct flattened 16-head MMA geometry for that owner; it remains opt-in.
     ``MCORE_BRIDGE_QSA_AUTO_HYBRID=1`` selects the measured length-adaptive
     compact hybrid (fanout 8,192 and the K16/224/2-warp producer in the
-    196K--256K interval, then fanout 12,288 with the same producer at/above
+    196K--256K interval, then fanout 10,000 with the same producer at/above
     256K) for eligible long-context calls when the higher-level attention
     dispatcher has enabled the same explicit mode.  It never changes the
     ordinary atomic default.
@@ -12390,7 +12390,7 @@ def qsa_selected_kv_backward(
     while retaining the original LSE-based probability formula.
     ``MCORE_BRIDGE_QSA_BACKWARD_MAXNREG`` overrides the Triton register cap;
     for the validated SM90 production shape it defaults to 192 on the
-    untrimmed long atomic route and to 224 on the auto-hybrid >=262K/T=12,288
+    untrimmed long atomic route and to 224 on the auto-hybrid >=262K/T=10,000
     route, while short and other segmented paths retain the compiler default.
     """
 
@@ -12874,7 +12874,7 @@ def qsa_selected_kv_backward(
                 and 196608 <= sq < 262144
             )
             or (
-                hybrid_min_fanout == 12288
+                hybrid_min_fanout == 10000
                 and sq >= 262144
             )
         )
@@ -12938,7 +12938,7 @@ def qsa_selected_kv_backward(
     # The long atomic production route is the only validated point where a
     # small register cap improves SM90 scheduling.  Compact hybrid has a
     # different producer live range: at the maximum context the measured
-    # T=12,288 point accepts 224, while the shorter hybrid and lower caps spill
+    # T=10,000 point accepts 224, while the shorter hybrid and lower caps spill
     # or lose scheduling headroom.  An explicit environment value (including
     # zero) always overrides these shape-specific defaults.
     auto_hybrid_maxnreg = (

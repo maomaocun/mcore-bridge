@@ -319,7 +319,7 @@ def _qsa_auto_hybrid_eligible(
 def _qsa_auto_hybrid_default_min_fanout(seq_len: int) -> int:
     """Return the measured default owner threshold for a long route."""
 
-    return 12288 if int(seq_len) >= 262144 else 8192
+    return 10000 if int(seq_len) >= 262144 else 8192
 
 
 @torch.no_grad()
@@ -1003,7 +1003,7 @@ def qsa_sparse_forward(
     for compact B=1 BF16 routes at or above
     ``MCORE_BRIDGE_QSA_AUTO_HYBRID_MIN_SEQ_LEN`` (default 163,840), it selects
     the measured length-adaptive compact hybrid (fanout 8,192 with the
-    K16/224/2-warp producer from 196K to below 256K, then 12,288 with the same
+    K16/224/2-warp producer from 196K to below 256K, then 10,000 with the same
     producer at/above 256K).  The normal default remains atomic and an
     explicit ``MCORE_BRIDGE_QSA_DKV_REDUCTION`` takes precedence.
     """

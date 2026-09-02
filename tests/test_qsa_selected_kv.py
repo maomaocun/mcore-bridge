@@ -68,7 +68,7 @@ def test_auto_hybrid_default_fanout_schedule_matches_dispatchers():
         196607: 8192,
         196608: 8192,
         262143: 8192,
-        262144: 12288,
+        262144: 10000,
     }
     for seq_len, fanout in expected.items():
         assert _attention_auto_hybrid_fanout(seq_len) == fanout
