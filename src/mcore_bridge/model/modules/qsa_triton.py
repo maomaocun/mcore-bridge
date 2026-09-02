@@ -6328,6 +6328,7 @@ if TRITON_AVAILABLE:
         BATCH_ONE: tl.constexpr,
         RECOMPUTE_DERIVATIVES: tl.constexpr,
         USE_BLOCK_LIST: tl.constexpr,
+        NUM_OCC_SPLITS: tl.constexpr,
     ):
         """Fuse all GQA head tiles into one block owner.
 
@@ -6342,10 +6343,13 @@ if TRITON_AVAILABLE:
         program = tl.program_id(0)
         head_work = program % num_kv_heads
         kv_head = head_work
-        key_group = program // num_kv_heads
+        owner_work = program // num_kv_heads
+        split = owner_work % NUM_OCC_SPLITS
+        owner_group = owner_work // NUM_OCC_SPLITS
+        key_group = owner_group
         if USE_BLOCK_LIST:
             key_group = tl.load(
-                owner_block_list_ptr + key_group).to(tl.int32)
+                owner_block_list_ptr + owner_group).to(tl.int32)
         batch = key_group // num_blocks
         block = key_group - batch * num_blocks
         segment_start = tl.load(segment_start_ptr + key_group).to(tl.int32)
@@ -6389,7 +6393,9 @@ if TRITON_AVAILABLE:
         head_lanes = flat_offsets - occurrence_lanes * HEAD_TILE
 
         for occurrence_offset in tl.range(
-            0, segment_end - segment_start, BLOCK_OCC
+            split * BLOCK_OCC,
+            segment_end - segment_start,
+            NUM_OCC_SPLITS * BLOCK_OCC,
         ):
             occurrence = segment_start + occurrence_offset + occurrence_lanes
             encoded = tl.load(
@@ -6537,18 +6543,64 @@ if TRITON_AVAILABLE:
             + d_offsets[None, :] * stride_dvd
         )
         output_mask = key_mask[:, None] & (d_offsets[None, :] < head_dim)
-        # The tail launch, when present, precedes this owner launch.  It is
-        # therefore safe to fold the additive tail into the sole owner write.
-        existing_key = tl.load(key_output_ptrs, mask=output_mask, other=0.0).to(tl.float32)
-        existing_value = tl.load(value_output_ptrs, mask=output_mask, other=0.0).to(tl.float32)
-        grad_key_acc += existing_key
-        grad_value_acc += existing_value
-        if DKV_ACCUM_BF16:
-            tl.store(key_output_ptrs, grad_key_acc.to(tl.bfloat16), mask=output_mask)
-            tl.store(value_output_ptrs, grad_value_acc.to(tl.bfloat16), mask=output_mask)
+        if NUM_OCC_SPLITS > 1:
+            # Each split owns a disjoint inverse-CSR slice.  The split count
+            # is deliberately small, so these atomics are block-level arrivals
+            # rather than one arrival per selected query/token.  The causal
+            # tail (and cold hybrid blocks) was emitted before this launch and
+            # is already present in the destination.
+            if DKV_ACCUM_BF16:
+                tl.atomic_add(
+                    key_output_ptrs,
+                    grad_key_acc.to(tl.bfloat16),
+                    mask=output_mask,
+                    sem="relaxed",
+                )
+                tl.atomic_add(
+                    value_output_ptrs,
+                    grad_value_acc.to(tl.bfloat16),
+                    mask=output_mask,
+                    sem="relaxed",
+                )
+            else:
+                tl.atomic_add(
+                    key_output_ptrs,
+                    grad_key_acc,
+                    mask=output_mask,
+                    sem="relaxed",
+                )
+                tl.atomic_add(
+                    value_output_ptrs,
+                    grad_value_acc,
+                    mask=output_mask,
+                    sem="relaxed",
+                )
         else:
-            tl.store(key_output_ptrs, grad_key_acc, mask=output_mask)
-            tl.store(value_output_ptrs, grad_value_acc, mask=output_mask)
+            # The tail launch, when present, precedes this owner launch.  It
+            # is therefore safe to fold the additive tail into the sole owner
+            # write when there is only one occurrence split.
+            existing_key = tl.load(
+                key_output_ptrs, mask=output_mask, other=0.0
+            ).to(tl.float32)
+            existing_value = tl.load(
+                value_output_ptrs, mask=output_mask, other=0.0
+            ).to(tl.float32)
+            grad_key_acc += existing_key
+            grad_value_acc += existing_value
+            if DKV_ACCUM_BF16:
+                tl.store(
+                    key_output_ptrs,
+                    grad_key_acc.to(tl.bfloat16),
+                    mask=output_mask,
+                )
+                tl.store(
+                    value_output_ptrs,
+                    grad_value_acc.to(tl.bfloat16),
+                    mask=output_mask,
+                )
+            else:
+                tl.store(key_output_ptrs, grad_key_acc, mask=output_mask)
+                tl.store(value_output_ptrs, grad_value_acc, mask=output_mask)
 
     @triton.jit
     def _qsa_segmented_dkv_reduce_flat_heads_kernel(
@@ -6561,6 +6613,11 @@ if TRITON_AVAILABLE:
         d_score_ptr,
         grad_key_ptr,
         grad_value_ptr,
+        key_ptr,
+        value_ptr,
+        lse_ptr,
+        grad_lse_ptr,
+        correction_ptr,
         seq_len_q,
         seq_len_k,
         num_blocks,
@@ -6576,6 +6633,23 @@ if TRITON_AVAILABLE:
         stride_gos,
         stride_goh,
         stride_god,
+        stride_kb,
+        stride_ks,
+        stride_kh,
+        stride_kd,
+        stride_vb,
+        stride_vs,
+        stride_vh,
+        stride_vd,
+        stride_lseb,
+        stride_lseh,
+        stride_lses,
+        stride_glseb,
+        stride_glseh,
+        stride_glses,
+        stride_cb,
+        stride_ch,
+        stride_cs,
         stride_dkb,
         stride_dks,
         stride_dkh,
@@ -6601,17 +6675,20 @@ if TRITON_AVAILABLE:
         BLOCK_TOPK: tl.constexpr,
         BLOCK_D: tl.constexpr,
         HAS_GRAD_OUTPUT: tl.constexpr,
+        HAS_GRAD_LSE: tl.constexpr,
         DKV_ACCUM_BF16: tl.constexpr,
         BATCH_ONE: tl.constexpr,
         OWNER_SLOT_DERIVATIVES: tl.constexpr,
+        RECOMPUTE_DERIVATIVES: tl.constexpr,
     ):
         """Flatten all GQA heads for one KV block into one owner MMA tile.
 
         Compact derivatives provide the full-D probability and d-score values,
         so the owner can combine all query-head rows without recomputing QK or
-        dP.  One CTA owns a physical block/KV-head pair and performs one
-        contiguous dK/dV store after folding in any preceding causal-tail
-        contribution.
+        dP.  The recompute diagnostic instead loads the owned K/V block once
+        and derives those values from LSE/correction.  One CTA owns a physical
+        block/KV-head pair and performs one contiguous dK/dV store after
+        folding in any preceding causal-tail contribution.
         """
 
         program = tl.program_id(0)
@@ -6633,6 +6710,31 @@ if TRITON_AVAILABLE:
         d_offsets = tl.arange(0, BLOCK_D)
         key_positions = block * RATIO + token_offsets
         key_mask = key_positions < seq_len_k
+        if RECOMPUTE_DERIVATIVES:
+            key_ptrs = (
+                key_ptr
+                + batch * stride_kb
+                + key_positions[:, None] * stride_ks
+                + kv_head * stride_kh
+                + d_offsets[None, :] * stride_kd
+            )
+            key_value_raw = tl.load(
+                key_ptrs,
+                mask=key_mask[:, None] & (d_offsets[None, :] < head_dim),
+                other=0.0,
+            )
+            value_ptrs = (
+                value_ptr
+                + batch * stride_vb
+                + key_positions[:, None] * stride_vs
+                + kv_head * stride_vh
+                + d_offsets[None, :] * stride_vd
+            )
+            value_value_raw = tl.load(
+                value_ptrs,
+                mask=key_mask[:, None] & (d_offsets[None, :] < head_dim),
+                other=0.0,
+            )
         grad_key_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
         grad_value_acc = tl.zeros((RATIO, BLOCK_D), dtype=tl.float32)
         flat_offsets = tl.arange(0, BLOCK_M)
@@ -6689,7 +6791,55 @@ if TRITON_AVAILABLE:
                 & HAS_GRAD_OUTPUT,
                 other=0.0,
             ).to(tl.bfloat16)
-            if OWNER_SLOT_DERIVATIVES:
+            if RECOMPUTE_DERIVATIVES:
+                lse_value = tl.load(
+                    lse_ptr
+                    + query_batch * stride_lseb
+                    + heads * stride_lseh
+                    + query * stride_lses,
+                    mask=row_valid,
+                    other=0.0,
+                ).to(tl.float32)
+                correction_value = tl.load(
+                    correction_ptr
+                    + query_batch * stride_cb
+                    + heads * stride_ch
+                    + query * stride_cs,
+                    mask=row_valid,
+                    other=0.0,
+                ).to(tl.float32)
+                grad_lse_value = tl.load(
+                    grad_lse_ptr
+                    + query_batch * stride_glseb
+                    + heads * stride_glseh
+                    + query * stride_glses,
+                    mask=row_valid & HAS_GRAD_LSE,
+                    other=0.0,
+                ).to(tl.float32)
+                score = tl.dot(
+                    q_value,
+                    tl.trans(key_value_raw),
+                    out_dtype=tl.float32,
+                ) * softmax_scale
+                probability = tl.exp2(
+                    tl.where(
+                        row_valid[:, None] & key_mask[None, :],
+                        (score - lse_value[:, None])
+                        * 1.4426950408889634,
+                        -float("inf"),
+                    )
+                )
+                d_probability = tl.dot(
+                    grad_output,
+                    tl.trans(value_value_raw),
+                    out_dtype=tl.float32,
+                )
+                grad_score = (
+                    probability
+                    * (d_probability - correction_value[:, None])
+                    + grad_lse_value[:, None] * probability
+                )
+            elif OWNER_SLOT_DERIVATIVES:
                 score_base = (
                     score_ptr
                     + tl.cast(
@@ -10633,6 +10783,13 @@ def qsa_segmented_dkv_reduce(
     performs one contiguous dK/dV store.  It is an opt-in profile control;
     ``..._RECOMPUTE_MAXNREG`` may cap its registers, but register-cap A/B did
     not improve the measured SM90 point.
+    ``MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_OCC_SPLITS`` optionally shards the
+    owner's inverse-CSR segment across 2/4/8 CTAs; each split performs one
+    block-level atomic output update and is intended to expose more parallelism
+    for long owner segments without a global partial workspace.
+    ``MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_RECOMPUTE_FLAT=1`` uses the direct
+    16-head flattened MMA tile for the recompute owner; it is an opt-in shape
+    control and currently supports one occurrence split.
     ``MCORE_BRIDGE_QSA_SEGMENT_OWNER_SLOT_DERIVATIVES=1`` selects the
     owner-rank derivative workspace, which avoids the reverse occurrence map
     but scales with the selected owner count and remains diagnostic.
@@ -11641,6 +11798,11 @@ def qsa_segmented_dkv_reduce(
         and route_block_size == ratio
         and flatten_heads
     )
+    fuse_owner_heads_recompute_flat = (
+        fuse_owner_heads_recompute
+        and os.environ.get(
+            'MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_RECOMPUTE_FLAT', '0') != '0'
+    )
     fuse_owner_heads_tiled = (
         fuse_owner_heads
         and os.environ.get(
@@ -11682,6 +11844,9 @@ def qsa_segmented_dkv_reduce(
     if fuse_owner_heads_flat and group_size > 16:
         raise RuntimeError(
             'QSA flat fused owner currently supports GQA groups up to 16 heads')
+    if fuse_owner_heads_recompute_flat and group_size > 16:
+        raise RuntimeError(
+            'QSA flat recompute owner currently supports GQA groups up to 16 heads')
     if (fuse_owner_heads_recompute
             and block_occ * segment_head_tile < 16):
         raise RuntimeError(
@@ -11692,6 +11857,17 @@ def qsa_segmented_dkv_reduce(
     if recompute_owner_maxnreg < 0:
         raise ValueError(
             'QSA fused recompute owner maxnreg must be non-negative')
+    recompute_owner_splits = int(os.environ.get(
+        'MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_OCC_SPLITS', '1'))
+    if recompute_owner_splits not in {1, 2, 4, 8}:
+        raise ValueError(
+            'QSA fused owner occurrence splits expects one of {1,2,4,8}')
+    if recompute_owner_splits > 1 and not recompute_owner_requested:
+        raise RuntimeError(
+            'QSA fused owner occurrence splits require the recompute owner')
+    if fuse_owner_heads_recompute_flat and recompute_owner_splits != 1:
+        raise RuntimeError(
+            'QSA flat recompute owner currently requires one occurrence split')
     if fuse_owner_heads_tiled:
         fused_kernel_args = (
             query,
@@ -11838,17 +12014,26 @@ def qsa_segmented_dkv_reduce(
             num_stages=1,
         )
         return
-    if fuse_owner_heads_flat:
+    if fuse_owner_heads_flat or fuse_owner_heads_recompute_flat:
+        flat_score_workspace = (
+            saved_scores if saved_scores is not None else query)
+        flat_d_score_workspace = (
+            saved_d_scores if saved_d_scores is not None else query)
         flat_kernel_args = (
             query,
             grad_output,
             occurrences,
             starts,
             owner_block_list_workspace,
-            saved_scores,
-            saved_d_scores,
+            flat_score_workspace,
+            flat_d_score_workspace,
             grad_key,
             grad_value,
+            key,
+            value,
+            lse,
+            grad_lse,
+            correction,
             sq,
             sk,
             num_blocks,
@@ -11864,6 +12049,23 @@ def qsa_segmented_dkv_reduce(
             grad_output.stride(0),
             grad_output.stride(2),
             grad_output.stride(3),
+            key.stride(1),
+            key.stride(0),
+            key.stride(2),
+            key.stride(3),
+            value.stride(1),
+            value.stride(0),
+            value.stride(2),
+            value.stride(3),
+            lse.stride(0),
+            lse.stride(1),
+            lse.stride(2),
+            grad_lse.stride(0),
+            grad_lse.stride(1),
+            grad_lse.stride(2),
+            correction.stride(0),
+            correction.stride(1),
+            correction.stride(2),
             grad_key.stride(1),
             grad_key.stride(0),
             grad_key.stride(2),
@@ -11872,14 +12074,14 @@ def qsa_segmented_dkv_reduce(
             grad_value.stride(0),
             grad_value.stride(2),
             grad_value.stride(3),
-            saved_scores.stride(0),
-            saved_scores.stride(1),
-            saved_scores.stride(2),
-            saved_scores.stride(3),
-            saved_d_scores.stride(0),
-            saved_d_scores.stride(1),
-            saved_d_scores.stride(2),
-            saved_d_scores.stride(3),
+            flat_score_workspace.stride(0),
+            flat_score_workspace.stride(1),
+            flat_score_workspace.stride(2),
+            flat_score_workspace.stride(3),
+            flat_d_score_workspace.stride(0),
+            flat_d_score_workspace.stride(1),
+            flat_d_score_workspace.stride(2),
+            flat_d_score_workspace.stride(3),
         )
         _qsa_segmented_dkv_reduce_flat_heads_kernel[
             (owner_group_count * num_kv_heads,)
@@ -11893,10 +12095,12 @@ def qsa_segmented_dkv_reduce(
             BLOCK_TOPK=block_topk,
             BLOCK_D=block_d,
             HAS_GRAD_OUTPUT=True,
+            HAS_GRAD_LSE=grad_lse is not lse,
             DKV_ACCUM_BF16=grad_key.dtype == torch.bfloat16,
             BATCH_ONE=batch == 1,
             USE_BLOCK_LIST=use_block_list,
             OWNER_SLOT_DERIVATIVES=owner_slot_derivatives,
+            RECOMPUTE_DERIVATIVES=fuse_owner_heads_recompute_flat,
             num_warps=segmented_num_warps,
             num_stages=1,
         )
@@ -12002,13 +12206,14 @@ def qsa_segmented_dkv_reduce(
             'BATCH_ONE': batch == 1,
             'RECOMPUTE_DERIVATIVES': fuse_owner_heads_recompute,
             'USE_BLOCK_LIST': use_block_list,
+            'NUM_OCC_SPLITS': recompute_owner_splits,
             'num_warps': segmented_num_warps,
             'num_stages': 1,
         }
         if recompute_owner_maxnreg:
             fused_owner_options['maxnreg'] = recompute_owner_maxnreg
         _qsa_segmented_dkv_reduce_fused_heads_kernel[
-            (owner_group_count * num_kv_heads,)
+            (owner_group_count * num_kv_heads * recompute_owner_splits,)
         ](
             *fused_kernel_args,
             **fused_owner_options,
@@ -12088,6 +12293,11 @@ def qsa_selected_kv_backward(
     block-owner diagnostic that removes owner-side dK/dV atomics by recomputing
     owner derivatives and writing one contiguous block result; it is not part
     of the production default.
+    ``MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_OCC_SPLITS`` can split that owner
+    across a small number of CTAs, retaining only block-level output atomics;
+    it is diagnostic and must be profiled with the full numerical gate.
+    ``MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_RECOMPUTE_FLAT=1`` selects the
+    direct flattened 16-head MMA geometry for that owner; it remains opt-in.
     ``MCORE_BRIDGE_QSA_BACKWARD_SPLIT_DKV=1`` is a separate diagnostic that
     launches dQ and dK/dV independently and deliberately recomputes scores.
     ``precomputed_scores`` is an opt-in BF16/FP32 raw-QK workspace produced by
