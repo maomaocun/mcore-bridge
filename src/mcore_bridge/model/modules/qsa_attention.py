@@ -316,6 +316,12 @@ def _qsa_auto_hybrid_eligible(
     )
 
 
+def _qsa_auto_hybrid_default_min_fanout(seq_len: int) -> int:
+    """Return the measured default owner threshold for a long route."""
+
+    return 12288 if int(seq_len) >= 262144 else 8192
+
+
 @torch.no_grad()
 def qsa_expand_block_route(
     block_indices: torch.Tensor,
@@ -679,9 +685,13 @@ class _QSASelectedKVFunction(Function):
                 and ctx.segmented_metadata is None):
             from .qsa_triton import qsa_prepare_segmented_metadata
 
+            default_hybrid_min_fanout = (
+                _qsa_auto_hybrid_default_min_fanout(query.shape[0])
+                if auto_hybrid else 0
+            )
             hybrid_min_fanout = int(os.environ.get(
                 'MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT',
-                '8192' if auto_hybrid else '0'))
+                str(default_hybrid_min_fanout)))
             if hybrid_min_fanout < 0:
                 raise ValueError(
                     'QSA segmented hybrid fanout threshold must be non-negative')
@@ -992,8 +1002,9 @@ def qsa_sparse_forward(
     ``MCORE_BRIDGE_QSA_AUTO_HYBRID=1`` is an explicit long-context diagnostic:
     for compact B=1 BF16 routes at or above
     ``MCORE_BRIDGE_QSA_AUTO_HYBRID_MIN_SEQ_LEN`` (default 163,840), it selects
-    the measured fanout-8,192 compact hybrid.  The normal default remains
-    atomic and an explicit ``MCORE_BRIDGE_QSA_DKV_REDUCTION`` takes precedence.
+    the measured length-adaptive compact hybrid (fanout 8,192 below 256K and
+    12,288 at/above 256K).  The normal default remains atomic and an explicit
+    ``MCORE_BRIDGE_QSA_DKV_REDUCTION`` takes precedence.
     """
 
     sq, sk, batch, num_q_heads, num_kv_heads, head_dim, topk_indices, topk_length = _validate_inputs(

@@ -10266,6 +10266,12 @@ def _qsa_auto_hybrid_enabled(
     )
 
 
+def _qsa_auto_hybrid_default_min_fanout(seq_len: int) -> int:
+    """Return the measured default owner threshold for a long route."""
+
+    return 12288 if int(seq_len) >= 262144 else 8192
+
+
 def _qsa_prepare_segmented_query_union(
     segmented_metadata,
     batch: int,
@@ -10900,6 +10906,9 @@ def qsa_segmented_dkv_reduce(
                 'MCORE_BRIDGE_QSA_SEGMENT_COMPACT_DERIVATIVES', '0') != '0'
             or auto_hybrid
         )
+        and saved_scores.ndim == 4
+        and saved_scores.shape[1] == 1
+        and saved_scores.shape[2:] == (num_q_heads, ratio)
     )
     owner_slot_derivatives = (
         use_saved_scores
@@ -10947,9 +10956,11 @@ def qsa_segmented_dkv_reduce(
     if use_saved_derivatives and saved_d_scores.shape != saved_scores.shape:
         raise ValueError(
             "QSA segmented dK/dV reduction saved d_score shape does not match probability")
+    default_hybrid_min_fanout = (
+        _qsa_auto_hybrid_default_min_fanout(sq) if auto_hybrid else 0)
     hybrid_min_fanout = int(os.environ.get(
         'MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT',
-        '8192' if auto_hybrid else '0'))
+        str(default_hybrid_min_fanout)))
     if hybrid_min_fanout < 0:
         raise ValueError(
             'QSA segmented hybrid fanout threshold must be non-negative')
@@ -12366,10 +12377,11 @@ def qsa_selected_kv_backward(
     it is diagnostic and must be profiled with the full numerical gate.
     ``MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_RECOMPUTE_FLAT=1`` selects the
     direct flattened 16-head MMA geometry for that owner; it remains opt-in.
-    ``MCORE_BRIDGE_QSA_AUTO_HYBRID=1`` selects the measured fanout-8,192
-    compact hybrid for eligible long-context calls when the higher-level
-    attention dispatcher has enabled the same explicit mode.  It never
-    changes the ordinary atomic default.
+    ``MCORE_BRIDGE_QSA_AUTO_HYBRID=1`` selects the measured length-adaptive
+    compact hybrid (fanout 8,192 below 256K and 12,288 at/above 256K) for
+    eligible long-context calls when the higher-level attention dispatcher
+    has enabled the same explicit mode.  It never changes the ordinary atomic
+    default.
     ``MCORE_BRIDGE_QSA_BACKWARD_SPLIT_DKV=1`` is a separate diagnostic that
     launches dQ and dK/dV independently and deliberately recomputes scores.
     ``precomputed_scores`` is an opt-in BF16/FP32 raw-QK workspace produced by
@@ -12499,9 +12511,11 @@ def qsa_selected_kv_backward(
     use_segmented_reduction = False
     if segment_reduction_requested and selected_token_group_size is not None:
         segment_ratio = int(selected_token_group_size)
+        default_hybrid_min_fanout = (
+            _qsa_auto_hybrid_default_min_fanout(sq) if auto_hybrid else 0)
         hybrid_min_fanout = int(os.environ.get(
             'MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT',
-            '8192' if auto_hybrid else '0'))
+            str(default_hybrid_min_fanout)))
         if hybrid_min_fanout < 0:
             raise ValueError(
                 'QSA segmented hybrid fanout threshold must be non-negative')
@@ -12593,6 +12607,7 @@ def qsa_selected_kv_backward(
     )
     owner_occurrence_requested = (
         compact_derivatives_requested or table_recompute_requested)
+    disable_derivative_reuse = False
     if use_segmented_reduction:
         metadata_owner_mask = _qsa_segmented_owner_mask(
             segmented_metadata, batch, sk, segment_ratio)
@@ -12669,12 +12684,19 @@ def qsa_selected_kv_backward(
             else:
                 compact_derivatives_requested = False
                 owner_occurrence_requested = False
+                if hybrid_min_fanout > 0:
+                    # No block will consume a derivative workspace in this
+                    # hybrid.  Falling through to the logical score slab
+                    # would add O(B*S*Hq*K) memory/traffic for no owner work.
+                    disable_derivative_reuse = True
     reuse_scores = (
         use_segmented_reduction
+        and not disable_derivative_reuse
         and os.environ.get('MCORE_BRIDGE_QSA_SEGMENT_REUSE_SCORES', '0') != '0'
     ) or compact_derivatives_requested or owner_slot_derivatives_requested
     reuse_derivatives = (
         use_segmented_reduction
+        and not disable_derivative_reuse
         and os.environ.get(
             'MCORE_BRIDGE_QSA_SEGMENT_REUSE_DERIVATIVES', '0') != '0'
     ) or compact_derivatives_requested or owner_slot_derivatives_requested

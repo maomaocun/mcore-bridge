@@ -1922,7 +1922,7 @@ def test_triton_auto_hybrid_dispatch_matches_torch_on_sm90(monkeypatch):
     grad_lse = torch.randn(
         batch, hq, sq, device=device, dtype=torch.float32) * 0.01
 
-    def run(auto):
+    def run(auto, min_fanout=2):
         monkeypatch.delenv('MCORE_BRIDGE_QSA_DKV_REDUCTION', raising=False)
         monkeypatch.delenv('MCORE_BRIDGE_QSA_AUTO_HYBRID', raising=False)
         monkeypatch.delenv(
@@ -1932,7 +1932,7 @@ def test_triton_auto_hybrid_dispatch_matches_torch_on_sm90(monkeypatch):
             monkeypatch.setenv(
                 'MCORE_BRIDGE_QSA_AUTO_HYBRID_MIN_SEQ_LEN', str(sq))
             monkeypatch.setenv(
-                'MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT', '2')
+                'MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT', str(min_fanout))
             reduction = 'atomic'
             backend = 'triton'
         else:
@@ -1962,10 +1962,18 @@ def test_triton_auto_hybrid_dispatch_matches_torch_on_sm90(monkeypatch):
 
     reference = run(False)
     actual = run(True)
+    no_owner = run(True, min_fanout=1024)
     assert torch.allclose(actual[0].float(), reference[0].float(), atol=2e-2, rtol=2e-2)
     assert torch.allclose(actual[1], reference[1], atol=2e-2, rtol=2e-2)
     assert torch.allclose(actual[2].float(), reference[2].float(), atol=0.05, rtol=0.05)
     for actual_grad, reference_grad in zip(actual[3:], reference[3:]):
+        assert torch.isfinite(actual_grad).all()
+        assert torch.allclose(
+            actual_grad.float(), reference_grad.float(), atol=0.125, rtol=0.05)
+    assert torch.allclose(no_owner[0].float(), reference[0].float(), atol=2e-2, rtol=2e-2)
+    assert torch.allclose(no_owner[1], reference[1], atol=2e-2, rtol=2e-2)
+    assert torch.allclose(no_owner[2].float(), reference[2].float(), atol=0.05, rtol=0.05)
+    for actual_grad, reference_grad in zip(no_owner[3:], reference[3:]):
         assert torch.isfinite(actual_grad).all()
         assert torch.allclose(
             actual_grad.float(), reference_grad.float(), atol=0.125, rtol=0.05)
