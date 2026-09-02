@@ -12388,9 +12388,9 @@ def qsa_selected_kv_backward(
     the matching forward diagnostic; it removes backward QK recomputation
     while retaining the original LSE-based probability formula.
     ``MCORE_BRIDGE_QSA_BACKWARD_MAXNREG`` overrides the Triton register cap;
-    for the validated SM90 production shape it defaults to 192 only on the
-    untrimmed long atomic route, while short and segmented paths retain the
-    compiler default.
+    for the validated SM90 production shape it defaults to 192 on the
+    untrimmed long atomic route and to 224 on the auto-hybrid >=262K/T=12,288
+    route, while short and other segmented paths retain the compiler default.
     """
 
     if not TRITON_AVAILABLE:
@@ -12908,13 +12908,33 @@ def qsa_selected_kv_backward(
     if backward_num_warps not in {1, 2, 4, 8} or backward_num_stages not in {1, 2, 3, 4}:
         raise ValueError(
             'QSA backward tuning expects warps in {1,2,4,8} and stages in {1,2,3,4}')
-    # The long production route is the only validated point where a small
-    # register cap improves SM90 scheduling.  Short causal rows use a
-    # different two-warp geometry and spill badly under the same cap, so keep
-    # them at the compiler default.  An explicit environment value (including
-    # zero) always overrides this shape-specific default.
+    # The long atomic production route is the only validated point where a
+    # small register cap improves SM90 scheduling.  Compact hybrid has a
+    # different producer live range: at the maximum context the measured
+    # T=12,288 point accepts 224, while the shorter hybrid and lower caps spill
+    # or lose scheduling headroom.  An explicit environment value (including
+    # zero) always overrides these shape-specific defaults.
+    auto_hybrid_maxnreg = (
+        224
+        if (
+            auto_hybrid
+            and use_segmented_reduction
+            and hybrid_min_fanout == 12288
+            and sq >= 262144
+            and is_sm90(query.device)
+            and dkv_accum_dtype == 'bf16'
+            and tensorized_tile
+            and head_tile_size == 16
+            and group_size == 12
+            and head_dim == 256
+            and route_block_size == 4
+        )
+        else 0
+    )
     default_backward_maxnreg = (
-        192
+        auto_hybrid_maxnreg
+        if auto_hybrid_maxnreg
+        else 192
         if (
             is_sm90(query.device)
             and dkv_accum_dtype == 'bf16'
