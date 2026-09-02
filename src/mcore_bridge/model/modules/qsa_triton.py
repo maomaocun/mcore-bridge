@@ -12378,10 +12378,11 @@ def qsa_selected_kv_backward(
     ``MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_RECOMPUTE_FLAT=1`` selects the
     direct flattened 16-head MMA geometry for that owner; it remains opt-in.
     ``MCORE_BRIDGE_QSA_AUTO_HYBRID=1`` selects the measured length-adaptive
-    compact hybrid (fanout 8,192 below 256K and 12,288 at/above 256K) for
-    eligible long-context calls when the higher-level attention dispatcher
-    has enabled the same explicit mode.  It never changes the ordinary atomic
-    default.
+    compact hybrid (fanout 8,192 and the K16/224/2-warp producer in the
+    196K--256K interval, then fanout 12,288 with the same producer at/above
+    256K) for eligible long-context calls when the higher-level attention
+    dispatcher has enabled the same explicit mode.  It never changes the
+    ordinary atomic default.
     ``MCORE_BRIDGE_QSA_BACKWARD_SPLIT_DKV=1`` is a separate diagnostic that
     launches dQ and dK/dV independently and deliberately recomputes scores.
     ``precomputed_scores`` is an opt-in BF16/FP32 raw-QK workspace produced by
@@ -12867,8 +12868,16 @@ def qsa_selected_kv_backward(
     auto_hybrid_long = (
         auto_hybrid
         and use_segmented_reduction
-        and hybrid_min_fanout == 12288
-        and sq >= 262144
+        and (
+            (
+                hybrid_min_fanout == 8192
+                and 196608 <= sq < 262144
+            )
+            or (
+                hybrid_min_fanout == 12288
+                and sq >= 262144
+            )
+        )
         and is_sm90(query.device)
         and dkv_accum_dtype == 'bf16'
         and tensorized_tile

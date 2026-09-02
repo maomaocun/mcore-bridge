@@ -14,7 +14,8 @@ import torch
 
 from mcore_bridge.model.modules.qsa_attention import (qsa_expand_block_route, qsa_sparse_forward,
                                                       qsa_sparse_forward_packed, qsa_sparse_forward_reference,
-                                                      resolve_qsa_backend)
+                                                      resolve_qsa_backend,
+                                                      _qsa_auto_hybrid_default_min_fanout as _attention_auto_hybrid_fanout)
 from mcore_bridge.model.modules.qsa_cp_exchange import _build_owner_plan, qsa_exchange_selected_kv
 from mcore_bridge.model.modules.qsa_indexer import QSAIndexer
 from mcore_bridge.model.modules.qsa_triton import (
@@ -24,6 +25,7 @@ from mcore_bridge.model.modules.qsa_triton import (
     qsa_indexer_fused_topk_with_ratio,
     qsa_indexer_packed_metadata_from_cu,
     qsa_indexer_slab_topk_with_ratio,
+    _qsa_auto_hybrid_default_min_fanout as _triton_auto_hybrid_fanout,
 )
 from mcore_bridge.model.gpts.qwen4_exp import Qwen4ExpLayer
 
@@ -58,6 +60,19 @@ def _sorted_valid_route(indices, lengths):
     slots = torch.arange(indices.shape[-1], device=indices.device)
     valid = slots.reshape(*([1] * (indices.ndim - 1)), -1) < lengths.long().unsqueeze(-1)
     return torch.where(valid, indices, torch.full_like(indices, -1)).sort(dim=-1).values
+
+
+def test_auto_hybrid_default_fanout_schedule_matches_dispatchers():
+    expected = {
+        163840: 8192,
+        196607: 8192,
+        196608: 8192,
+        262143: 8192,
+        262144: 12288,
+    }
+    for seq_len, fanout in expected.items():
+        assert _attention_auto_hybrid_fanout(seq_len) == fanout
+        assert _triton_auto_hybrid_fanout(seq_len) == fanout
 
 
 def test_selected_kv_forward_matches_independent_gqa2_reference():

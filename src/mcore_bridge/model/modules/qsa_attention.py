@@ -1002,9 +1002,10 @@ def qsa_sparse_forward(
     ``MCORE_BRIDGE_QSA_AUTO_HYBRID=1`` is an explicit long-context diagnostic:
     for compact B=1 BF16 routes at or above
     ``MCORE_BRIDGE_QSA_AUTO_HYBRID_MIN_SEQ_LEN`` (default 163,840), it selects
-    the measured length-adaptive compact hybrid (fanout 8,192 below 256K and
-    12,288 at/above 256K).  The normal default remains atomic and an explicit
-    ``MCORE_BRIDGE_QSA_DKV_REDUCTION`` takes precedence.
+    the measured length-adaptive compact hybrid (fanout 8,192 with the
+    K16/224/2-warp producer from 196K to below 256K, then 12,288 with the same
+    producer at/above 256K).  The normal default remains atomic and an
+    explicit ``MCORE_BRIDGE_QSA_DKV_REDUCTION`` takes precedence.
     """
 
     sq, sk, batch, num_q_heads, num_kv_heads, head_dim, topk_indices, topk_length = _validate_inputs(
