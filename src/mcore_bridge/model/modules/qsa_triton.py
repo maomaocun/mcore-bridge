@@ -12914,7 +12914,9 @@ def qsa_selected_kv_backward(
         and block_k == 32
     )
     default_num_warps = (
-        2 if hopper_short_k32 else 4 if tensorize_derivatives else 1
+        2
+        if auto_hybrid_long
+        else 2 if hopper_short_k32 else 4 if tensorize_derivatives else 1
     )
     backward_num_warps = int(os.environ.get(
         'MCORE_BRIDGE_QSA_BACKWARD_WARPS', str(default_num_warps)))
