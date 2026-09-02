@@ -262,6 +262,60 @@ def _normalise_scale(softmax_scale: Optional[float], head_dim: int) -> float:
     return scale
 
 
+def _qsa_auto_hybrid_eligible(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    causal: bool,
+    key_position_offset: int,
+    selected_token_group_size: Optional[int],
+    route_block_size: int,
+) -> bool:
+    """Return whether the opt-in long-context hybrid dispatch is applicable.
+
+    The thresholded segmented path is only a measured point for the compact
+    B=1 BF16 QSA shape.  Keep the switch explicit and conservative so setting
+    the environment variable cannot silently alter fallback, packed, CP, or
+    non-production shapes.
+    """
+
+    if os.environ.get('MCORE_BRIDGE_QSA_AUTO_HYBRID', '0') == '0':
+        return False
+    if os.environ.get('MCORE_BRIDGE_QSA_DKV_REDUCTION') is not None:
+        return False
+    try:
+        min_seq_len = int(os.environ.get(
+            'MCORE_BRIDGE_QSA_AUTO_HYBRID_MIN_SEQ_LEN', '163840'))
+    except ValueError:
+        raise ValueError(
+            'MCORE_BRIDGE_QSA_AUTO_HYBRID_MIN_SEQ_LEN must be an integer')
+    if min_seq_len <= 0:
+        raise ValueError(
+            'MCORE_BRIDGE_QSA_AUTO_HYBRID_MIN_SEQ_LEN must be positive')
+    return bool(
+        causal
+        and int(key_position_offset) == 0
+        and query.ndim == 4
+        and key.ndim == 4
+        and value.ndim == 4
+        and query.shape[1] == 1
+        and key.shape[1] == 1
+        and query.shape[2] == 24
+        and key.shape[2] == 2
+        and query.shape[3] == 256
+        and query.dtype == torch.bfloat16
+        and key.dtype == torch.bfloat16
+        and value.dtype == torch.bfloat16
+        and selected_token_group_size is not None
+        and int(selected_token_group_size) >= 2
+        and (int(selected_token_group_size)
+             & (int(selected_token_group_size) - 1)) == 0
+        and int(route_block_size) == int(selected_token_group_size)
+        and int(route_block_size) > 1
+        and query.shape[0] >= min_seq_len
+    )
+
+
 @torch.no_grad()
 def qsa_expand_block_route(
     block_indices: torch.Tensor,
@@ -608,13 +662,26 @@ class _QSASelectedKVFunction(Function):
             if len(segmented_metadata) < 4:
                 raise ValueError(
                     'segmented_metadata must contain inverse-CSR metadata')
+        auto_hybrid = (
+            effective_dkv_reduction == 'segmented'
+            and _qsa_auto_hybrid_eligible(
+                query,
+                key,
+                value,
+                causal,
+                key_position_offset,
+                selected_token_group_size,
+                route_block_size,
+            )
+        )
         if (resolved == 'triton' and selected_token_group_size is not None and
                 effective_dkv_reduction == 'segmented'
                 and ctx.segmented_metadata is None):
             from .qsa_triton import qsa_prepare_segmented_metadata
 
             hybrid_min_fanout = int(os.environ.get(
-                'MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT', '0'))
+                'MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT',
+                '8192' if auto_hybrid else '0'))
             if hybrid_min_fanout < 0:
                 raise ValueError(
                     'QSA segmented hybrid fanout threshold must be non-negative')
@@ -630,9 +697,12 @@ class _QSASelectedKVFunction(Function):
                 owner_min_fanout=hybrid_min_fanout,
             )
             resident_owner_map_requested = (
-                os.environ.get(
-                    'MCORE_BRIDGE_QSA_SEGMENT_RESIDENT_OWNER_MAP', '0')
-                != '0'
+                (
+                    os.environ.get(
+                        'MCORE_BRIDGE_QSA_SEGMENT_RESIDENT_OWNER_MAP', '0')
+                    != '0'
+                    or auto_hybrid
+                )
                 and (
                     os.environ.get(
                         'MCORE_BRIDGE_QSA_SEGMENT_COMPACT_DERIVATIVES',
@@ -640,6 +710,7 @@ class _QSASelectedKVFunction(Function):
                     or os.environ.get(
                         'MCORE_BRIDGE_QSA_SEGMENT_TABLE_RECOMPUTE_DERIVATIVES',
                         '0') != '0'
+                    or auto_hybrid
                 )
             )
             resident_table_plan_requested = (
@@ -918,6 +989,11 @@ def qsa_sparse_forward(
     ``segmented_metadata`` optionally supplies a prebuilt inverse-CSR/owner
     plan from the route producer; when omitted, segmented metadata is built
     by the Triton autograd forward context as before.
+    ``MCORE_BRIDGE_QSA_AUTO_HYBRID=1`` is an explicit long-context diagnostic:
+    for compact B=1 BF16 routes at or above
+    ``MCORE_BRIDGE_QSA_AUTO_HYBRID_MIN_SEQ_LEN`` (default 163,840), it selects
+    the measured fanout-8,192 compact hybrid.  The normal default remains
+    atomic and an explicit ``MCORE_BRIDGE_QSA_DKV_REDUCTION`` takes precedence.
     """
 
     sq, sk, batch, num_q_heads, num_kv_heads, head_dim, topk_indices, topk_length = _validate_inputs(
@@ -936,13 +1012,31 @@ def qsa_sparse_forward(
     dkv_accum_dtype = str(dkv_accum_dtype).lower()
     if dkv_accum_dtype not in {'bf16', 'fp32'}:
         raise ValueError(f"unsupported QSA dkv_accum_dtype={dkv_accum_dtype!r}; choose 'bf16' or 'fp32'")
-    effective_dkv_reduction = os.environ.get(
-        'MCORE_BRIDGE_QSA_DKV_REDUCTION', dkv_reduction).lower()
+    route_block_size = int(route_block_size)
+    explicit_dkv_reduction = os.environ.get(
+        'MCORE_BRIDGE_QSA_DKV_REDUCTION')
+    auto_hybrid = (
+        explicit_dkv_reduction is None
+        and actual == 'triton'
+        and _qsa_auto_hybrid_eligible(
+            query,
+            key,
+            value,
+            causal,
+            key_position_offset,
+            selected_token_group_size,
+            route_block_size,
+        )
+    )
+    effective_dkv_reduction = (
+        explicit_dkv_reduction.lower()
+        if explicit_dkv_reduction is not None
+        else 'segmented' if auto_hybrid else str(dkv_reduction).lower()
+    )
     if effective_dkv_reduction not in {'atomic', 'segmented'}:
         raise ValueError(
             f"unsupported QSA dkv_reduction={effective_dkv_reduction!r}; "
             "choose 'atomic' or 'segmented'")
-    route_block_size = int(route_block_size)
     if route_block_size <= 0:
         raise ValueError('QSA route_block_size must be positive')
     if (route_block_size > 1 and selected_token_group_size is not None

@@ -1889,6 +1889,89 @@ def test_triton_hybrid_owner_mask_preserves_compact_gradients_on_sm90(monkeypatc
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_triton_auto_hybrid_dispatch_matches_torch_on_sm90(monkeypatch):
+    """The explicit long-context switch must preserve the full gradient gate."""
+
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('requires H100/SM90')
+    torch.manual_seed(2027)
+    device = 'cuda'
+    sq, batch, hq, hkv, dim, ratio, block_topk = 64, 1, 24, 2, 256, 4, 4
+    positions = torch.arange(sq, device=device, dtype=torch.int32)
+    indices = torch.full(
+        (batch, sq, block_topk), -1, device=device, dtype=torch.int32)
+    lengths = torch.zeros((batch, sq), device=device, dtype=torch.int32)
+    for query in range(sq):
+        complete = min((query + 1) // ratio, block_topk)
+        tail = (query + 1) - ((query + 1) // ratio) * ratio
+        if complete:
+            block_ids = torch.arange(
+                complete, device=device, dtype=torch.int32)
+            if query % 2:
+                block_ids = block_ids.flip(0)
+            if complete >= 3 and query % 3 == 0:
+                block_ids[-1] = 0
+            indices[0, query, :complete] = block_ids
+        lengths[0, query] = complete * ratio + tail
+    query_base = torch.randn(
+        sq, batch, hq, dim, device=device, dtype=torch.bfloat16)
+    key_base = torch.randn(
+        sq, batch, hkv, dim, device=device, dtype=torch.bfloat16)
+    value_base = torch.randn_like(key_base)
+    grad_output = torch.randn_like(query_base)
+    grad_lse = torch.randn(
+        batch, hq, sq, device=device, dtype=torch.float32) * 0.01
+
+    def run(auto):
+        monkeypatch.delenv('MCORE_BRIDGE_QSA_DKV_REDUCTION', raising=False)
+        monkeypatch.delenv('MCORE_BRIDGE_QSA_AUTO_HYBRID', raising=False)
+        monkeypatch.delenv(
+            'MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT', raising=False)
+        if auto:
+            monkeypatch.setenv('MCORE_BRIDGE_QSA_AUTO_HYBRID', '1')
+            monkeypatch.setenv(
+                'MCORE_BRIDGE_QSA_AUTO_HYBRID_MIN_SEQ_LEN', str(sq))
+            monkeypatch.setenv(
+                'MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT', '2')
+            reduction = 'atomic'
+            backend = 'triton'
+        else:
+            reduction = 'atomic'
+            backend = 'torch'
+        query = query_base.detach().clone().requires_grad_()
+        key = key_base.detach().clone().requires_grad_()
+        value = value_base.detach().clone().requires_grad_()
+        output, lse = qsa_sparse_forward(
+            query,
+            key,
+            value,
+            indices,
+            lengths,
+            backend=backend,
+            require_backend=auto,
+            query_positions=positions,
+            selected_token_group_size=ratio,
+            dkv_reduction=reduction,
+            route_block_size=ratio,
+        )
+        ((output.float() * grad_output.float()).sum()
+         + (lse * grad_lse).sum()).backward()
+        return (
+            output.detach(), lse.detach(), query.grad.detach(),
+            key.grad.detach(), value.grad.detach())
+
+    reference = run(False)
+    actual = run(True)
+    assert torch.allclose(actual[0].float(), reference[0].float(), atol=2e-2, rtol=2e-2)
+    assert torch.allclose(actual[1], reference[1], atol=2e-2, rtol=2e-2)
+    assert torch.allclose(actual[2].float(), reference[2].float(), atol=0.05, rtol=0.05)
+    for actual_grad, reference_grad in zip(actual[3:], reference[3:]):
+        assert torch.isfinite(actual_grad).all()
+        assert torch.allclose(
+            actual_grad.float(), reference_grad.float(), atol=0.125, rtol=0.05)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
 def test_triton_owner_slot_derivatives_batch_two_matches_reference_on_sm90(monkeypatch):
     if torch.cuda.get_device_capability() != (9, 0):
         pytest.skip('requires H100/SM90')

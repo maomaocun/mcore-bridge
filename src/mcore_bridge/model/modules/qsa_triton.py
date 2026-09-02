@@ -10214,6 +10214,58 @@ def _qsa_segmented_owner_mask(
     return candidate
 
 
+def _qsa_auto_hybrid_enabled(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    causal: bool,
+    key_position_offset: int,
+    selected_token_group_size: Optional[int],
+    route_block_size: int,
+) -> bool:
+    """Match the conservative long-context hybrid contract in attention."""
+
+    if os.environ.get('MCORE_BRIDGE_QSA_AUTO_HYBRID', '0') == '0':
+        return False
+    # An explicit reduction mode is authoritative.  The higher-level
+    # attention dispatcher only leaves this environment unset when it wants
+    # AUTO_HYBRID to choose the segmented mode.
+    if os.environ.get('MCORE_BRIDGE_QSA_DKV_REDUCTION') is not None:
+        return False
+    try:
+        min_seq_len = int(os.environ.get(
+            'MCORE_BRIDGE_QSA_AUTO_HYBRID_MIN_SEQ_LEN', '163840'))
+    except ValueError:
+        raise ValueError(
+            'MCORE_BRIDGE_QSA_AUTO_HYBRID_MIN_SEQ_LEN must be an integer')
+    if min_seq_len <= 0:
+        raise ValueError(
+            'MCORE_BRIDGE_QSA_AUTO_HYBRID_MIN_SEQ_LEN must be positive')
+    if selected_token_group_size is None:
+        return False
+    ratio = int(selected_token_group_size)
+    return bool(
+        causal
+        and int(key_position_offset) == 0
+        and query.ndim == 4
+        and key.ndim == 4
+        and value.ndim == 4
+        and query.shape[1] == 1
+        and key.shape[1] == 1
+        and query.shape[2] == 24
+        and key.shape[2] == 2
+        and query.shape[3] == 256
+        and query.dtype == torch.bfloat16
+        and key.dtype == torch.bfloat16
+        and value.dtype == torch.bfloat16
+        and ratio >= 2
+        and (ratio & (ratio - 1)) == 0
+        and int(route_block_size) == ratio
+        and int(route_block_size) > 1
+        and query.shape[0] >= min_seq_len
+    )
+
+
 def _qsa_prepare_segmented_query_union(
     segmented_metadata,
     batch: int,
@@ -10821,6 +10873,15 @@ def qsa_segmented_dkv_reduce(
         raise ValueError("QSA segmented dK/dV reduction received incompatible Q/K/V shapes")
     if topk_indices.shape[:2] != (batch, sq) or topk_length.shape != (batch, sq):
         raise ValueError("QSA segmented dK/dV reduction received incompatible index shapes")
+    auto_hybrid = _qsa_auto_hybrid_enabled(
+        query,
+        key,
+        value,
+        causal=True,
+        key_position_offset=0,
+        selected_token_group_size=ratio,
+        route_block_size=route_block_size,
+    )
     use_saved_scores = saved_scores is not None
     use_saved_derivatives = saved_d_scores is not None
     if use_saved_derivatives and not use_saved_scores:
@@ -10834,8 +10895,11 @@ def qsa_segmented_dkv_reduce(
     compact_derivatives = (
         use_saved_scores
         and route_block_size == ratio
-        and os.environ.get(
-            'MCORE_BRIDGE_QSA_SEGMENT_COMPACT_DERIVATIVES', '0') != '0'
+        and (
+            os.environ.get(
+                'MCORE_BRIDGE_QSA_SEGMENT_COMPACT_DERIVATIVES', '0') != '0'
+            or auto_hybrid
+        )
     )
     owner_slot_derivatives = (
         use_saved_scores
@@ -10884,7 +10948,8 @@ def qsa_segmented_dkv_reduce(
         raise ValueError(
             "QSA segmented dK/dV reduction saved d_score shape does not match probability")
     hybrid_min_fanout = int(os.environ.get(
-        'MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT', '0'))
+        'MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT',
+        '8192' if auto_hybrid else '0'))
     if hybrid_min_fanout < 0:
         raise ValueError(
             'QSA segmented hybrid fanout threshold must be non-negative')
@@ -11811,8 +11876,11 @@ def qsa_segmented_dkv_reduce(
     fuse_owner_heads_flat = (
         (compact_derivatives or owner_slot_derivatives)
         and flatten_heads
-        and os.environ.get(
-            'MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_FLAT', '0') != '0'
+        and (
+            os.environ.get(
+                'MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_FLAT', '0') != '0'
+            or auto_hybrid
+        )
     )
     if owner_slot_derivatives and not fuse_owner_heads_flat:
         raise RuntimeError(
@@ -12298,6 +12366,10 @@ def qsa_selected_kv_backward(
     it is diagnostic and must be profiled with the full numerical gate.
     ``MCORE_BRIDGE_QSA_SEGMENT_FUSE_HEADS_RECOMPUTE_FLAT=1`` selects the
     direct flattened 16-head MMA geometry for that owner; it remains opt-in.
+    ``MCORE_BRIDGE_QSA_AUTO_HYBRID=1`` selects the measured fanout-8,192
+    compact hybrid for eligible long-context calls when the higher-level
+    attention dispatcher has enabled the same explicit mode.  It never
+    changes the ordinary atomic default.
     ``MCORE_BRIDGE_QSA_BACKWARD_SPLIT_DKV=1`` is a separate diagnostic that
     launches dQ and dK/dV independently and deliberately recomputes scores.
     ``precomputed_scores`` is an opt-in BF16/FP32 raw-QK workspace produced by
@@ -12336,6 +12408,15 @@ def qsa_selected_kv_backward(
         route_slots
         if route_block_size == 1
         else route_slots * route_block_size + route_block_size - 1
+    )
+    auto_hybrid = _qsa_auto_hybrid_enabled(
+        query,
+        key,
+        value,
+        causal,
+        key_position_offset,
+        selected_token_group_size,
+        route_block_size,
     )
     if precomputed_scores is not None:
         valid_score_shape = (
@@ -12403,9 +12484,13 @@ def qsa_selected_kv_backward(
         output = query
     else:
         output = output.contiguous()
-    segment_reduction_requested = os.environ.get(
-        "MCORE_BRIDGE_QSA_DKV_REDUCTION", dkv_reduction
-    ).lower() == "segmented"
+    explicit_dkv_reduction = os.environ.get(
+        'MCORE_BRIDGE_QSA_DKV_REDUCTION')
+    segment_reduction_requested = (
+        explicit_dkv_reduction.lower() == 'segmented'
+        if explicit_dkv_reduction is not None
+        else str(dkv_reduction).lower() == 'segmented' or auto_hybrid
+    )
     if precomputed_scores is not None and segment_reduction_requested:
         raise RuntimeError(
             'QSA precomputed score reuse currently supports atomic dK/dV only')
@@ -12415,7 +12500,8 @@ def qsa_selected_kv_backward(
     if segment_reduction_requested and selected_token_group_size is not None:
         segment_ratio = int(selected_token_group_size)
         hybrid_min_fanout = int(os.environ.get(
-            'MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT', '0'))
+            'MCORE_BRIDGE_QSA_SEGMENT_HYBRID_MIN_FANOUT',
+            '8192' if auto_hybrid else '0'))
         if hybrid_min_fanout < 0:
             raise ValueError(
                 'QSA segmented hybrid fanout threshold must be non-negative')
@@ -12485,8 +12571,11 @@ def qsa_selected_kv_backward(
                 break
     compact_derivatives_requested = (
         use_segmented_reduction
-        and os.environ.get(
-            'MCORE_BRIDGE_QSA_SEGMENT_COMPACT_DERIVATIVES', '0') != '0'
+        and (
+            os.environ.get(
+                'MCORE_BRIDGE_QSA_SEGMENT_COMPACT_DERIVATIVES', '0') != '0'
+            or auto_hybrid
+        )
     )
     owner_slot_derivatives_requested = (
         use_segmented_reduction
